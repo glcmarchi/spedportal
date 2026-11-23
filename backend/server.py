@@ -144,6 +144,7 @@ class QuoteRequest(BaseModel):
 class CreateShipmentInput(BaseModel):
     quote: QuoteRequest
     carrier_id: str
+    contract_source: Optional[str] = None  # "admin" | "reseller" (opzionale in modalità ibrida)
 
 class UpdateUserInput(BaseModel):
     billing_type: Optional[str] = None
@@ -231,10 +232,13 @@ async def me(user=Depends(get_current_user)):
             "address_book": True, "parcels": True, "broadcasts": True,
             "premium_own_carriers": True,
         }
+        user["can_manage_own_carriers"] = True
     elif rid:
-        res = await db.resellers.find_one({"id": rid}, {"_id": 0, "features": 1, "company_name": 1})
+        res = await db.resellers.find_one({"id": rid}, {"_id": 0, "features": 1, "company_name": 1, "carrier_policies": 1})
         user["features"] = (res or {}).get("features", {})
         user["reseller_name"] = (res or {}).get("company_name", "")
+        policies = (res or {}).get("carrier_policies") or {}
+        user["can_manage_own_carriers"] = any(p in ("reseller_only", "hybrid") for p in policies.values())
     return user
 
 @api_router.get("/admin/users")
@@ -345,14 +349,83 @@ async def _price_with_markup(user: dict, cost: float, weight: float, zone: str) 
                     return round(cost * (1 + band["markup_percent"] / 100.0), 2)
     return round(cost * (1 + default_markup / 100.0), 2)
 
+
+async def _resolve_tenant_carrier_options(user: dict) -> dict:
+    """Restituisce per ciascun corriere abilitato: policy, default_source, codice admin e codice reseller."""
+    rid = user.get("reseller_id")
+    master_doc = await db.system_settings.find_one({"id": "master_carriers"}, {"_id": 0})
+    master_carriers = (master_doc or {}).get("carriers") or {}
+
+    if not rid:
+        # Super admin diretto
+        out = {}
+        for c in MOCK_CARRIERS:
+            cid = c["id"]
+            m = master_carriers.get(cid) or {}
+            if m.get("status") == "verified":
+                out[cid] = {
+                    "policy": "admin_only",
+                    "default_source": "admin",
+                    "can_switch": False,
+                    "admin_code": m.get("primary_code", ""),
+                    "reseller_code": "",
+                }
+        return out
+
+    res = await db.resellers.find_one({"id": rid}, {"_id": 0})
+    if not res:
+        return {}
+    policies = res.get("carrier_policies") or {}
+    defaults = res.get("carrier_defaults") or {}
+    own_creds = res.get("carrier_credentials") or {}
+    out = {}
+
+    for c in MOCK_CARRIERS:
+        cid = c["id"]
+        pol = policies.get(cid, "admin_only")
+        if pol == "disabled":
+            continue
+        m = master_carriers.get(cid) or {}
+        o = own_creds.get(cid) or {}
+        admin_ready = m.get("status") == "verified"
+        reseller_ready = o.get("status") == "verified"
+
+        if pol == "admin_only" and not admin_ready:
+            continue
+        if pol == "reseller_only" and not reseller_ready:
+            continue
+        if pol == "hybrid" and not (admin_ready or reseller_ready):
+            continue
+
+        default_src = defaults.get(cid, "reseller" if pol == "reseller_only" else "admin")
+        if default_src == "reseller" and not reseller_ready:
+            default_src = "admin"
+        if default_src == "admin" and not admin_ready:
+            default_src = "reseller"
+
+        out[cid] = {
+            "policy": pol,
+            "default_source": default_src,
+            "can_switch": (pol == "hybrid" and admin_ready and reseller_ready and user.get("role") == "reseller_admin"),
+            "admin_code": m.get("primary_code", "") if admin_ready else "",
+            "reseller_code": o.get("primary_code", "") if reseller_ready else "",
+            "per_shipment_fee": float(res.get("per_shipment_fee") or 0.0),
+        }
+    return out
+
+
 @api_router.post("/shipments/quote")
 async def quote_shipment(q: QuoteRequest, user=Depends(require_approved)):
     total_weight = sum(p.weight for p in q.parcels)
     vol_weight = sum((p.length * p.width * p.height) / 5000.0 for p in q.parcels)
     billed_weight = max(total_weight, vol_weight)
     zone = _zone_of(q.sender, q.recipient)
+    options = await _resolve_tenant_carrier_options(user)
     quotes = []
     for c in MOCK_CARRIERS:
+        opt = options.get(c["id"])
+        if not opt:
+            continue
         cost = _mock_carrier_cost(c["id"], billed_weight, zone, len(q.parcels))
         service_extra = 0.0
         if q.services.insurance:
@@ -368,6 +441,9 @@ async def quote_shipment(q: QuoteRequest, user=Depends(require_approved)):
             "carrier_id": c["id"], "carrier_name": c["name"], "color": c["color"],
             "cost": cost, "price": price, "transit_days": transit,
             "billed_weight": round(billed_weight, 2), "zone": zone,
+            "policy": opt["policy"],
+            "default_source": opt["default_source"],
+            "can_switch_source": opt["can_switch"],
         })
     quotes.sort(key=lambda x: x["price"])
     return {"quotes": quotes, "billed_weight": round(billed_weight, 2), "zone": zone}
@@ -380,7 +456,20 @@ async def create_shipment(inp: CreateShipmentInput, user=Depends(require_approve
     quotes = await quote_shipment(inp.quote, user)
     chosen = next((q for q in quotes["quotes"] if q["carrier_id"] == inp.carrier_id), None)
     if not chosen:
-        raise HTTPException(400, "Corriere non valido")
+        raise HTTPException(400, "Corriere non valido o non abilitato per questo account")
+
+    options = await _resolve_tenant_carrier_options(user)
+    opt = options.get(inp.carrier_id)
+    if not opt:
+        raise HTTPException(400, "Configurazione corriere non trovata")
+
+    source = opt["default_source"]
+    if inp.contract_source in ("admin", "reseller") and opt["can_switch"]:
+        source = inp.contract_source
+
+    code_used = opt["admin_code"] if source == "admin" else opt["reseller_code"]
+    applied_fee = 0.0 if source == "admin" else opt.get("per_shipment_fee", 0.0)
+
     price = chosen["price"]
     cost = chosen["cost"]
     if user.get("billing_type") == "prepaid":
@@ -391,7 +480,10 @@ async def create_shipment(inp: CreateShipmentInput, user=Depends(require_approve
         "id": new_id(),
         "user_id": user["id"],
         "reseller_id": user.get("reseller_id"),
-        "on_master_codes": True,
+        "on_master_codes": (source == "admin"),
+        "contract_owner": source,
+        "carrier_code_used": code_used,
+        "applied_fee": applied_fee,
         "tracking_number": _tracking_number(inp.carrier_id),
         "carrier_id": inp.carrier_id,
         "carrier_name": chosen["carrier_name"],
@@ -503,15 +595,18 @@ async def export_shipments(user=Depends(require_approved)):
     wb = openpyxl.Workbook()
     ws = wb.active
     ws.title = "Spedizioni"
-    headers = ["Data", "Tracking", "Corriere", "Mittente", "Destinatario", "Città", "Nazione",
+    headers = ["Data", "Tracking", "Corriere", "Contratto", "Codice Usato", "Mittente", "Destinatario", "Città", "Nazione",
                "Colli", "Peso (kg)", "Zona", "Prezzo (€)", "Stato"]
     ws.append(headers)
     for cell in ws[1]:
         cell.font = Font(bold=True, color="FFFFFF")
         cell.fill = PatternFill("solid", fgColor="0F172A")
     for s in ships:
+        owner = s.get("contract_owner", "admin" if s.get("on_master_codes", True) else "reseller")
         ws.append([
             s.get("created_at", ""), s.get("tracking_number", ""), s.get("carrier_name", ""),
+            "Piattaforma" if owner == "admin" else "Proprio",
+            s.get("carrier_code_used", ""),
             s.get("sender", {}).get("company_name", ""),
             s.get("recipient", {}).get("company_name", ""),
             s.get("recipient", {}).get("city", ""),
@@ -717,10 +812,11 @@ async def root():
 app.include_router(api_router)
 from extras import extra_router
 from mail import mail_router, send_email, tpl_registration, tpl_approved, FRONTEND_URL
-from tenancy import super_router, bootstrap_multitenant
+from tenancy import super_router, reseller_router, bootstrap_multitenant
 app.include_router(extra_router)
 app.include_router(mail_router)
 app.include_router(super_router)
+app.include_router(reseller_router)
 
 app.add_middleware(
     CORSMiddleware, allow_credentials=True,
