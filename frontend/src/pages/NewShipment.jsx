@@ -30,7 +30,6 @@ export default function NewShipment() {
   const [services, setServices] = useState({ insurance: false, insurance_value: 0, neutral_delivery: false });
   const [quotes, setQuotes] = useState(null);
   const [chosen, setChosen] = useState(null);
-  const [contractSource, setContractSource] = useState("admin");
   const [loading, setLoading] = useState(false);
   const [created, setCreated] = useState(null);
   const [addressbook, setAddressbook] = useState([]);
@@ -63,11 +62,7 @@ export default function NewShipment() {
     if (!chosen) return;
     setLoading(true);
     try {
-      const r = await api.post("/shipments", {
-        quote: buildBody(),
-        carrier_id: chosen.carrier_id,
-        contract_source: contractSource,
-      });
+      const r = await api.post("/shipments", { quote: buildBody(), carrier_id: chosen.carrier_id });
       setCreated(r.data); await refresh(); setStep(5); toast.success("Spedizione creata!");
     } catch (err) { toast.error(err?.response?.data?.detail || "Errore creazione"); }
     finally { setLoading(false); }
@@ -206,11 +201,8 @@ export default function NewShipment() {
             <h2 className="text-2xl font-bold tracking-tight" style={{ fontFamily: "Chivo" }}>Preventivo</h2>
             <div className="text-sm text-slate-600">Zona: <b>{quotes.zone}</b> · Peso tassato: <b>{quotes.billed_weight} kg</b></div>
             {quotes.quotes.map((q, i) => (
-              <div
-                key={q.carrier_id}
-                onClick={() => { setChosen(q); setContractSource(q.default_source || "admin"); }}
-                className={`bg-white border rounded-sm p-4 flex items-center gap-4 cursor-pointer transition-all hover:shadow-md ${chosen?.carrier_id === q.carrier_id ? "border-l-[3px] border-orange-600 border-y border-r border-slate-200" : "border-slate-200"}`}
-              >
+              <div key={q.carrier_id} onClick={() => setChosen(q)}
+                className={`bg-white border rounded-sm p-4 flex items-center gap-4 cursor-pointer transition-all hover:shadow-md ${chosen?.carrier_id === q.carrier_id ? "border-l-[3px] border-orange-600 border-y border-r border-slate-200" : "border-slate-200"}`}>
                 <div className="w-14 h-14 rounded-sm flex items-center justify-center font-black text-white shrink-0" style={{ backgroundColor: q.color, fontFamily: "Chivo" }}>
                   {q.carrier_name.slice(0, 3).toUpperCase()}
                 </div>
@@ -225,24 +217,6 @@ export default function NewShipment() {
                 </div>
               </div>
             ))}
-
-            {chosen?.can_switch_source && (
-              <div className="bg-slate-50 border border-slate-200 rounded-sm p-4 flex items-center justify-between gap-3 flex-wrap">
-                <div className="text-sm font-semibold">Contratto da utilizzare per {chosen.carrier_name}:</div>
-                <div className="flex gap-2">
-                  <Button type="button" size="sm" variant={contractSource === "reseller" ? "default" : "outline"}
-                    onClick={() => setContractSource("reseller")}
-                    className={`rounded-sm ${contractSource === "reseller" ? "bg-orange-600 hover:bg-orange-700" : ""}`}>
-                    Il Mio Codice
-                  </Button>
-                  <Button type="button" size="sm" variant={contractSource === "admin" ? "default" : "outline"}
-                    onClick={() => setContractSource("admin")}
-                    className={`rounded-sm ${contractSource === "admin" ? "bg-slate-900" : ""}`}>
-                    Codice Piattaforma
-                  </Button>
-                </div>
-              </div>
-            )}
           </div>
         )}
         {step === 5 && created && (
