@@ -1,15 +1,18 @@
 import React, { useEffect, useState } from "react";
 import { useParams, Link } from "react-router-dom";
 import { api } from "@/lib/api";
+import { useAuth } from "@/lib/auth";
 import { Button } from "@/components/ui/button";
 import { StatusBadge } from "@/pages/Dashboard";
 import { toast } from "sonner";
-import { ArrowLeft, Printer, ArrowsClockwise, MapPin, Clock } from "@phosphor-icons/react";
+import { ArrowLeft, Printer, ArrowsClockwise, MapPin, Clock, XCircle } from "@phosphor-icons/react";
 
 export default function ShipmentDetail() {
   const { id } = useParams();
+  const { refresh } = useAuth();
   const [s, setS] = useState(null);
   const [syncing, setSyncing] = useState(false);
+  const [cancelling, setCancelling] = useState(false);
 
   useEffect(() => {
     api.get(`/shipments/${id}`).then(r => setS(r.data));
@@ -37,6 +40,21 @@ export default function ShipmentDetail() {
       toast.error("Errore aggiornamento tracking");
     } finally {
       setSyncing(false);
+    }
+  };
+
+  const cancelShipment = async () => {
+    if (!window.confirm("Confermi di voler annullare questa spedizione prima del ritiro?")) return;
+    setCancelling(true);
+    try {
+      const r = await api.post(`/shipments/${id}/cancel`);
+      setS(r.data);
+      await refresh();
+      toast.success("Spedizione annullata con successo");
+    } catch (err) {
+      toast.error(err?.response?.data?.detail || "Errore durante l'annullamento");
+    } finally {
+      setCancelling(false);
     }
   };
 
@@ -68,13 +86,24 @@ export default function ShipmentDetail() {
           </div>
         </div>
         <div className="flex gap-2 flex-wrap">
-          <Button variant="outline" onClick={refreshTracking} disabled={syncing} className="rounded-sm h-11">
-            <ArrowsClockwise size={16} className={`mr-2 ${syncing ? "animate-spin" : ""}`} />
-            {syncing ? "Aggiornamento…" : "Aggiorna Tracking"}
-          </Button>
-          <Button onClick={label} className="bg-orange-600 hover:bg-orange-700 rounded-sm h-11">
-            <Printer size={16} className="mr-2" /> Stampa Etichetta
-          </Button>
+          {s.status === "created" && (
+            <Button variant="outline" onClick={cancelShipment} disabled={cancelling}
+              className="border-red-200 text-red-600 hover:bg-red-50 hover:text-red-700 rounded-sm h-11">
+              <XCircle size={16} className="mr-2" />
+              {cancelling ? "Annullamento…" : "Annulla Spedizione"}
+            </Button>
+          )}
+          {s.status !== "cancelled" && (
+            <>
+              <Button variant="outline" onClick={refreshTracking} disabled={syncing} className="rounded-sm h-11">
+                <ArrowsClockwise size={16} className={`mr-2 ${syncing ? "animate-spin" : ""}`} />
+                {syncing ? "Aggiornamento…" : "Aggiorna Tracking"}
+              </Button>
+              <Button onClick={label} className="bg-orange-600 hover:bg-orange-700 rounded-sm h-11">
+                <Printer size={16} className="mr-2" /> Stampa Etichetta
+              </Button>
+            </>
+          )}
         </div>
       </div>
 
