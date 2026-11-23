@@ -144,7 +144,6 @@ class QuoteRequest(BaseModel):
 class CreateShipmentInput(BaseModel):
     quote: QuoteRequest
     carrier_id: str
-    contract_source: Optional[str] = None  # "admin" | "reseller" (opzionale in modalità ibrida)
 
 class UpdateUserInput(BaseModel):
     billing_type: Optional[str] = None
@@ -351,24 +350,21 @@ async def _price_with_markup(user: dict, cost: float, weight: float, zone: str) 
 
 
 async def _resolve_tenant_carrier_options(user: dict) -> dict:
-    """Restituisce per ciascun corriere abilitato: policy, default_source, codice admin e codice reseller."""
+    """Restituisce per ciascun corriere abilitato al tenant se usa contratto Admin o Reseller."""
     rid = user.get("reseller_id")
     master_doc = await db.system_settings.find_one({"id": "master_carriers"}, {"_id": 0})
     master_carriers = (master_doc or {}).get("carriers") or {}
 
     if not rid:
-        # Super admin diretto
         out = {}
         for c in MOCK_CARRIERS:
             cid = c["id"]
             m = master_carriers.get(cid) or {}
             if m.get("status") == "verified":
                 out[cid] = {
-                    "policy": "admin_only",
-                    "default_source": "admin",
-                    "can_switch": False,
-                    "admin_code": m.get("primary_code", ""),
-                    "reseller_code": "",
+                    "owner": "admin",
+                    "code": m.get("primary_code", ""),
+                    "per_shipment_fee": 0.0,
                 }
         return out
 
@@ -376,41 +372,33 @@ async def _resolve_tenant_carrier_options(user: dict) -> dict:
     if not res:
         return {}
     policies = res.get("carrier_policies") or {}
-    defaults = res.get("carrier_defaults") or {}
     own_creds = res.get("carrier_credentials") or {}
     out = {}
 
     for c in MOCK_CARRIERS:
         cid = c["id"]
         pol = policies.get(cid, "admin_only")
+        if pol == "hybrid":
+            pol = "reseller_only"
         if pol == "disabled":
             continue
-        m = master_carriers.get(cid) or {}
-        o = own_creds.get(cid) or {}
-        admin_ready = m.get("status") == "verified"
-        reseller_ready = o.get("status") == "verified"
 
-        if pol == "admin_only" and not admin_ready:
-            continue
-        if pol == "reseller_only" and not reseller_ready:
-            continue
-        if pol == "hybrid" and not (admin_ready or reseller_ready):
-            continue
-
-        default_src = defaults.get(cid, "reseller" if pol == "reseller_only" else "admin")
-        if default_src == "reseller" and not reseller_ready:
-            default_src = "admin"
-        if default_src == "admin" and not admin_ready:
-            default_src = "reseller"
-
-        out[cid] = {
-            "policy": pol,
-            "default_source": default_src,
-            "can_switch": (pol == "hybrid" and admin_ready and reseller_ready and user.get("role") == "reseller_admin"),
-            "admin_code": m.get("primary_code", "") if admin_ready else "",
-            "reseller_code": o.get("primary_code", "") if reseller_ready else "",
-            "per_shipment_fee": float(res.get("per_shipment_fee") or 0.0),
-        }
+        if pol == "admin_only":
+            m = master_carriers.get(cid) or {}
+            if m.get("status") == "verified":
+                out[cid] = {
+                    "owner": "admin",
+                    "code": m.get("primary_code", ""),
+                    "per_shipment_fee": 0.0,
+                }
+        elif pol == "reseller_only":
+            o = own_creds.get(cid) or {}
+            if o.get("status") == "verified":
+                out[cid] = {
+                    "owner": "reseller",
+                    "code": o.get("primary_code", ""),
+                    "per_shipment_fee": float(res.get("per_shipment_fee") or 0.0),
+                }
     return out
 
 
@@ -441,9 +429,7 @@ async def quote_shipment(q: QuoteRequest, user=Depends(require_approved)):
             "carrier_id": c["id"], "carrier_name": c["name"], "color": c["color"],
             "cost": cost, "price": price, "transit_days": transit,
             "billed_weight": round(billed_weight, 2), "zone": zone,
-            "policy": opt["policy"],
-            "default_source": opt["default_source"],
-            "can_switch_source": opt["can_switch"],
+            "contract_owner": opt["owner"],
         })
     quotes.sort(key=lambda x: x["price"])
     return {"quotes": quotes, "billed_weight": round(billed_weight, 2), "zone": zone}
@@ -463,11 +449,8 @@ async def create_shipment(inp: CreateShipmentInput, user=Depends(require_approve
     if not opt:
         raise HTTPException(400, "Configurazione corriere non trovata")
 
-    source = opt["default_source"]
-    if inp.contract_source in ("admin", "reseller") and opt["can_switch"]:
-        source = inp.contract_source
-
-    code_used = opt["admin_code"] if source == "admin" else opt["reseller_code"]
+    source = opt["owner"]
+    code_used = opt["code"]
     applied_fee = 0.0 if source == "admin" else opt.get("per_shipment_fee", 0.0)
 
     price = chosen["price"]
