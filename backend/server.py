@@ -18,7 +18,7 @@ from reportlab.lib.units import mm
 from reportlab.lib import colors as rl_colors
 import openpyxl
 from openpyxl.styles import Font, PatternFill
-from carriers.fedex import is_fedex_configured, get_fedex_rates, create_fedex_shipment
+from carriers.fedex import is_fedex_configured, get_fedex_rates, create_fedex_shipment, track_fedex_shipment
 
 ROOT_DIR = Path(__file__).parent
 load_dotenv(ROOT_DIR / '.env')
@@ -543,8 +543,8 @@ async def create_shipment(inp: CreateShipmentInput, user=Depends(require_approve
 
     tracking_num = _tracking_number(inp.carrier_id)
     label_b64 = ""
+    is_live_shipment = False
 
-    # Se FedEx è configurato su Render, genera lettera di vettura reale via API FedEx
     if inp.carrier_id == "tnt" and is_fedex_configured() and code_used:
         try:
             fx_ship = await create_fedex_shipment(
@@ -561,6 +561,7 @@ async def create_shipment(inp: CreateShipmentInput, user=Depends(require_approve
             if fx_ship.get("tracking_number"):
                 tracking_num = fx_ship["tracking_number"]
             label_b64 = fx_ship.get("label_pdf_base64", "")
+            is_live_shipment = True
         except Exception as e:
             raise HTTPException(502, str(e))
 
@@ -572,6 +573,7 @@ async def create_shipment(inp: CreateShipmentInput, user=Depends(require_approve
         "contract_owner": source,
         "carrier_code_used": code_used,
         "applied_fee": applied_fee,
+        "is_live": is_live_shipment,
         "tracking_number": tracking_num,
         "carrier_id": inp.carrier_id,
         "carrier_name": chosen["carrier_name"],
@@ -593,7 +595,7 @@ async def create_shipment(inp: CreateShipmentInput, user=Depends(require_approve
         "cost": reseller_cost,
         "price": price,
         "status": "created",
-        "tracking_events": [{"ts": now_iso(), "code": "created", "label": "Spedizione creata"}],
+        "tracking_events": [{"ts": now_iso(), "code": "created", "label": "Spedizione creata / Etichetta generata", "location": inp.quote.sender.city}],
         "created_at": now_iso(),
     }
     await db.shipments.insert_one(shipment)
@@ -610,6 +612,36 @@ async def create_shipment(inp: CreateShipmentInput, user=Depends(require_approve
             shipment.pop(secret_k, None)
     return shipment
 
+
+async def _sync_live_tracking(s: dict) -> dict:
+    """Se la spedizione è reale FedEx e non ancora consegnata/annullata, sincronizza stato ed eventi da FedEx."""
+    if s.get("carrier_id") != "tnt" or not is_fedex_configured():
+        if not s.get("is_live"):
+            s["status"] = _simulate_status(s)
+        return s
+
+    if s.get("status") in ("delivered", "cancelled"):
+        return s
+
+    live = await track_fedex_shipment(s.get("tracking_number", ""))
+    if live:
+        updates: Dict[str, Any] = {
+            "status": live["status"],
+            "tracking_last_sync": now_iso(),
+        }
+        if live.get("events"):
+            updates["tracking_events"] = live["events"]
+        if live.get("estimated_delivery"):
+            updates["estimated_delivery"] = live["estimated_delivery"]
+        if live.get("actual_delivery"):
+            updates["actual_delivery"] = live["actual_delivery"]
+        if live.get("signed_by"):
+            updates["signed_by"] = live["signed_by"]
+        await db.shipments.update_one({"id": s["id"]}, {"$set": updates})
+        s.update(updates)
+    return s
+
+
 @api_router.get("/shipments")
 async def list_shipments(user=Depends(require_approved)):
     q = tenant_filter(user)
@@ -618,8 +650,10 @@ async def list_shipments(user=Depends(require_approved)):
         proj.update({"cost": 0, "carrier_cost": 0, "reseller_cost": 0, "admin_markup_percent": 0, "reseller_markup_percent": 0})
     ships = await db.shipments.find(q, proj).sort("created_at", -1).to_list(1000)
     for s in ships:
-        s["status"] = _simulate_status(s)
+        if not s.get("is_live"):
+            s["status"] = _simulate_status(s)
     return ships
+
 
 @api_router.get("/shipments/{sid}")
 async def get_shipment(sid: str, user=Depends(require_approved)):
@@ -630,8 +664,22 @@ async def get_shipment(sid: str, user=Depends(require_approved)):
     s = await db.shipments.find_one(q, proj)
     if not s:
         raise HTTPException(404, "Spedizione non trovata")
-    s["status"] = _simulate_status(s)
+    s = await _sync_live_tracking(s)
     return s
+
+
+@api_router.post("/shipments/{sid}/track/refresh")
+async def refresh_shipment_tracking(sid: str, user=Depends(require_approved)):
+    q = tenant_filter(user, {"id": sid})
+    proj = {"_id": 0, "label_pdf_base64": 0}
+    if user.get("role") == "user":
+        proj.update({"cost": 0, "carrier_cost": 0, "reseller_cost": 0, "admin_markup_percent": 0, "reseller_markup_percent": 0})
+    s = await db.shipments.find_one(q, proj)
+    if not s:
+        raise HTTPException(404, "Spedizione non trovata")
+    s = await _sync_live_tracking(s)
+    return s
+
 
 def _simulate_status(s: dict) -> str:
     try:
@@ -657,7 +705,6 @@ async def download_label(sid: str, user=Depends(require_approved)):
     if not s:
         raise HTTPException(404, "Spedizione non trovata")
 
-    # Se presente l'etichetta PDF ufficiale del corriere (es. FedEx Base64), restituisci quella
     if s.get("label_pdf_base64"):
         pdf_bytes = base64.b64decode(s["label_pdf_base64"])
         return StreamingResponse(
@@ -717,6 +764,7 @@ async def export_shipments(user=Depends(require_approved)):
         cell.fill = PatternFill("solid", fgColor="0F172A")
     for s in ships:
         owner = s.get("contract_owner", "admin" if s.get("on_master_codes", True) else "reseller")
+        st = s.get("status") if s.get("is_live") else _simulate_status(s)
         ws.append([
             s.get("created_at", ""), s.get("tracking_number", ""), s.get("carrier_name", ""),
             "Piattaforma" if owner == "admin" else "Proprio",
@@ -726,7 +774,7 @@ async def export_shipments(user=Depends(require_approved)):
             s.get("recipient", {}).get("city", ""),
             s.get("recipient", {}).get("country", ""),
             len(s.get("parcels", [])), s.get("billed_weight", 0),
-            s.get("zone", ""), s.get("price", 0), _simulate_status(s),
+            s.get("zone", ""), s.get("price", 0), st,
         ])
     for i, _ in enumerate(ws.columns, start=1):
         ws.column_dimensions[openpyxl.utils.get_column_letter(i)].width = 18
