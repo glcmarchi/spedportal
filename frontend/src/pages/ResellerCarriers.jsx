@@ -46,23 +46,13 @@ export default function ResellerCarriers() {
     }
   };
 
-  const setDefault = async (cid, src) => {
-    try {
-      await api.patch(`/reseller/carriers/${cid}/default`, { default_source: src });
-      toast.success("Contratto predefinito aggiornato");
-      load();
-    } catch (err) {
-      toast.error(err?.response?.data?.detail || "Impossibile cambiare il default");
-    }
-  };
-
   return (
     <div className="space-y-6">
       <div>
         <div className="label-caps text-orange-600 mb-1 flex items-center gap-1.5"><Key size={14} weight="fill" /> Contratti Corrieri</div>
         <h1 className="text-4xl font-black tracking-tighter text-slate-900" style={{ fontFamily: "Chivo" }}>I Miei Corrieri</h1>
         <p className="text-sm text-slate-500 mt-1">
-          Configura i tuoi codici contrattuali sui corrieri abilitati (fee piattaforma per spedizioni su codice proprio: <b>€ {Number(fee).toFixed(2)}</b>).
+          Configura i tuoi codici contrattuali sui corrieri assegnati al tuo account (fee piattaforma per spedizioni su codice proprio: <b>€ {Number(fee).toFixed(2)}</b>).
         </p>
       </div>
 
@@ -78,7 +68,7 @@ export default function ResellerCarriers() {
                 <div>
                   <div className="font-black text-xl" style={{ fontFamily: "Chivo" }}>{c.name}</div>
                   <div className="text-xs text-slate-500">
-                    Modalità: <b>{c.policy === "hybrid" ? "Ibrido (Tuo codice + Piattaforma)" : c.policy === "reseller_only" ? "Solo Tuo Codice" : "Contratto Piattaforma"}</b>
+                    Contratto: <b>{c.can_configure_own ? "Codice Proprio Reseller" : "Contratto Piattaforma"}</b>
                   </div>
                 </div>
                 {c.can_configure_own ? (
@@ -95,25 +85,6 @@ export default function ResellerCarriers() {
                   </span>
                 )}
               </div>
-
-              {c.policy === "hybrid" && (
-                <div className="bg-slate-50 border border-slate-200 rounded-sm p-3 flex items-center justify-between gap-2 flex-wrap">
-                  <span className="text-xs font-semibold text-slate-700">Contratto Default:</span>
-                  <div className="flex gap-1.5">
-                    <Button size="sm" variant={c.default_source === "admin" ? "default" : "outline"}
-                      onClick={() => setDefault(c.carrier_id, "admin")}
-                      className={`h-7 text-xs rounded-sm ${c.default_source === "admin" ? "bg-slate-900" : ""}`}>
-                      Piattaforma
-                    </Button>
-                    <Button size="sm" variant={c.default_source === "reseller" ? "default" : "outline"}
-                      disabled={!isVerified}
-                      onClick={() => setDefault(c.carrier_id, "reseller")}
-                      className={`h-7 text-xs rounded-sm ${c.default_source === "reseller" ? "bg-orange-600 hover:bg-orange-700" : ""}`}>
-                      Il Mio Codice
-                    </Button>
-                  </div>
-                </div>
-              )}
 
               {c.can_configure_own ? (
                 <>
