@@ -30,6 +30,7 @@ export default function SuperAdmin() {
   const [resellers, setResellers] = useState([]);
   const [masterData, setMasterData] = useState({ schemas: {}, carriers: {} });
   const [masterDrafts, setMasterDrafts] = useState({});
+  const [masterMarkups, setMasterMarkups] = useState({});
   const [open, setOpen] = useState(false);
   const [editing, setEditing] = useState(null);
   const [billing, setBilling] = useState(null);
@@ -38,6 +39,7 @@ export default function SuperAdmin() {
     company_name: "", admin_email: "", admin_password: "", plan: "basic",
     features: Object.fromEntries(FEATURE_KEYS.map(([k]) => [k, true])),
     carrier_policies: Object.fromEntries(CARRIERS.map(c => [c, "admin_only"])),
+    admin_carrier_markups: {},
     per_shipment_fee: 0.15, active: true,
   };
   const [form, setForm] = useState(empty);
@@ -47,10 +49,13 @@ export default function SuperAdmin() {
     api.get("/super/master-carriers").then(r => {
       setMasterData(r.data);
       const drafts = {};
+      const mks = {};
       Object.keys(r.data.schemas || {}).forEach(cid => {
         drafts[cid] = { ...(r.data.carriers?.[cid]?.values || {}) };
+        mks[cid] = r.data.carriers?.[cid]?.default_markup_percent ?? 5;
       });
       setMasterDrafts(drafts);
+      setMasterMarkups(mks);
     });
   };
   useEffect(() => { load(); }, []);
@@ -73,8 +78,11 @@ export default function SuperAdmin() {
 
   const saveMasterCarrier = async (cid) => {
     try {
-      await api.put(`/super/master-carriers/${cid}`, { values: masterDrafts[cid] || {} });
-      toast.success(`Configurazione ${masterData.schemas[cid]?.name} salvata`);
+      await api.put(`/super/master-carriers/${cid}`, {
+        values: masterDrafts[cid] || {},
+        default_markup_percent: parseFloat(masterMarkups[cid]) || 0,
+      });
+      toast.success(`Configurazione e margine ${masterData.schemas[cid]?.name} salvati`);
       load();
     } catch (err) {
       toast.error(err?.response?.data?.detail || "Errore salvataggio corriere");
@@ -83,7 +91,10 @@ export default function SuperAdmin() {
 
   const authMasterCarrier = async (cid) => {
     try {
-      await api.put(`/super/master-carriers/${cid}`, { values: masterDrafts[cid] || {} });
+      await api.put(`/super/master-carriers/${cid}`, {
+        values: masterDrafts[cid] || {},
+        default_markup_percent: parseFloat(masterMarkups[cid]) || 0,
+      });
       await api.post(`/super/master-carriers/${cid}/authenticate`);
       toast.success(`Account ${masterData.schemas[cid]?.name} autenticato con successo!`);
       load();
@@ -99,6 +110,7 @@ export default function SuperAdmin() {
       ...empty,
       ...r,
       carrier_policies: { ...empty.carrier_policies, ...(r.carrier_policies || {}) },
+      admin_carrier_markups: { ...(r.admin_carrier_markups || {}) },
       admin_email: r.admin_email,
       admin_password: "",
     });
@@ -139,6 +151,7 @@ export default function SuperAdmin() {
         <div className="grid gap-4">
           {resellers.map(r => {
             const pols = r.carrier_policies || {};
+            const customMk = r.admin_carrier_markups || {};
             return (
               <div key={r.id} className="bg-white border border-slate-200 rounded-sm p-5">
                 <div className="flex items-start justify-between gap-4 flex-wrap">
@@ -150,8 +163,10 @@ export default function SuperAdmin() {
                       <div className="flex flex-wrap gap-1.5 mt-2">
                         {CARRIERS.map(c => {
                           const p = pols[c] || "admin_only";
+                          const defMk = masterData.carriers?.[c]?.default_markup_percent ?? 0;
+                          const effMk = customMk[c] !== undefined && customMk[c] !== null ? customMk[c] : defMk;
                           const badge = p === "reseller_only" ? "bg-blue-100 text-blue-800" : p === "disabled" ? "bg-slate-100 text-slate-400 line-through" : "bg-orange-100 text-orange-800";
-                          const label = p === "reseller_only" ? "Reseller" : p === "disabled" ? "Off" : "Admin";
+                          const label = p === "reseller_only" ? "Reseller" : p === "disabled" ? "Off" : `Admin (+${effMk}%)`;
                           return <span key={c} className={`text-[10px] font-bold uppercase px-2 py-0.5 rounded-sm ${badge}`}>{c}: {label}</span>;
                         })}
                       </div>
@@ -159,7 +174,7 @@ export default function SuperAdmin() {
                   </div>
                   <div className="flex gap-2">
                     <Button variant="outline" size="sm" onClick={() => showBilling(r)} className="rounded-sm"><Receipt size={14} className="mr-1" /> Fatturazione</Button>
-                    <Button variant="outline" size="sm" onClick={() => startEdit(r)} className="rounded-sm">Permessi & Modifica</Button>
+                    <Button variant="outline" size="sm" onClick={() => startEdit(r)} className="rounded-sm">Permessi & Margini</Button>
                   </div>
                 </div>
               </div>
@@ -212,6 +227,20 @@ export default function SuperAdmin() {
                       />
                     </div>
                   ))}
+                  <div className="sm:col-span-2 bg-orange-50/60 border border-orange-200 p-2.5 rounded-sm flex items-center justify-between gap-3">
+                    <div>
+                      <div className="label-caps text-orange-800">Margine Admin Default (%)</div>
+                      <div className="text-[11px] text-slate-600">Ricarico applicato ai Reseller che usano questo codice</div>
+                    </div>
+                    <Input
+                      type="number"
+                      step="0.5"
+                      min="0"
+                      value={masterMarkups[cid] ?? 5}
+                      onChange={(e) => setMasterMarkups({ ...masterMarkups, [cid]: e.target.value })}
+                      className="w-24 rounded-sm h-9 text-xs font-bold text-right bg-white"
+                    />
+                  </div>
                 </div>
 
                 <div className="flex justify-end gap-2 pt-2">
@@ -221,7 +250,7 @@ export default function SuperAdmin() {
                     </Button>
                   ) : (
                     <Button onClick={() => saveMasterCarrier(cid)} className="bg-orange-600 hover:bg-orange-700 rounded-sm h-9 text-xs">
-                      Salva Codice Master
+                      Salva Codice & Margine
                     </Button>
                   )}
                 </div>
@@ -231,7 +260,7 @@ export default function SuperAdmin() {
         </div>
       )}
 
-      {/* DIALOG MODIFICA RESELLER E PERMESSI PER CORRIERE */}
+      {/* DIALOG MODIFICA RESELLER, PERMESSI E MARGINI PERSONALIZZATI */}
       <Dialog open={open} onOpenChange={setOpen}>
         <DialogContent className="max-w-3xl rounded-sm max-h-[90vh] overflow-y-auto">
           <DialogHeader><DialogTitle style={{ fontFamily: "Chivo" }}>{editing ? "Configura" : "Nuovo"} Reseller</DialogTitle></DialogHeader>
@@ -248,23 +277,57 @@ export default function SuperAdmin() {
             </div>
 
             <div className="border-t pt-4">
-              <div className="label-caps text-orange-600 mb-1">Assegnazione Codici Corrieri per questo Reseller</div>
-              <p className="text-xs text-slate-500 mb-3">Scegli per singolo corriere se il Reseller utilizza il tuo codice Admin (Master) oppure il proprio codice Reseller.</p>
+              <div className="label-caps text-orange-600 mb-1">Assegnazione Codici Corrieri & Margine Admin</div>
+              <p className="text-xs text-slate-500 mb-3">
+                Per i corrieri su <b>Codice Admin</b> puoi lasciare vuoto il campo % per usare il margine di default, oppure inserire una % personalizzata per questo Reseller.
+              </p>
               <div className="space-y-2">
-                {CARRIERS.map(cid => (
-                  <div key={cid} className="grid grid-cols-1 sm:grid-cols-2 gap-2 items-center bg-slate-50 p-2.5 rounded-sm border border-slate-200">
-                    <div className="font-bold text-sm uppercase">{masterData.schemas?.[cid]?.name || cid}</div>
-                    <Select
-                      value={form.carrier_policies?.[cid] || "admin_only"}
-                      onValueChange={(v) => setForm({ ...form, carrier_policies: { ...(form.carrier_policies || {}), [cid]: v } })}
-                    >
-                      <SelectTrigger className="h-9 rounded-sm bg-white text-xs"><SelectValue /></SelectTrigger>
-                      <SelectContent>
-                        {POLICY_OPTIONS.map(o => <SelectItem key={o.value} value={o.value}>{o.label}</SelectItem>)}
-                      </SelectContent>
-                    </Select>
-                  </div>
-                ))}
+                {CARRIERS.map(cid => {
+                  const pol = form.carrier_policies?.[cid] || "admin_only";
+                  const defMk = masterData.carriers?.[cid]?.default_markup_percent ?? 5;
+                  const customVal = form.admin_carrier_markups?.[cid];
+                  return (
+                    <div key={cid} className="grid grid-cols-1 sm:grid-cols-12 gap-2 items-center bg-slate-50 p-2.5 rounded-sm border border-slate-200">
+                      <div className="sm:col-span-3 font-bold text-sm uppercase">{masterData.schemas?.[cid]?.name || cid}</div>
+                      <div className="sm:col-span-5">
+                        <Select
+                          value={pol}
+                          onValueChange={(v) => setForm({ ...form, carrier_policies: { ...(form.carrier_policies || {}), [cid]: v } })}
+                        >
+                          <SelectTrigger className="h-9 rounded-sm bg-white text-xs"><SelectValue /></SelectTrigger>
+                          <SelectContent>
+                            {POLICY_OPTIONS.map(o => <SelectItem key={o.value} value={o.value}>{o.label}</SelectItem>)}
+                          </SelectContent>
+                        </Select>
+                      </div>
+                      <div className="sm:col-span-4">
+                        {pol === "admin_only" ? (
+                          <div className="flex items-center gap-1.5">
+                            <Input
+                              type="number"
+                              step="0.5"
+                              min="0"
+                              placeholder={`Default ${defMk}%`}
+                              value={customVal !== undefined && customVal !== null ? customVal : ""}
+                              onChange={(e) => {
+                                const raw = e.target.value;
+                                const next = { ...(form.admin_carrier_markups || {}) };
+                                next[cid] = raw === "" ? null : parseFloat(raw);
+                                setForm({ ...form, admin_carrier_markups: next });
+                              }}
+                              className="h-9 rounded-sm bg-white text-xs text-right"
+                            />
+                            <span className="text-xs text-slate-500 font-semibold">%</span>
+                          </div>
+                        ) : (
+                          <div className="text-[11px] text-slate-400 text-right pr-2">
+                            {pol === "reseller_only" ? `Fee € ${Number(form.per_shipment_fee || 0).toFixed(2)}` : "Disabilitato"}
+                          </div>
+                        )}
+                      </div>
+                    </div>
+                  );
+                })}
               </div>
             </div>
 
@@ -285,17 +348,18 @@ export default function SuperAdmin() {
         </DialogContent>
       </Dialog>
 
-      {/* DIALOG REPORT FATTURAZIONE & CODICI USATI */}
+      {/* DIALOG REPORT FATTURAZIONE & MARGINI */}
       <Dialog open={!!billing} onOpenChange={(o) => !o && setBilling(null)}>
         <DialogContent className="rounded-sm max-w-2xl max-h-[85vh] overflow-y-auto">
           {billing && (
             <>
-              <DialogHeader><DialogTitle style={{ fontFamily: "Chivo" }}>Fatturazione & Codici — {billing.reseller.company_name}</DialogTitle></DialogHeader>
+              <DialogHeader><DialogTitle style={{ fontFamily: "Chivo" }}>Fatturazione & Margini — {billing.reseller.company_name}</DialogTitle></DialogHeader>
               <div className="space-y-2 text-sm">
-                <div className="flex justify-between py-2 border-b"><span>Spedizioni su codici Admin (da rifatturare)</span><b>{billing.shipments_on_master}</b></div>
-                <div className="flex justify-between py-2 border-b"><span>Importo trasporto codici Admin</span><b>€ {billing.amount_due_standard.toFixed(2)}</b></div>
-                <div className="flex justify-between py-2 border-b"><span>Spedizioni su codici propri Reseller</span><b>{billing.shipments_on_own}</b></div>
-                <div className="flex justify-between py-2 border-b"><span>Fee piattaforma su codici Reseller</span><b>€ {billing.amount_due_premium.toFixed(2)}</b></div>
+                <div className="flex justify-between py-2 border-b"><span>Spedizioni su codici Admin</span><b>{billing.shipments_on_master}</b></div>
+                <div className="flex justify-between py-2 border-b text-slate-500"><span>Costo vivo API corriere (codici Admin)</span><span>€ {(billing.raw_carrier_cost_master ?? billing.amount_due_standard).toFixed(2)}</span></div>
+                <div className="flex justify-between py-2 border-b text-green-700"><span>Margine Admin maturato</span><b>+ € {(billing.admin_margin_earned ?? 0).toFixed(2)}</b></div>
+                <div className="flex justify-between py-2 border-b"><span>Totale trasporto da rifatturare al Reseller</span><b>€ {billing.amount_due_standard.toFixed(2)}</b></div>
+                <div className="flex justify-between py-2 border-b"><span>Spedizioni su codici propri Reseller ({billing.shipments_on_own})</span><b>€ {billing.amount_due_premium.toFixed(2)}</b></div>
                 <div className="flex justify-between py-3 border-t-2 border-slate-900 text-lg"><span className="font-black">Totale da fatturare</span><b className="text-orange-600">€ {billing.amount_due_total.toFixed(2)}</b></div>
               </div>
               {billing.recent_shipments?.length > 0 && (
@@ -307,27 +371,29 @@ export default function SuperAdmin() {
                         <tr>
                           <th className="p-2">Tracking</th>
                           <th className="p-2">Corriere</th>
-                          <th className="p-2">Titolare Codice</th>
-                          <th className="p-2">Codice Usato</th>
-                          <th className="p-2 text-right">Costo / Fee</th>
+                          <th className="p-2">Titolare</th>
+                          <th className="p-2">Codice</th>
+                          <th className="p-2 text-right">Costo API</th>
+                          <th className="p-2 text-right">Fatt. Reseller</th>
                         </tr>
                       </thead>
                       <tbody>
                         {billing.recent_shipments.map(s => {
                           const isAdm = (s.contract_owner || (s.on_master_codes ? "admin" : "reseller")) === "admin";
+                          const rawC = s.carrier_cost ?? s.cost ?? 0;
+                          const billedR = isAdm ? (s.reseller_cost ?? s.cost ?? 0) : (s.applied_fee ?? billing.reseller.per_shipment_fee ?? 0);
                           return (
                             <tr key={s.id} className="border-t">
                               <td className="p-2 font-mono">{s.tracking_number}</td>
                               <td className="p-2">{s.carrier_name}</td>
                               <td className="p-2">
                                 <span className={`px-1.5 py-0.5 rounded-sm font-bold ${isAdm ? "bg-orange-100 text-orange-800" : "bg-blue-100 text-blue-800"}`}>
-                                  {isAdm ? "Admin" : "Reseller"}
+                                  {isAdm ? `Admin (+${s.admin_markup_percent ?? 0}%)` : "Reseller"}
                                 </span>
                               </td>
                               <td className="p-2 font-mono">{s.carrier_code_used || "-"}</td>
-                              <td className="p-2 text-right font-semibold">
-                                € {(isAdm ? (s.cost || 0) : (s.applied_fee ?? billing.reseller.per_shipment_fee ?? 0)).toFixed(2)}
-                              </td>
+                              <td className="p-2 text-right text-slate-500">€ {rawC.toFixed(2)}</td>
+                              <td className="p-2 text-right font-semibold">€ {billedR.toFixed(2)}</td>
                             </tr>
                           );
                         })}
