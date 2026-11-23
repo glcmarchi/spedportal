@@ -1,7 +1,6 @@
 import os
 import time
 import uuid
-import base64
 import logging
 from datetime import datetime, timezone
 from typing import Dict, Any, List, Optional
@@ -18,6 +17,26 @@ _TOKEN_CACHE: Dict[str, Any] = {"access_token": None, "expires_at": 0.0}
 TRANSIT_MAP = {
     "ONE_DAY": 1, "TWO_DAYS": 2, "THREE_DAYS": 3, "FOUR_DAYS": 4,
     "FIVE_DAYS": 5, "SIX_DAYS": 6, "SEVEN_DAYS": 7, "EIGHT_DAYS": 8,
+}
+
+# Mappatura codici stato FedEx (latestStatusDetail.derivedCode / code) -> stati SpedPortal
+FEDEX_STATUS_MAP = {
+    "OC": "created",           # Order Created / Label Created
+    "AP": "created",           # At Pickup
+    "PU": "in_transit",        # Picked Up
+    "IT": "in_transit",        # In Transit
+    "AR": "in_transit",        # Arrived at FedEx location
+    "DP": "in_transit",        # Departed FedEx location
+    "AF": "in_transit",        # At local FedEx facility
+    "CC": "in_customs",        # Cleared Customs
+    "CD": "in_customs",        # Clearance Delay
+    "OD": "out_for_delivery",  # Out for Delivery
+    "DL": "delivered",         # Delivered
+    "DE": "exception",         # Delivery Exception
+    "SE": "exception",         # Shipment Exception
+    "HL": "exception",         # Hold at Location
+    "CA": "cancelled",         # Shipment Cancelled
+    "RS": "exception",         # Return to Shipper
 }
 
 
@@ -108,7 +127,6 @@ def _extract_net_charge(rated_details: List[Dict[str, Any]]) -> Dict[str, Any]:
     net = float(chosen.get("totalNetFedExCharge") or chosen.get("totalNetCharge") or (base + surcharges))
     currency = chosen.get("currency") or srd.get("currency") or "EUR"
 
-    # Se FedEx quota in valuta estera e fornisce currencyExchangeRate verso EUR
     fx = srd.get("currencyExchangeRate") or {}
     if currency != "EUR" and fx.get("intoCurrency") == "EUR" and fx.get("rate"):
         rate = float(fx["rate"])
@@ -372,4 +390,86 @@ async def create_fedex_shipment(
             "service_type": tx.get("serviceType", service_type),
             "service_name": tx.get("serviceName", "FedEx"),
             "label_pdf_base64": label_b64,
+        }
+
+
+async def track_fedex_shipment(tracking_number: str) -> Optional[Dict[str, Any]]:
+    """Chiama POST /track/v1/trackingnumbers (Basic Integrated Visibility) per stato ed eventi reali."""
+    if not is_fedex_configured() or not tracking_number:
+        return None
+    token = await get_fedex_token()
+    payload = {
+        "includeDetailedScans": True,
+        "trackingInfo": [
+            {
+                "trackingNumberInfo": {
+                    "trackingNumber": str(tracking_number).strip()
+                }
+            }
+        ],
+    }
+
+    async with httpx.AsyncClient(timeout=20.0) as client:
+        resp = await client.post(
+            f"{FEDEX_BASE_URL}/track/v1/trackingnumbers",
+            json=payload,
+            headers=_headers(token),
+        )
+        if resp.status_code != 200:
+            logger.warning("FedEx Track API %s: %s", resp.status_code, resp.text[:400])
+            return None
+
+        data = resp.json()
+        complete = ((data.get("output") or {}).get("completeTrackResults")) or []
+        if not complete:
+            return None
+        track_results = complete[0].get("trackResults") or []
+        if not track_results:
+            return None
+        tr = track_results[0]
+
+        if tr.get("error"):
+            logger.info("FedEx Track notice for %s: %s", tracking_number, tr["error"].get("message"))
+            return None
+
+        latest = tr.get("latestStatusDetail") or {}
+        raw_code = (latest.get("derivedCode") or latest.get("code") or "").upper()
+        mapped_status = FEDEX_STATUS_MAP.get(raw_code, "in_transit" if raw_code else "created")
+        status_label = latest.get("statusByLocale") or latest.get("description") or ""
+
+        events = []
+        for ev in tr.get("scanEvents") or []:
+            loc = ev.get("scanLocation") or {}
+            city = loc.get("city") or ""
+            country = loc.get("countryCode") or ""
+            place = ", ".join([x for x in (city, country) if x])
+            desc = ev.get("eventDescription") or ev.get("derivedStatus") or ""
+            if ev.get("exceptionDescription"):
+                desc = f"{desc} — {ev['exceptionDescription']}"
+            events.append({
+                "ts": ev.get("date") or "",
+                "code": (ev.get("derivedStatusCode") or ev.get("eventType") or "").lower(),
+                "label": desc,
+                "location": place,
+            })
+
+        estimated_delivery = None
+        actual_delivery = None
+        for dt in tr.get("dateAndTimes") or []:
+            if dt.get("type") == "ACTUAL_DELIVERY":
+                actual_delivery = dt.get("dateTime")
+            elif dt.get("type") in ("ESTIMATED_DELIVERY", "COMMITMENT") and not estimated_delivery:
+                estimated_delivery = dt.get("dateTime")
+
+        delivery_details = tr.get("deliveryDetails") or {}
+        signed_by = delivery_details.get("signedByName") or delivery_details.get("receivedByName") or ""
+
+        return {
+            "status": mapped_status,
+            "raw_code": raw_code,
+            "status_label": status_label,
+            "events": events,
+            "estimated_delivery": estimated_delivery,
+            "actual_delivery": actual_delivery,
+            "signed_by": signed_by,
         }
