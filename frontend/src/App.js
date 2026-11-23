@@ -24,6 +24,7 @@ import Support from "@/pages/Support";
 import Manifests from "@/pages/Manifests";
 import PendingApproval from "@/pages/PendingApproval";
 import SuperAdmin from "@/pages/SuperAdmin";
+import ResellerCarriers from "@/pages/ResellerCarriers";
 
 const ADMIN_ROLES = ["admin", "reseller_admin", "super_admin"];
 
@@ -74,6 +75,7 @@ function App() {
               <Route path="/manifests" element={<Manifests />} />
               <Route path="/admin/users" element={<Protected adminOnly><AdminUsers /></Protected>} />
               <Route path="/admin/rates" element={<Protected adminOnly><AdminRates /></Protected>} />
+              <Route path="/admin/carriers" element={<Protected adminOnly><ResellerCarriers /></Protected>} />
               <Route path="/admin/broadcast" element={<Protected adminOnly><AdminBroadcast /></Protected>} />
             </Route>
           </Routes>
