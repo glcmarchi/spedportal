@@ -18,7 +18,13 @@ from reportlab.lib.units import mm
 from reportlab.lib import colors as rl_colors
 import openpyxl
 from openpyxl.styles import Font, PatternFill
-from carriers.fedex import is_fedex_configured, get_fedex_rates, create_fedex_shipment, track_fedex_shipment
+from carriers.fedex import (
+    is_fedex_configured,
+    get_fedex_rates,
+    create_fedex_shipment,
+    cancel_fedex_shipment,
+    track_fedex_shipment,
+)
 
 ROOT_DIR = Path(__file__).parent
 load_dotenv(ROOT_DIR / '.env')
@@ -614,13 +620,12 @@ async def create_shipment(inp: CreateShipmentInput, user=Depends(require_approve
 
 
 async def _sync_live_tracking(s: dict) -> dict:
-    """Se la spedizione è reale FedEx e non ancora consegnata/annullata, sincronizza stato ed eventi da FedEx."""
+    if s.get("status") in ("delivered", "cancelled"):
+        return s
+
     if s.get("carrier_id") != "tnt" or not is_fedex_configured():
         if not s.get("is_live"):
             s["status"] = _simulate_status(s)
-        return s
-
-    if s.get("status") in ("delivered", "cancelled"):
         return s
 
     live = await track_fedex_shipment(s.get("tracking_number", ""))
@@ -650,7 +655,7 @@ async def list_shipments(user=Depends(require_approved)):
         proj.update({"cost": 0, "carrier_cost": 0, "reseller_cost": 0, "admin_markup_percent": 0, "reseller_markup_percent": 0})
     ships = await db.shipments.find(q, proj).sort("created_at", -1).to_list(1000)
     for s in ships:
-        if not s.get("is_live"):
+        if s.get("status") != "cancelled" and not s.get("is_live"):
             s["status"] = _simulate_status(s)
     return ships
 
@@ -681,7 +686,71 @@ async def refresh_shipment_tracking(sid: str, user=Depends(require_approved)):
     return s
 
 
+@api_router.post("/shipments/{sid}/cancel")
+async def cancel_shipment(sid: str, user=Depends(require_approved)):
+    q = tenant_filter(user, {"id": sid})
+    s = await db.shipments.find_one(q, {"_id": 0, "label_pdf_base64": 0})
+    if not s:
+        raise HTTPException(404, "Spedizione non trovata")
+
+    current_status = s.get("status") if (s.get("is_live") or s.get("status") == "cancelled") else _simulate_status(s)
+    if current_status == "cancelled":
+        raise HTTPException(400, "Spedizione già annullata")
+    if current_status != "created":
+        raise HTTPException(400, "Impossibile annullare: la spedizione è già stata affidata al corriere")
+
+    if s.get("carrier_id") == "tnt" and s.get("is_live") and is_fedex_configured():
+        account_num = s.get("carrier_code_used", "")
+        sender_country = (s.get("sender") or {}).get("country", "IT")
+        try:
+            await cancel_fedex_shipment(
+                account_number=account_num,
+                tracking_number=s.get("tracking_number", ""),
+                sender_country_code=sender_country,
+            )
+        except Exception as e:
+            raise HTTPException(502, str(e))
+
+    cancel_event = {
+        "ts": now_iso(),
+        "code": "cancelled",
+        "label": "Spedizione annullata prima del ritiro",
+        "location": (s.get("sender") or {}).get("city", ""),
+    }
+    await db.shipments.update_one(
+        {"id": sid},
+        {
+            "$set": {"status": "cancelled", "cancelled_at": now_iso()},
+            "$push": {"tracking_events": cancel_event},
+        },
+    )
+
+    # Rimborso automatico se l'utente che ha pagato era in modalità prepagata
+    owner_user = await db.users.find_one({"id": s["user_id"]})
+    if owner_user and owner_user.get("billing_type") == "prepaid":
+        refund_amount = float(s.get("price") or 0.0)
+        if refund_amount > 0:
+            await db.users.update_one({"id": s["user_id"]}, {"$inc": {"credit_balance": refund_amount}})
+            await db.ledger.insert_one({
+                "id": new_id(),
+                "user_id": s["user_id"],
+                "reseller_id": s.get("reseller_id"),
+                "type": "shipment_refund",
+                "amount": refund_amount,
+                "shipment_id": sid,
+                "created_at": now_iso(),
+            })
+
+    proj = {"_id": 0, "label_pdf_base64": 0}
+    if user.get("role") == "user":
+        proj.update({"cost": 0, "carrier_cost": 0, "reseller_cost": 0, "admin_markup_percent": 0, "reseller_markup_percent": 0})
+    updated = await db.shipments.find_one({"id": sid}, proj)
+    return updated
+
+
 def _simulate_status(s: dict) -> str:
+    if s.get("status") == "cancelled":
+        return "cancelled"
     try:
         created = datetime.fromisoformat(s["created_at"])
     except Exception:
@@ -764,7 +833,7 @@ async def export_shipments(user=Depends(require_approved)):
         cell.fill = PatternFill("solid", fgColor="0F172A")
     for s in ships:
         owner = s.get("contract_owner", "admin" if s.get("on_master_codes", True) else "reseller")
-        st = s.get("status") if s.get("is_live") else _simulate_status(s)
+        st = s.get("status") if (s.get("is_live") or s.get("status") == "cancelled") else _simulate_status(s)
         ws.append([
             s.get("created_at", ""), s.get("tracking_number", ""), s.get("carrier_name", ""),
             "Piattaforma" if owner == "admin" else "Proprio",
@@ -882,7 +951,10 @@ async def generate_invoice(user_id: str, admin=Depends(require_admin)):
         raise HTTPException(404, "Utente non trovato")
     if admin.get("role") == "reseller_admin" and target.get("reseller_id") != admin.get("reseller_id"):
         raise HTTPException(403, "Utente di altro reseller")
-    ships = await db.shipments.find({"user_id": user_id, "invoice_id": {"$exists": False}}, {"_id": 0, "label_pdf_base64": 0}).to_list(1000)
+    ships = await db.shipments.find(
+        {"user_id": user_id, "invoice_id": {"$exists": False}, "status": {"$ne": "cancelled"}},
+        {"_id": 0, "label_pdf_base64": 0}
+    ).to_list(1000)
     if not ships:
         raise HTTPException(400, "Nessuna spedizione da fatturare")
     total = sum(s["price"] for s in ships)
