@@ -13,7 +13,6 @@ DEFAULT_FEATURES = {
 }
 DEFAULT_CARRIERS = ["brt", "gls", "dhl", "ups", "tnt", "poste"]
 
-# Schemi campi per corriere: distingue credenziali dirette vs Account Linking (FedEx/UPS)
 CARRIER_SCHEMAS = {
     "brt": {
         "name": "BRT",
@@ -73,6 +72,7 @@ CARRIER_SCHEMAS = {
     },
 }
 
+# Policy consentite: admin_only | reseller_only | disabled
 DEFAULT_POLICIES = {c: "admin_only" for c in DEFAULT_CARRIERS}
 
 
@@ -86,6 +86,14 @@ async def require_reseller_admin(user=Depends(get_current_user)):
     if user.get("role") != "reseller_admin" or not user.get("reseller_id"):
         raise HTTPException(403, "Riservato all'amministratore del Reseller")
     return user
+
+
+def _normalize_policy(pol: str) -> str:
+    if pol == "hybrid":
+        return "reseller_only"
+    if pol in ("admin_only", "reseller_only", "disabled"):
+        return pol
+    return "admin_only"
 
 
 def _validate_carrier_payload(carrier_id: str, values: Dict[str, Any]):
@@ -111,7 +119,7 @@ class ResellerInput(BaseModel):
     admin_password: Optional[str] = None
     plan: str = "basic"
     features: Optional[Dict[str, bool]] = None
-    carrier_policies: Optional[Dict[str, str]] = None  # admin_only | reseller_only | hybrid | disabled
+    carrier_policies: Optional[Dict[str, str]] = None  # admin_only | reseller_only | disabled
     carrier_credentials: Optional[Dict[str, Dict[str, Any]]] = None
     per_shipment_fee: float = 0.0
     active: bool = True
@@ -119,11 +127,6 @@ class ResellerInput(BaseModel):
 
 class CarrierCredsSave(BaseModel):
     values: Dict[str, Any]
-    default_source: Optional[str] = None  # "admin" | "reseller"
-
-
-class CarrierDefaultInput(BaseModel):
-    default_source: str  # "admin" | "reseller"
 
 
 # --- ENDPOINT SCHEMI CORRIERI ---
@@ -190,13 +193,13 @@ async def create_reseller(inp: ResellerInput, _=Depends(require_super_admin)):
     rid = new_id()
     slug = (inp.slug or inp.company_name.lower().replace(" ", "-"))
     features = {**DEFAULT_FEATURES, **(inp.features or {})}
-    policies = {**DEFAULT_POLICIES, **(inp.carrier_policies or {})}
+    raw_pol = {**DEFAULT_POLICIES, **(inp.carrier_policies or {})}
+    policies = {k: _normalize_policy(v) for k, v in raw_pol.items()}
     reseller = {
         "id": rid, "company_name": inp.company_name, "slug": slug,
         "admin_email": inp.admin_email.lower(), "plan": inp.plan,
         "features": features,
         "carrier_policies": policies,
-        "carrier_defaults": {c: "admin" for c in DEFAULT_CARRIERS},
         "carrier_credentials": inp.carrier_credentials or {},
         "per_shipment_fee": inp.per_shipment_fee, "active": inp.active, "created_at": now_iso(),
     }
@@ -216,7 +219,8 @@ async def create_reseller(inp: ResellerInput, _=Depends(require_super_admin)):
 async def list_resellers(_=Depends(require_super_admin)):
     items = await db.resellers.find({}, {"_id": 0}).to_list(1000)
     for r in items:
-        r["carrier_policies"] = {**DEFAULT_POLICIES, **(r.get("carrier_policies") or {})}
+        raw_pol = {**DEFAULT_POLICIES, **(r.get("carrier_policies") or {})}
+        r["carrier_policies"] = {k: _normalize_policy(v) for k, v in raw_pol.items()}
         r["user_count"] = await db.users.count_documents({"reseller_id": r["id"], "role": "user"})
         r["shipment_count"] = await db.shipments.count_documents({"reseller_id": r["id"]})
     return items
@@ -233,18 +237,8 @@ async def update_reseller(rid: str, inp: ResellerInput, _=Depends(require_super_
     if "features" in doc and doc["features"]:
         doc["features"] = {**DEFAULT_FEATURES, **doc["features"]}
     if "carrier_policies" in doc and doc["carrier_policies"]:
-        merged_policies = {**DEFAULT_POLICIES, **(existing.get("carrier_policies") or {}), **doc["carrier_policies"]}
-        doc["carrier_policies"] = merged_policies
-        # Allinea i default se una policy passa a solo admin o solo reseller
-        defaults = dict(existing.get("carrier_defaults") or {})
-        for cid, pol in merged_policies.items():
-            if pol == "admin_only":
-                defaults[cid] = "admin"
-            elif pol == "reseller_only":
-                defaults[cid] = "reseller"
-            elif pol == "hybrid" and cid not in defaults:
-                defaults[cid] = "admin"
-        doc["carrier_defaults"] = defaults
+        merged = {**DEFAULT_POLICIES, **(existing.get("carrier_policies") or {}), **doc["carrier_policies"]}
+        doc["carrier_policies"] = {k: _normalize_policy(v) for k, v in merged.items()}
     await db.resellers.update_one({"id": rid}, {"$set": doc})
     return {"ok": True}
 
@@ -285,8 +279,8 @@ async def my_features(user=Depends(get_current_user)):
         return {"features": DEFAULT_FEATURES, "role": user.get("role")}
     res = await db.resellers.find_one({"id": rid}, {"_id": 0, "features": 1, "company_name": 1, "plan": 1, "carrier_policies": 1})
     features = {**DEFAULT_FEATURES, **((res or {}).get("features") or {})}
-    policies = {**DEFAULT_POLICIES, **((res or {}).get("carrier_policies") or {})}
-    can_manage_own = any(p in ("reseller_only", "hybrid") for p in policies.values())
+    policies = {k: _normalize_policy(v) for k, v in {**DEFAULT_POLICIES, **((res or {}).get("carrier_policies") or {})}.items()}
+    can_manage_own = any(p == "reseller_only" for p in policies.values())
     return {
         "features": features,
         "can_manage_own_carriers": can_manage_own,
@@ -301,11 +295,9 @@ async def reseller_list_carriers(user=Depends(require_reseller_admin)):
     res = await db.resellers.find_one({"id": user["reseller_id"]}, {"_id": 0})
     if not res:
         raise HTTPException(404, "Reseller non trovato")
-    policies = {**DEFAULT_POLICIES, **(res.get("carrier_policies") or {})}
-    defaults = res.get("carrier_defaults") or {}
+    raw_pol = {**DEFAULT_POLICIES, **(res.get("carrier_policies") or {})}
+    policies = {k: _normalize_policy(v) for k, v in raw_pol.items()}
     own_creds = res.get("carrier_credentials") or {}
-    master_doc = await db.system_settings.find_one({"id": "master_carriers"}, {"_id": 0})
-    master_carriers = (master_doc or {}).get("carriers") or {}
 
     items = []
     for cid in DEFAULT_CARRIERS:
@@ -314,18 +306,15 @@ async def reseller_list_carriers(user=Depends(require_reseller_admin)):
             continue
         schema = CARRIER_SCHEMAS[cid]
         own = own_creds.get(cid) or {}
-        master = master_carriers.get(cid) or {}
         items.append({
             "carrier_id": cid,
             "name": schema["name"],
             "auth_type": schema["auth_type"],
             "auth_note": schema.get("auth_note", ""),
             "fields": schema["fields"],
-            "policy": pol,  # admin_only | reseller_only | hybrid
-            "can_configure_own": pol in ("reseller_only", "hybrid"),
-            "admin_available": bool(master.get("values")),
+            "policy": pol,  # admin_only | reseller_only
+            "can_configure_own": (pol == "reseller_only"),
             "own_config": own,
-            "default_source": defaults.get(cid, "reseller" if pol == "reseller_only" else "admin"),
         })
     return {"carriers": items, "per_shipment_fee": res.get("per_shipment_fee", 0.0)}
 
@@ -335,9 +324,8 @@ async def reseller_save_carrier(carrier_id: str, inp: CarrierCredsSave, user=Dep
     res = await db.resellers.find_one({"id": user["reseller_id"]})
     if not res:
         raise HTTPException(404)
-    policies = {**DEFAULT_POLICIES, **(res.get("carrier_policies") or {})}
-    pol = policies.get(carrier_id, "admin_only")
-    if pol not in ("reseller_only", "hybrid"):
+    policies = {k: _normalize_policy(v) for k, v in {**DEFAULT_POLICIES, **(res.get("carrier_policies") or {})}.items()}
+    if policies.get(carrier_id) != "reseller_only":
         raise HTTPException(403, "L'amministratore non ha abilitato l'uso di codici propri per questo corriere")
 
     _validate_carrier_payload(carrier_id, inp.values)
@@ -350,13 +338,10 @@ async def reseller_save_carrier(carrier_id: str, inp: CarrierCredsSave, user=Dep
         "status": status,
         "updated_at": now_iso(),
     }
-    updates = {f"carrier_credentials.{carrier_id}": entry}
-    if pol == "reseller_only":
-        updates[f"carrier_defaults.{carrier_id}"] = "reseller"
-    elif pol == "hybrid" and inp.default_source in ("admin", "reseller"):
-        updates[f"carrier_defaults.{carrier_id}"] = inp.default_source
-
-    await db.resellers.update_one({"id": user["reseller_id"]}, {"$set": updates})
+    await db.resellers.update_one(
+        {"id": user["reseller_id"]},
+        {"$set": {f"carrier_credentials.{carrier_id}": entry}},
+    )
     return {"ok": True, "config": entry}
 
 
@@ -365,8 +350,8 @@ async def reseller_authenticate_carrier(carrier_id: str, user=Depends(require_re
     res = await db.resellers.find_one({"id": user["reseller_id"]})
     if not res:
         raise HTTPException(404)
-    policies = {**DEFAULT_POLICIES, **(res.get("carrier_policies") or {})}
-    if policies.get(carrier_id) not in ("reseller_only", "hybrid"):
+    policies = {k: _normalize_policy(v) for k, v in {**DEFAULT_POLICIES, **(res.get("carrier_policies") or {})}.items()}
+    if policies.get(carrier_id) != "reseller_only":
         raise HTTPException(403, "Operazione non consentita su questo corriere")
     own = (res.get("carrier_credentials") or {}).get(carrier_id)
     if not own or not own.get("values"):
@@ -382,32 +367,9 @@ async def reseller_authenticate_carrier(carrier_id: str, user=Depends(require_re
     return {"ok": True, "status": "verified"}
 
 
-@reseller_router.patch("/carriers/{carrier_id}/default")
-async def reseller_set_default_source(carrier_id: str, inp: CarrierDefaultInput, user=Depends(require_reseller_admin)):
-    if inp.default_source not in ("admin", "reseller"):
-        raise HTTPException(400, "Sorgente non valida")
-    res = await db.resellers.find_one({"id": user["reseller_id"]})
-    if not res:
-        raise HTTPException(404)
-    policies = {**DEFAULT_POLICIES, **(res.get("carrier_policies") or {})}
-    pol = policies.get(carrier_id, "admin_only")
-    if pol != "hybrid":
-        raise HTTPException(400, "Puoi cambiare il default solo sui corrieri configurati in modalità Ibrida")
-    if inp.default_source == "reseller":
-        own = (res.get("carrier_credentials") or {}).get(carrier_id) or {}
-        if own.get("status") != "verified":
-            raise HTTPException(400, "Configura e autentica prima il tuo codice cliente per impostarlo come default")
-    await db.resellers.update_one(
-        {"id": user["reseller_id"]},
-        {"$set": {f"carrier_defaults.{carrier_id}": inp.default_source}},
-    )
-    return {"ok": True, "default_source": inp.default_source}
-
-
 async def bootstrap_multitenant():
     await db.users.update_one({"email": "admin@spedportal.it"}, {"$set": {"role": "super_admin", "reseller_id": None}})
 
-    # Inizializza codici Master Super Admin di esempio se non presenti
     master_doc = await db.system_settings.find_one({"id": "master_carriers"})
     if not master_doc:
         await db.system_settings.insert_one({
@@ -430,10 +392,9 @@ async def bootstrap_multitenant():
             "admin_email": "reseller@spedportal.it", "plan": "full",
             "features": {**DEFAULT_FEATURES, "premium_own_carriers": True},
             "carrier_policies": {
-                "brt": "hybrid", "gls": "admin_only", "dhl": "hybrid",
+                "brt": "admin_only", "gls": "admin_only", "dhl": "admin_only",
                 "ups": "reseller_only", "tnt": "admin_only", "poste": "admin_only"
             },
-            "carrier_defaults": {c: "admin" for c in DEFAULT_CARRIERS},
             "carrier_credentials": {},
             "per_shipment_fee": 0.15, "active": True, "created_at": now_iso(),
         })
@@ -446,17 +407,9 @@ async def bootstrap_multitenant():
         logger.info("Demo reseller seeded: reseller@spedportal.it / Reseller@2026")
     else:
         demo_id = demo["id"]
-        if not demo.get("carrier_policies"):
-            await db.resellers.update_one(
-                {"id": demo_id},
-                {"$set": {
-                    "carrier_policies": {
-                        "brt": "hybrid", "gls": "admin_only", "dhl": "hybrid",
-                        "ups": "reseller_only", "tnt": "admin_only", "poste": "admin_only"
-                    },
-                    "carrier_defaults": {c: "admin" for c in DEFAULT_CARRIERS},
-                }}
-            )
+        if demo.get("carrier_policies"):
+            cleaned = {k: _normalize_policy(v) for k, v in demo["carrier_policies"].items()}
+            await db.resellers.update_one({"id": demo_id}, {"$set": {"carrier_policies": cleaned}})
 
     for coll in ["users", "shipments", "invoices", "rate_tables", "addressbook",
                  "saved_parcels", "support_tickets", "broadcasts", "broadcast_reads",
