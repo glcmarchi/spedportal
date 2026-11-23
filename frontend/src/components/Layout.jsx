@@ -4,7 +4,7 @@ import { useAuth } from "@/lib/auth";
 import {
   House, Package, ListChecks, Receipt, Wallet, Users, ChartBar,
   SignOut, List as MenuIcon, Truck, AddressBook, Headset, ClipboardText,
-  Megaphone, Bell, Envelope,
+  Megaphone, Bell, Envelope, Key,
 } from "@phosphor-icons/react";
 import { Popover, PopoverContent, PopoverTrigger } from "@/components/ui/popover";
 import { api } from "@/lib/api";
@@ -45,9 +45,13 @@ export default function Layout() {
     ...(isPrepaid ? [{ to: "/topup", icon: Wallet, label: "Ricariche", testid: "nav-topup" }] : []),
     { to: "/support", icon: Headset, label: "Supporto", testid: "nav-support" },
   ];
+
   const admin_items = [
     { to: "/admin/users", icon: Users, label: "Clienti", testid: "nav-admin-users" },
     { to: "/admin/rates", icon: ChartBar, label: "Listini", testid: "nav-admin-rates" },
+    ...(user?.role === "reseller_admin" && user?.can_manage_own_carriers
+      ? [{ to: "/admin/carriers", icon: Key, label: "I Miei Corrieri", testid: "nav-admin-carriers" }]
+      : []),
     ...(features.broadcasts !== false ? [{ to: "/admin/broadcast", icon: Megaphone, label: "Comunicazioni", testid: "nav-admin-bc" }] : []),
   ];
 
