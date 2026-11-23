@@ -19,7 +19,6 @@ TRANSIT_MAP = {
     "FIVE_DAYS": 5, "SIX_DAYS": 6, "SEVEN_DAYS": 7, "EIGHT_DAYS": 8,
 }
 
-# Mappatura codici stato FedEx (latestStatusDetail.derivedCode / code) -> stati SpedPortal
 FEDEX_STATUS_MAP = {
     "OC": "created",           # Order Created / Label Created
     "AP": "created",           # At Pickup
@@ -390,6 +389,45 @@ async def create_fedex_shipment(
             "service_type": tx.get("serviceType", service_type),
             "service_name": tx.get("serviceName", "FedEx"),
             "label_pdf_base64": label_b64,
+        }
+
+
+async def cancel_fedex_shipment(
+    account_number: str,
+    tracking_number: str,
+    sender_country_code: str = "IT",
+) -> Dict[str, Any]:
+    """Chiama PUT /ship/v1/shipments/cancel per annullare una spedizione prima del ritiro."""
+    token = await get_fedex_token()
+    payload = {
+        "accountNumber": {"value": str(account_number).strip()},
+        "trackingNumber": str(tracking_number).strip(),
+        "senderCountryCode": (sender_country_code or "IT").upper(),
+        "deletionControl": "DELETE_ALL_PACKAGES",
+    }
+
+    async with httpx.AsyncClient(timeout=20.0) as client:
+        resp = await client.put(
+            f"{FEDEX_BASE_URL}/ship/v1/shipments/cancel",
+            json=payload,
+            headers=_headers(token),
+        )
+        if resp.status_code != 200:
+            logger.error("FedEx Cancel API %s: %s", resp.status_code, resp.text[:600])
+            err_msg = "Errore annullamento spedizione FedEx"
+            try:
+                errs = resp.json().get("errors") or []
+                if errs:
+                    err_msg = f"FedEx: {errs[0].get('message', err_msg)}"
+            except Exception:
+                pass
+            raise RuntimeError(err_msg)
+
+        data = resp.json()
+        out = data.get("output") or {}
+        return {
+            "cancelled": bool(out.get("cancelledShipment", True)),
+            "message": out.get("message", "Shipment cancelled"),
         }
 
 
