@@ -19,15 +19,14 @@ const FEATURE_KEYS = [
 const CARRIERS = ["brt", "gls", "dhl", "ups", "tnt", "poste"];
 
 const POLICY_OPTIONS = [
-  { value: "admin_only", label: "Solo Codice Admin (Master)" },
-  { value: "reseller_only", label: "Solo Codice Reseller (Proprio)" },
-  { value: "hybrid", label: "Ibrido (Admin + Reseller con Default)" },
+  { value: "admin_only", label: "Codice Admin (Master)" },
+  { value: "reseller_only", label: "Codice Reseller (Proprio)" },
   { value: "disabled", label: "Disabilitato" },
 ];
 
 export default function SuperAdmin() {
   const { logout } = useAuth();
-  const [tab, setTab] = useState("resellers"); // "resellers" | "master_carriers"
+  const [tab, setTab] = useState("resellers");
   const [resellers, setResellers] = useState([]);
   const [masterData, setMasterData] = useState({ schemas: {}, carriers: {} });
   const [masterDrafts, setMasterDrafts] = useState({});
@@ -151,8 +150,8 @@ export default function SuperAdmin() {
                       <div className="flex flex-wrap gap-1.5 mt-2">
                         {CARRIERS.map(c => {
                           const p = pols[c] || "admin_only";
-                          const badge = p === "hybrid" ? "bg-purple-100 text-purple-800" : p === "reseller_only" ? "bg-blue-100 text-blue-800" : p === "disabled" ? "bg-slate-100 text-slate-400 line-through" : "bg-orange-100 text-orange-800";
-                          const label = p === "hybrid" ? "Ibrido" : p === "reseller_only" ? "Reseller" : p === "disabled" ? "Off" : "Admin";
+                          const badge = p === "reseller_only" ? "bg-blue-100 text-blue-800" : p === "disabled" ? "bg-slate-100 text-slate-400 line-through" : "bg-orange-100 text-orange-800";
+                          const label = p === "reseller_only" ? "Reseller" : p === "disabled" ? "Off" : "Admin";
                           return <span key={c} className={`text-[10px] font-bold uppercase px-2 py-0.5 rounded-sm ${badge}`}>{c}: {label}</span>;
                         })}
                       </div>
@@ -249,8 +248,8 @@ export default function SuperAdmin() {
             </div>
 
             <div className="border-t pt-4">
-              <div className="label-caps text-orange-600 mb-1">Permessi Corrieri per questo Reseller</div>
-              <p className="text-xs text-slate-500 mb-3">Scegli per singolo corriere se il Reseller usa i tuoi codici Master, i suoi codici diretti o entrambi (Ibrido).</p>
+              <div className="label-caps text-orange-600 mb-1">Assegnazione Codici Corrieri per questo Reseller</div>
+              <p className="text-xs text-slate-500 mb-3">Scegli per singolo corriere se il Reseller utilizza il tuo codice Admin (Master) oppure il proprio codice Reseller.</p>
               <div className="space-y-2">
                 {CARRIERS.map(cid => (
                   <div key={cid} className="grid grid-cols-1 sm:grid-cols-2 gap-2 items-center bg-slate-50 p-2.5 rounded-sm border border-slate-200">
