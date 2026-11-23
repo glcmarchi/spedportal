@@ -20,22 +20,22 @@ TRANSIT_MAP = {
 }
 
 FEDEX_STATUS_MAP = {
-    "OC": "created",           # Order Created / Label Created
-    "AP": "created",           # At Pickup
-    "PU": "in_transit",        # Picked Up
-    "IT": "in_transit",        # In Transit
-    "AR": "in_transit",        # Arrived at FedEx location
-    "DP": "in_transit",        # Departed FedEx location
-    "AF": "in_transit",        # At local FedEx facility
-    "CC": "in_customs",        # Cleared Customs
-    "CD": "in_customs",        # Clearance Delay
-    "OD": "out_for_delivery",  # Out for Delivery
-    "DL": "delivered",         # Delivered
-    "DE": "exception",         # Delivery Exception
-    "SE": "exception",         # Shipment Exception
-    "HL": "exception",         # Hold at Location
-    "CA": "cancelled",         # Shipment Cancelled
-    "RS": "exception",         # Return to Shipper
+    "OC": "created",
+    "AP": "created",
+    "PU": "in_transit",
+    "IT": "in_transit",
+    "AR": "in_transit",
+    "DP": "in_transit",
+    "AF": "in_transit",
+    "CC": "in_customs",
+    "CD": "in_customs",
+    "OD": "out_for_delivery",
+    "DL": "delivered",
+    "DE": "exception",
+    "SE": "exception",
+    "HL": "exception",
+    "CA": "cancelled",
+    "RS": "exception",
 }
 
 
@@ -109,7 +109,6 @@ def _build_package_items(parcels: List[Dict[str, Any]], insured_value: float = 0
 
 
 def _extract_net_charge(rated_details: List[Dict[str, Any]]) -> Dict[str, Any]:
-    """Estrae nolo base + supplementi (escluse tasse/IVA) preferendo la tariffa contrattuale ACCOUNT."""
     chosen = None
     for preferred in ("ACCOUNT", "PREFERRED_CURRENCY", "PREFERRED_INCENTIVE", "LIST"):
         chosen = next((r for r in rated_details if r.get("rateType") == preferred), None)
@@ -153,7 +152,6 @@ async def get_fedex_rates(
     goods_description: str = "",
     insured_value: float = 0.0,
 ) -> List[Dict[str, Any]]:
-    """Chiama POST /rate/v1/rates/quotes e restituisce i servizi disponibili con costi reali."""
     token = await get_fedex_token()
     ship_date = datetime.now(timezone.utc).strftime("%Y-%m-%d")
     s_country = (sender.get("country") or "IT").upper()
@@ -262,7 +260,6 @@ async def create_fedex_shipment(
     customs_required: bool = False,
     insured_value: float = 0.0,
 ) -> Dict[str, Any]:
-    """Chiama POST /ship/v1/shipments e restituisce tracking_number reale ed etichetta PDF in Base64."""
     token = await get_fedex_token()
     ship_date = datetime.now(timezone.utc).strftime("%Y-%m-%d")
     s_country = (sender.get("country") or "IT").upper()
@@ -397,7 +394,6 @@ async def cancel_fedex_shipment(
     tracking_number: str,
     sender_country_code: str = "IT",
 ) -> Dict[str, Any]:
-    """Chiama PUT /ship/v1/shipments/cancel per annullare una spedizione prima del ritiro."""
     token = await get_fedex_token()
     payload = {
         "accountNumber": {"value": str(account_number).strip()},
@@ -431,8 +427,135 @@ async def cancel_fedex_shipment(
         }
 
 
+async def schedule_fedex_pickup(
+    account_number: str,
+    sender: Dict[str, Any],
+    recipient_country: str,
+    tracking_number: str,
+    package_count: int,
+    total_weight: float,
+    pickup_date: str,          # YYYY-MM-DD
+    ready_time: str = "10:00", # HH:MM
+    close_time: str = "18:00", # HH:MM
+    remarks: str = "",
+) -> Dict[str, Any]:
+    """Chiama POST /pickup/v1/pickups (Pickup Request API) per prenotare il ritiro corriere."""
+    token = await get_fedex_token()
+    s_country = (sender.get("country") or "IT").upper()
+    r_country = (recipient_country or "IT").upper()
+    is_intl = s_country != r_country
+
+    ready_hhmmss = ready_time if len(ready_time) == 8 else f"{ready_time}:00"
+    close_hhmmss = close_time if len(close_time) == 8 else f"{close_time}:00"
+    ready_ts = f"{pickup_date}T{ready_hhmmss}Z"
+
+    phone_digits = "".join(ch for ch in (sender.get("phone") or "0200000000") if ch.isdigit())
+    if len(phone_digits) < 8:
+        phone_digits = phone_digits.ljust(10, "0")
+
+    payload: Dict[str, Any] = {
+        "associatedAccountNumber": {"value": str(account_number).strip()},
+        "carrierCode": "FDXE",
+        "countryRelationships": "INTERNATIONAL" if is_intl else "DOMESTIC",
+        "packageCount": max(1, int(package_count)),
+        "totalWeight": {"units": "KG", "value": round(max(0.5, float(total_weight)), 2)},
+        "trackingNumber": str(tracking_number).strip(),
+        "originDetail": {
+            "pickupAddressType": "SHIPPER",
+            "pickupLocation": {
+                "contact": {
+                    "companyName": (sender.get("company_name") or "Mittente")[:35],
+                    "personName": (sender.get("reference") or sender.get("company_name") or "Mittente")[:35],
+                    "phoneNumber": phone_digits[:13],
+                },
+                "address": {
+                    "streetLines": _split_street(sender.get("address", "")),
+                    "city": (sender.get("city") or "")[:35],
+                    "postalCode": str(sender.get("postal_code", "")).strip(),
+                    "countryCode": s_country,
+                    "residential": False,
+                },
+            },
+            "readyDateTimestamp": ready_ts,
+            "customerCloseTime": close_hhmmss,
+            "packageLocation": "FRONT",
+        },
+    }
+    if remarks:
+        payload["remarks"] = remarks.strip()[:60]
+
+    async with httpx.AsyncClient(timeout=25.0) as client:
+        resp = await client.post(
+            f"{FEDEX_BASE_URL}/pickup/v1/pickups",
+            json=payload,
+            headers=_headers(token),
+        )
+        if resp.status_code != 200:
+            logger.error("FedEx Pickup API %s: %s", resp.status_code, resp.text[:800])
+            err_msg = "Errore prenotazione ritiro FedEx"
+            try:
+                errs = resp.json().get("errors") or []
+                if errs:
+                    err_msg = f"FedEx: {errs[0].get('message', err_msg)}"
+            except Exception:
+                pass
+            raise RuntimeError(err_msg)
+
+        data = resp.json()
+        out = data.get("output") or {}
+        return {
+            "confirmation_code": str(out.get("pickupConfirmationCode") or ""),
+            "location": str(out.get("location") or ""),
+            "scheduled_date": pickup_date,
+            "ready_time": ready_time,
+            "close_time": close_time,
+            "remarks": remarks,
+        }
+
+
+async def cancel_fedex_pickup(
+    account_number: str,
+    confirmation_code: str,
+    scheduled_date: str,
+    location: str = "",
+) -> Dict[str, Any]:
+    """Chiama PUT /pickup/v1/pickups/cancel per annullare un ritiro prenotato."""
+    token = await get_fedex_token()
+    payload: Dict[str, Any] = {
+        "associatedAccountNumber": {"value": str(account_number).strip()},
+        "pickupConfirmationCode": str(confirmation_code).strip(),
+        "carrierCode": "FDXE",
+        "scheduledDate": scheduled_date,
+    }
+    if location:
+        payload["location"] = location
+
+    async with httpx.AsyncClient(timeout=20.0) as client:
+        resp = await client.put(
+            f"{FEDEX_BASE_URL}/pickup/v1/pickups/cancel",
+            json=payload,
+            headers=_headers(token),
+        )
+        if resp.status_code != 200:
+            logger.error("FedEx Cancel Pickup %s: %s", resp.status_code, resp.text[:600])
+            err_msg = "Errore annullamento ritiro FedEx"
+            try:
+                errs = resp.json().get("errors") or []
+                if errs:
+                    err_msg = f"FedEx: {errs[0].get('message', err_msg)}"
+            except Exception:
+                pass
+            raise RuntimeError(err_msg)
+
+        data = resp.json()
+        out = data.get("output") or {}
+        return {
+            "cancelled": True,
+            "message": out.get("cancelConfirmationMessage", "Ritiro annullato"),
+        }
+
+
 async def track_fedex_shipment(tracking_number: str) -> Optional[Dict[str, Any]]:
-    """Chiama POST /track/v1/trackingnumbers (Basic Integrated Visibility) per stato ed eventi reali."""
     if not is_fedex_configured() or not tracking_number:
         return None
     token = await get_fedex_token()
