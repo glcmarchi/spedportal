@@ -23,6 +23,8 @@ from carriers.fedex import (
     get_fedex_rates,
     create_fedex_shipment,
     cancel_fedex_shipment,
+    schedule_fedex_pickup,
+    cancel_fedex_pickup,
     track_fedex_shipment,
 )
 
@@ -151,6 +153,12 @@ class QuoteRequest(BaseModel):
 class CreateShipmentInput(BaseModel):
     quote: QuoteRequest
     carrier_id: str
+
+class PickupRequestInput(BaseModel):
+    pickup_date: str           # YYYY-MM-DD
+    ready_time: str = "10:00"  # HH:MM
+    close_time: str = "18:00"  # HH:MM
+    remarks: Optional[str] = ""
 
 class UpdateUserInput(BaseModel):
     billing_type: Optional[str] = None
@@ -619,6 +627,13 @@ async def create_shipment(inp: CreateShipmentInput, user=Depends(require_approve
     return shipment
 
 
+def _sanitize_shipment_for_role(s: dict, role: str) -> dict:
+    if role == "user":
+        for secret_k in ("cost", "carrier_cost", "reseller_cost", "admin_markup_percent", "reseller_markup_percent"):
+            s.pop(secret_k, None)
+    return s
+
+
 async def _sync_live_tracking(s: dict) -> dict:
     if s.get("status") in ("delivered", "cancelled"):
         return s
@@ -664,26 +679,129 @@ async def list_shipments(user=Depends(require_approved)):
 async def get_shipment(sid: str, user=Depends(require_approved)):
     q = tenant_filter(user, {"id": sid})
     proj = {"_id": 0, "label_pdf_base64": 0}
-    if user.get("role") == "user":
-        proj.update({"cost": 0, "carrier_cost": 0, "reseller_cost": 0, "admin_markup_percent": 0, "reseller_markup_percent": 0})
     s = await db.shipments.find_one(q, proj)
     if not s:
         raise HTTPException(404, "Spedizione non trovata")
     s = await _sync_live_tracking(s)
-    return s
+    return _sanitize_shipment_for_role(s, user.get("role", "user"))
 
 
 @api_router.post("/shipments/{sid}/track/refresh")
 async def refresh_shipment_tracking(sid: str, user=Depends(require_approved)):
     q = tenant_filter(user, {"id": sid})
     proj = {"_id": 0, "label_pdf_base64": 0}
-    if user.get("role") == "user":
-        proj.update({"cost": 0, "carrier_cost": 0, "reseller_cost": 0, "admin_markup_percent": 0, "reseller_markup_percent": 0})
     s = await db.shipments.find_one(q, proj)
     if not s:
         raise HTTPException(404, "Spedizione non trovata")
     s = await _sync_live_tracking(s)
-    return s
+    return _sanitize_shipment_for_role(s, user.get("role", "user"))
+
+
+@api_router.post("/shipments/{sid}/pickup")
+async def book_shipment_pickup(sid: str, inp: PickupRequestInput, user=Depends(require_approved)):
+    q = tenant_filter(user, {"id": sid})
+    s = await db.shipments.find_one(q, {"_id": 0, "label_pdf_base64": 0})
+    if not s:
+        raise HTTPException(404, "Spedizione non trovata")
+
+    current_status = s.get("status") if (s.get("is_live") or s.get("status") == "cancelled") else _simulate_status(s)
+    if current_status == "cancelled":
+        raise HTTPException(400, "Impossibile prenotare un ritiro per una spedizione annullata")
+    if s.get("pickup", {}).get("status") == "scheduled":
+        raise HTTPException(400, "Esiste già un ritiro attivo per questa spedizione")
+
+    total_weight = sum(float(p.get("weight", 1)) for p in (s.get("parcels") or []))
+    pkg_count = len(s.get("parcels") or []) or 1
+
+    if s.get("carrier_id") == "tnt" and s.get("is_live") and is_fedex_configured():
+        try:
+            pk = await schedule_fedex_pickup(
+                account_number=s.get("carrier_code_used", ""),
+                sender=s.get("sender") or {},
+                recipient_country=(s.get("recipient") or {}).get("country", "IT"),
+                tracking_number=s.get("tracking_number", ""),
+                package_count=pkg_count,
+                total_weight=total_weight,
+                pickup_date=inp.pickup_date,
+                ready_time=inp.ready_time,
+                close_time=inp.close_time,
+                remarks=inp.remarks or "",
+            )
+            pickup_doc = {
+                "status": "scheduled",
+                "confirmation_code": pk["confirmation_code"],
+                "location": pk.get("location", ""),
+                "scheduled_date": inp.pickup_date,
+                "ready_time": inp.ready_time,
+                "close_time": inp.close_time,
+                "remarks": inp.remarks or "",
+                "created_at": now_iso(),
+            }
+        except Exception as e:
+            raise HTTPException(502, str(e))
+    else:
+        pickup_doc = {
+            "status": "scheduled",
+            "confirmation_code": f"PK{random.randint(100000, 999999)}",
+            "location": "",
+            "scheduled_date": inp.pickup_date,
+            "ready_time": inp.ready_time,
+            "close_time": inp.close_time,
+            "remarks": inp.remarks or "",
+            "created_at": now_iso(),
+        }
+
+    ev = {
+        "ts": now_iso(),
+        "code": "pickup_scheduled",
+        "label": f"Ritiro prenotato per il {inp.pickup_date} ({inp.ready_time}-{inp.close_time}) · Cod. {pickup_doc['confirmation_code']}",
+        "location": (s.get("sender") or {}).get("city", ""),
+    }
+    await db.shipments.update_one(
+        {"id": sid},
+        {"$set": {"pickup": pickup_doc}, "$push": {"tracking_events": ev}},
+    )
+    updated = await db.shipments.find_one({"id": sid}, {"_id": 0, "label_pdf_base64": 0})
+    return _sanitize_shipment_for_role(updated, user.get("role", "user"))
+
+
+@api_router.post("/shipments/{sid}/pickup/cancel")
+async def cancel_shipment_pickup(sid: str, user=Depends(require_approved)):
+    q = tenant_filter(user, {"id": sid})
+    s = await db.shipments.find_one(q, {"_id": 0, "label_pdf_base64": 0})
+    if not s:
+        raise HTTPException(404, "Spedizione non trovata")
+
+    pk = s.get("pickup") or {}
+    if pk.get("status") != "scheduled":
+        raise HTTPException(400, "Nessun ritiro attivo da annullare")
+
+    if s.get("carrier_id") == "tnt" and s.get("is_live") and is_fedex_configured():
+        try:
+            await cancel_fedex_pickup(
+                account_number=s.get("carrier_code_used", ""),
+                confirmation_code=pk.get("confirmation_code", ""),
+                scheduled_date=pk.get("scheduled_date", ""),
+                location=pk.get("location", ""),
+            )
+        except Exception as e:
+            raise HTTPException(502, str(e))
+
+    ev = {
+        "ts": now_iso(),
+        "code": "pickup_cancelled",
+        "label": f"Ritiro {pk.get('confirmation_code', '')} annullato",
+        "location": (s.get("sender") or {}).get("city", ""),
+    }
+    await db.shipments.update_one(
+        {"id": sid},
+        {
+            "$set": {"pickup.status": "cancelled", "pickup.cancelled_at": now_iso()},
+            "$push": {"tracking_events": ev},
+        },
+    )
+    updated = await db.shipments.find_one({"id": sid}, {"_id": 0, "label_pdf_base64": 0})
+    return _sanitize_shipment_for_role(updated, user.get("role", "user"))
 
 
 @api_router.post("/shipments/{sid}/cancel")
@@ -725,7 +843,6 @@ async def cancel_shipment(sid: str, user=Depends(require_approved)):
         },
     )
 
-    # Rimborso automatico se l'utente che ha pagato era in modalità prepagata
     owner_user = await db.users.find_one({"id": s["user_id"]})
     if owner_user and owner_user.get("billing_type") == "prepaid":
         refund_amount = float(s.get("price") or 0.0)
@@ -741,11 +858,8 @@ async def cancel_shipment(sid: str, user=Depends(require_approved)):
                 "created_at": now_iso(),
             })
 
-    proj = {"_id": 0, "label_pdf_base64": 0}
-    if user.get("role") == "user":
-        proj.update({"cost": 0, "carrier_cost": 0, "reseller_cost": 0, "admin_markup_percent": 0, "reseller_markup_percent": 0})
-    updated = await db.shipments.find_one({"id": sid}, proj)
-    return updated
+    updated = await db.shipments.find_one({"id": sid}, {"_id": 0, "label_pdf_base64": 0})
+    return _sanitize_shipment_for_role(updated, user.get("role", "user"))
 
 
 def _simulate_status(s: dict) -> str:
