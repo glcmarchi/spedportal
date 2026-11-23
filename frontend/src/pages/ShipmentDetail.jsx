@@ -3,9 +3,12 @@ import { useParams, Link } from "react-router-dom";
 import { api } from "@/lib/api";
 import { useAuth } from "@/lib/auth";
 import { Button } from "@/components/ui/button";
+import { Input } from "@/components/ui/input";
+import { Label } from "@/components/ui/label";
+import { Dialog, DialogContent, DialogHeader, DialogTitle } from "@/components/ui/dialog";
 import { StatusBadge } from "@/pages/Dashboard";
 import { toast } from "sonner";
-import { ArrowLeft, Printer, ArrowsClockwise, MapPin, Clock, XCircle } from "@phosphor-icons/react";
+import { ArrowLeft, Printer, ArrowsClockwise, MapPin, Clock, XCircle, Truck, CheckCircle } from "@phosphor-icons/react";
 
 export default function ShipmentDetail() {
   const { id } = useParams();
@@ -13,6 +16,16 @@ export default function ShipmentDetail() {
   const [s, setS] = useState(null);
   const [syncing, setSyncing] = useState(false);
   const [cancelling, setCancelling] = useState(false);
+  const [pickupOpen, setPickupOpen] = useState(false);
+  const [pickupLoading, setPickupLoading] = useState(false);
+
+  const tomorrow = new Date(Date.now() + 86400000).toISOString().slice(0, 10);
+  const [pickupForm, setPickupForm] = useState({
+    pickup_date: tomorrow,
+    ready_time: "10:00",
+    close_time: "18:00",
+    remarks: "",
+  });
 
   useEffect(() => {
     api.get(`/shipments/${id}`).then(r => setS(r.data));
@@ -58,7 +71,36 @@ export default function ShipmentDetail() {
     }
   };
 
+  const bookPickup = async () => {
+    setPickupLoading(true);
+    try {
+      const r = await api.post(`/shipments/${id}/pickup`, pickupForm);
+      setS(r.data);
+      setPickupOpen(false);
+      toast.success(`Ritiro prenotato! Codice: ${r.data.pickup?.confirmation_code}`);
+    } catch (err) {
+      toast.error(err?.response?.data?.detail || "Errore prenotazione ritiro");
+    } finally {
+      setPickupLoading(false);
+    }
+  };
+
+  const cancelPickup = async () => {
+    if (!window.confirm("Vuoi annullare la prenotazione del ritiro?")) return;
+    setPickupLoading(true);
+    try {
+      const r = await api.post(`/shipments/${id}/pickup/cancel`);
+      setS(r.data);
+      toast.success("Ritiro annullato");
+    } catch (err) {
+      toast.error(err?.response?.data?.detail || "Errore annullamento ritiro");
+    } finally {
+      setPickupLoading(false);
+    }
+  };
+
   const events = s.tracking_events || [];
+  const hasActivePickup = s.pickup?.status === "scheduled";
 
   return (
     <div className="space-y-6">
@@ -86,6 +128,11 @@ export default function ShipmentDetail() {
           </div>
         </div>
         <div className="flex gap-2 flex-wrap">
+          {s.status === "created" && !hasActivePickup && (
+            <Button variant="outline" onClick={() => setPickupOpen(true)} className="rounded-sm h-11">
+              <Truck size={16} className="mr-2" /> Prenota Ritiro
+            </Button>
+          )}
           {s.status === "created" && (
             <Button variant="outline" onClick={cancelShipment} disabled={cancelling}
               className="border-red-200 text-red-600 hover:bg-red-50 hover:text-red-700 rounded-sm h-11">
@@ -106,6 +153,29 @@ export default function ShipmentDetail() {
           )}
         </div>
       </div>
+
+      {hasActivePickup && (
+        <div className="bg-green-50 border border-green-200 rounded-sm p-4 flex items-center justify-between gap-4 flex-wrap">
+          <div className="flex items-center gap-3">
+            <CheckCircle size={22} weight="fill" className="text-green-600 shrink-0" />
+            <div className="text-sm">
+              <div className="font-bold text-green-900">
+                Ritiro prenotato per il {s.pickup.scheduled_date} ({s.pickup.ready_time} – {s.pickup.close_time})
+              </div>
+              <div className="text-xs text-green-800">
+                Codice conferma corriere: <span className="font-mono font-bold">{s.pickup.confirmation_code}</span>
+                {s.pickup.remarks && ` · Note: ${s.pickup.remarks}`}
+              </div>
+            </div>
+          </div>
+          {s.status === "created" && (
+            <Button size="sm" variant="outline" onClick={cancelPickup} disabled={pickupLoading}
+              className="border-red-200 text-red-600 hover:bg-red-50 rounded-sm">
+              Annulla Ritiro
+            </Button>
+          )}
+        </div>
+      )}
 
       <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
         <Card title="Mittente" data={s.sender} />
@@ -170,6 +240,52 @@ export default function ShipmentDetail() {
         </div>
         {s.goods_description && <div className="mt-4 text-sm"><span className="label-caps">Merce: </span>{s.goods_description}</div>}
       </div>
+
+      <Dialog open={pickupOpen} onOpenChange={setPickupOpen}>
+        <DialogContent className="rounded-sm max-w-md">
+          <DialogHeader>
+            <DialogTitle style={{ fontFamily: "Chivo" }}>Prenota Ritiro Corriere</DialogTitle>
+          </DialogHeader>
+          <div className="space-y-4 text-sm">
+            <div className="bg-slate-50 border border-slate-200 rounded-sm p-3 text-xs text-slate-600">
+              Indirizzo ritiro: <b>{s.sender?.company_name}</b> — {s.sender?.address}, {s.sender?.postal_code} {s.sender?.city}
+            </div>
+            <div>
+              <Label className="label-caps">Data Ritiro</Label>
+              <Input type="date" value={pickupForm.pickup_date}
+                onChange={(e) => setPickupForm({ ...pickupForm, pickup_date: e.target.value })}
+                className="mt-1 rounded-sm h-10" />
+            </div>
+            <div className="grid grid-cols-2 gap-3">
+              <div>
+                <Label className="label-caps">Merce pronta dalle</Label>
+                <Input type="time" value={pickupForm.ready_time}
+                  onChange={(e) => setPickupForm({ ...pickupForm, ready_time: e.target.value })}
+                  className="mt-1 rounded-sm h-10" />
+              </div>
+              <div>
+                <Label className="label-caps">Chiusura sede alle</Label>
+                <Input type="time" value={pickupForm.close_time}
+                  onChange={(e) => setPickupForm({ ...pickupForm, close_time: e.target.value })}
+                  className="mt-1 rounded-sm h-10" />
+              </div>
+            </div>
+            <div>
+              <Label className="label-caps">Note per l'autista (opzionale)</Label>
+              <Input maxLength={60} placeholder="Es. Citofonare magazzino sul retro"
+                value={pickupForm.remarks}
+                onChange={(e) => setPickupForm({ ...pickupForm, remarks: e.target.value })}
+                className="mt-1 rounded-sm h-10" />
+            </div>
+            <div className="flex justify-end gap-2 pt-2">
+              <Button variant="outline" onClick={() => setPickupOpen(false)} className="rounded-sm">Annulla</Button>
+              <Button onClick={bookPickup} disabled={pickupLoading} className="bg-orange-600 hover:bg-orange-700 rounded-sm">
+                {pickupLoading ? "Prenotazione…" : "Conferma Ritiro"}
+              </Button>
+            </div>
+          </div>
+        </DialogContent>
+      </Dialog>
     </div>
   );
 }
