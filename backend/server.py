@@ -4,7 +4,7 @@ from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from dotenv import load_dotenv
 from starlette.middleware.cors import CORSMiddleware
 from motor.motor_asyncio import AsyncIOMotorClient
-import os, io, uuid, logging, random, string, hashlib
+import os, io, uuid, logging, random, string, hashlib, base64
 from pathlib import Path
 from pydantic import BaseModel, EmailStr
 from typing import List, Optional
@@ -18,6 +18,7 @@ from reportlab.lib.units import mm
 from reportlab.lib import colors as rl_colors
 import openpyxl
 from openpyxl.styles import Font, PatternFill
+from carriers.fedex import is_fedex_configured, get_fedex_rates, create_fedex_shipment
 
 ROOT_DIR = Path(__file__).parent
 load_dotenv(ROOT_DIR / '.env')
@@ -308,7 +309,7 @@ MOCK_CARRIERS = [
     {"id": "gls", "name": "GLS", "logo": "GLS", "color": "#003366"},
     {"id": "dhl", "name": "DHL Express", "logo": "DHL", "color": "#ffcc00"},
     {"id": "ups", "name": "UPS", "logo": "UPS", "color": "#5c3317"},
-    {"id": "tnt", "name": "TNT (FedEx)", "logo": "TNT", "color": "#ff6600"},
+    {"id": "tnt", "name": "FedEx / TNT", "logo": "FDX", "color": "#4d148c"},
     {"id": "poste", "name": "Poste Italiane", "logo": "PI", "color": "#003399"},
 ]
 
@@ -338,7 +339,6 @@ def _mock_carrier_cost(carrier_id: str, weight: float, zone: str, parcels_count:
     return round(cost, 2)
 
 async def _reseller_markup_percent(user: dict, weight: float, zone: str) -> float:
-    """Restituisce la % di ricarico del Reseller (dal listino assegnato al cliente o dal listino base del tenant)."""
     default_markup = 20.0
     rate_table_id = user.get("rate_table_id")
     table = None
@@ -354,7 +354,6 @@ async def _reseller_markup_percent(user: dict, weight: float, zone: str) -> floa
 
 
 async def _resolve_tenant_carrier_options(user: dict) -> dict:
-    """Restituisce per ciascun corriere abilitato: contratto (admin|reseller), codice e % margine Admin."""
     rid = user.get("reseller_id")
     master_doc = await db.system_settings.find_one({"id": "master_carriers"}, {"_id": 0})
     master_carriers = (master_doc or {}).get("carriers") or {}
@@ -413,7 +412,6 @@ async def _resolve_tenant_carrier_options(user: dict) -> dict:
 
 
 async def _compute_quotes_internal(q: QuoteRequest, user: dict) -> dict:
-    """Calcola la cascata completa dei costi e dei margini per uso interno/backend."""
     total_weight = sum(p.weight for p in q.parcels)
     vol_weight = sum((p.length * p.width * p.height) / 5000.0 for p in q.parcels)
     billed_weight = max(total_weight, vol_weight)
@@ -423,32 +421,61 @@ async def _compute_quotes_internal(q: QuoteRequest, user: dict) -> dict:
 
     quotes = []
     for c in MOCK_CARRIERS:
-        opt = options.get(c["id"])
+        cid = c["id"]
+        opt = options.get(cid)
         if not opt:
             continue
-        # 1. Costo vivo dal corriere (nolo + supplementi)
-        carrier_cost = _mock_carrier_cost(c["id"], billed_weight, zone, len(q.parcels))
-        service_extra = 0.0
-        if q.services.insurance:
-            service_extra += max(3.0, q.services.insurance_value * 0.008)
-        if q.services.neutral_delivery:
-            service_extra += 2.0
-        if q.customs.required:
-            carrier_cost += 8.0
-        carrier_cost = round(carrier_cost + service_extra, 2)
 
-        # 2. Margine Super Admin (applicato solo se usa codice Admin)
+        live_fedex = None
+        if cid == "tnt" and is_fedex_configured() and opt["code"]:
+            try:
+                fx_rates = await get_fedex_rates(
+                    account_number=opt["code"],
+                    sender=q.sender.model_dump(),
+                    recipient=q.recipient.model_dump(),
+                    parcels=[p.model_dump() for p in q.parcels],
+                    parcel_type=q.parcel_type,
+                    customs_required=q.customs.required,
+                    goods_description=q.goods_description,
+                    insured_value=q.services.insurance_value if q.services.insurance else 0.0,
+                )
+                if fx_rates:
+                    fx_rates.sort(key=lambda x: x["carrier_cost"])
+                    live_fedex = fx_rates[0]
+            except Exception as e:
+                logger.warning("Fallback tariffa simulata per FedEx: %s", e)
+
+        if live_fedex:
+            carrier_cost = live_fedex["carrier_cost"]
+            transit = live_fedex["transit_days"]
+            service_type = live_fedex["service_type"]
+            carrier_label = live_fedex["service_name"]
+            is_live = True
+        else:
+            carrier_cost = _mock_carrier_cost(cid, billed_weight, zone, len(q.parcels))
+            service_extra = 0.0
+            if q.services.insurance:
+                service_extra += max(3.0, q.services.insurance_value * 0.008)
+            if q.services.neutral_delivery:
+                service_extra += 2.0
+            if q.customs.required:
+                carrier_cost += 8.0
+            carrier_cost = round(carrier_cost + service_extra, 2)
+            transit = 1 if zone.startswith("NAZ") else (3 if cid in ["dhl", "ups", "tnt"] else 5)
+            service_type = "INTERNATIONAL_PRIORITY" if zone.startswith("INT") else "FEDEX_PRIORITY"
+            carrier_label = c["name"]
+            is_live = False
+
         admin_mk_pct = opt["admin_markup_percent"] if opt["owner"] == "admin" else 0.0
         reseller_cost = round(carrier_cost * (1 + admin_mk_pct / 100.0), 2)
-
-        # 3. Margine Reseller (applicato sopra reseller_cost -> prezzo finale cliente)
         client_price = round(reseller_cost * (1 + reseller_mk_pct / 100.0), 2)
 
-        transit = 1 if zone.startswith("NAZ") else (3 if c["id"] in ["dhl", "ups", "tnt"] else 5)
         quotes.append({
-            "carrier_id": c["id"],
-            "carrier_name": c["name"],
+            "carrier_id": cid,
+            "carrier_name": carrier_label,
             "color": c["color"],
+            "service_type": service_type,
+            "is_live": is_live,
             "carrier_cost": carrier_cost,
             "admin_markup_percent": admin_mk_pct,
             "reseller_cost": reseller_cost,
@@ -468,7 +495,6 @@ async def _compute_quotes_internal(q: QuoteRequest, user: dict) -> dict:
 async def quote_shipment(q: QuoteRequest, user=Depends(require_approved)):
     full = await _compute_quotes_internal(q, user)
     role = user.get("role")
-    # Il cliente finale vede SOLO il prezzo marginato, mai costi vivi o margini intermedi
     if role == "user":
         sanitized = [
             {
@@ -515,6 +541,29 @@ async def create_shipment(inp: CreateShipmentInput, user=Depends(require_approve
         if bal < price:
             raise HTTPException(402, "Credito insufficiente. Ricarica il tuo saldo prepagato.")
 
+    tracking_num = _tracking_number(inp.carrier_id)
+    label_b64 = ""
+
+    # Se FedEx è configurato su Render, genera lettera di vettura reale via API FedEx
+    if inp.carrier_id == "tnt" and is_fedex_configured() and code_used:
+        try:
+            fx_ship = await create_fedex_shipment(
+                account_number=code_used,
+                sender=inp.quote.sender.model_dump(),
+                recipient=inp.quote.recipient.model_dump(),
+                parcels=[p.model_dump() for p in inp.quote.parcels],
+                service_type=chosen.get("service_type") or "INTERNATIONAL_PRIORITY",
+                parcel_type=inp.quote.parcel_type,
+                goods_description=inp.quote.goods_description,
+                customs_required=inp.quote.customs.required,
+                insured_value=inp.quote.services.insurance_value if inp.quote.services.insurance else 0.0,
+            )
+            if fx_ship.get("tracking_number"):
+                tracking_num = fx_ship["tracking_number"]
+            label_b64 = fx_ship.get("label_pdf_base64", "")
+        except Exception as e:
+            raise HTTPException(502, str(e))
+
     shipment = {
         "id": new_id(),
         "user_id": user["id"],
@@ -523,9 +572,11 @@ async def create_shipment(inp: CreateShipmentInput, user=Depends(require_approve
         "contract_owner": source,
         "carrier_code_used": code_used,
         "applied_fee": applied_fee,
-        "tracking_number": _tracking_number(inp.carrier_id),
+        "tracking_number": tracking_num,
         "carrier_id": inp.carrier_id,
         "carrier_name": chosen["carrier_name"],
+        "service_type": chosen.get("service_type", ""),
+        "label_pdf_base64": label_b64,
         "sender": inp.quote.sender.model_dump(),
         "recipient": inp.quote.recipient.model_dump(),
         "parcel_type": inp.quote.parcel_type,
@@ -553,6 +604,7 @@ async def create_shipment(inp: CreateShipmentInput, user=Depends(require_approve
             "type": "shipment_charge", "amount": -price, "shipment_id": shipment["id"], "created_at": now_iso()
         })
     shipment.pop("_id", None)
+    shipment.pop("label_pdf_base64", None)
     if user.get("role") == "user":
         for secret_k in ("cost", "carrier_cost", "reseller_cost", "admin_markup_percent", "reseller_markup_percent"):
             shipment.pop(secret_k, None)
@@ -561,7 +613,7 @@ async def create_shipment(inp: CreateShipmentInput, user=Depends(require_approve
 @api_router.get("/shipments")
 async def list_shipments(user=Depends(require_approved)):
     q = tenant_filter(user)
-    proj = {"_id": 0}
+    proj = {"_id": 0, "label_pdf_base64": 0}
     if user.get("role") == "user":
         proj.update({"cost": 0, "carrier_cost": 0, "reseller_cost": 0, "admin_markup_percent": 0, "reseller_markup_percent": 0})
     ships = await db.shipments.find(q, proj).sort("created_at", -1).to_list(1000)
@@ -572,7 +624,7 @@ async def list_shipments(user=Depends(require_approved)):
 @api_router.get("/shipments/{sid}")
 async def get_shipment(sid: str, user=Depends(require_approved)):
     q = tenant_filter(user, {"id": sid})
-    proj = {"_id": 0}
+    proj = {"_id": 0, "label_pdf_base64": 0}
     if user.get("role") == "user":
         proj.update({"cost": 0, "carrier_cost": 0, "reseller_cost": 0, "admin_markup_percent": 0, "reseller_markup_percent": 0})
     s = await db.shipments.find_one(q, proj)
@@ -604,6 +656,16 @@ async def download_label(sid: str, user=Depends(require_approved)):
     s = await db.shipments.find_one(q, {"_id": 0})
     if not s:
         raise HTTPException(404, "Spedizione non trovata")
+
+    # Se presente l'etichetta PDF ufficiale del corriere (es. FedEx Base64), restituisci quella
+    if s.get("label_pdf_base64"):
+        pdf_bytes = base64.b64decode(s["label_pdf_base64"])
+        return StreamingResponse(
+            io.BytesIO(pdf_bytes),
+            media_type="application/pdf",
+            headers={"Content-Disposition": f"attachment; filename=label-{s['tracking_number']}.pdf"},
+        )
+
     buf = io.BytesIO()
     c = canvas.Canvas(buf, pagesize=A6)
     w, h = A6
@@ -643,7 +705,7 @@ async def download_label(sid: str, user=Depends(require_approved)):
 @api_router.get("/shipments/export/xlsx")
 async def export_shipments(user=Depends(require_approved)):
     q = tenant_filter(user)
-    ships = await db.shipments.find(q, {"_id": 0}).sort("created_at", -1).to_list(5000)
+    ships = await db.shipments.find(q, {"_id": 0, "label_pdf_base64": 0}).sort("created_at", -1).to_list(5000)
     wb = openpyxl.Workbook()
     ws = wb.active
     ws.title = "Spedizioni"
@@ -772,7 +834,7 @@ async def generate_invoice(user_id: str, admin=Depends(require_admin)):
         raise HTTPException(404, "Utente non trovato")
     if admin.get("role") == "reseller_admin" and target.get("reseller_id") != admin.get("reseller_id"):
         raise HTTPException(403, "Utente di altro reseller")
-    ships = await db.shipments.find({"user_id": user_id, "invoice_id": {"$exists": False}}, {"_id": 0}).to_list(1000)
+    ships = await db.shipments.find({"user_id": user_id, "invoice_id": {"$exists": False}}, {"_id": 0, "label_pdf_base64": 0}).to_list(1000)
     if not ships:
         raise HTTPException(400, "Nessuna spedizione da fatturare")
     total = sum(s["price"] for s in ships)
@@ -793,7 +855,7 @@ async def invoice_pdf(iid: str, user=Depends(require_approved)):
     inv = await db.invoices.find_one(tenant_filter(user, {"id": iid}), {"_id": 0})
     if not inv:
         raise HTTPException(404, "Fattura non trovata")
-    ships = await db.shipments.find({"id": {"$in": inv["shipment_ids"]}}, {"_id": 0}).to_list(1000)
+    ships = await db.shipments.find({"id": {"$in": inv["shipment_ids"]}}, {"_id": 0, "label_pdf_base64": 0}).to_list(1000)
     u = await db.users.find_one({"id": inv["user_id"]}, {"_id": 0, "password": 0})
     buf = io.BytesIO()
     c = canvas.Canvas(buf, pagesize=A4)
@@ -859,7 +921,7 @@ async def bootstrap():
 
 @api_router.get("/")
 async def root():
-    return {"service": "SpedPortal API", "status": "ok"}
+    return {"service": "SpedPortal API", "status": "ok", "fedex_live": is_fedex_configured()}
 
 app.include_router(api_router)
 from extras import extra_router
