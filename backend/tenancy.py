@@ -72,7 +72,6 @@ CARRIER_SCHEMAS = {
     },
 }
 
-# Policy consentite: admin_only | reseller_only | disabled
 DEFAULT_POLICIES = {c: "admin_only" for c in DEFAULT_CARRIERS}
 
 
@@ -120,6 +119,7 @@ class ResellerInput(BaseModel):
     plan: str = "basic"
     features: Optional[Dict[str, bool]] = None
     carrier_policies: Optional[Dict[str, str]] = None  # admin_only | reseller_only | disabled
+    admin_carrier_markups: Optional[Dict[str, Optional[float]]] = None  # None = usa default corriere, float = override
     carrier_credentials: Optional[Dict[str, Dict[str, Any]]] = None
     per_shipment_fee: float = 0.0
     active: bool = True
@@ -127,6 +127,7 @@ class ResellerInput(BaseModel):
 
 class CarrierCredsSave(BaseModel):
     values: Dict[str, Any]
+    default_markup_percent: Optional[float] = None
 
 
 # --- ENDPOINT SCHEMI CORRIERI ---
@@ -140,7 +141,7 @@ async def get_carrier_schemas_reseller(_=Depends(get_current_user)):
     return CARRIER_SCHEMAS
 
 
-# --- CODICI MASTER DEL SUPER ADMIN ---
+# --- CODICI MASTER DEL SUPER ADMIN + MARGINE DEFAULT ---
 @super_router.get("/master-carriers")
 async def list_master_carriers(_=Depends(require_super_admin)):
     doc = await db.system_settings.find_one({"id": "master_carriers"}, {"_id": 0})
@@ -152,12 +153,23 @@ async def list_master_carriers(_=Depends(require_super_admin)):
 async def save_master_carrier(carrier_id: str, inp: CarrierCredsSave, _=Depends(require_super_admin)):
     _validate_carrier_payload(carrier_id, inp.values)
     schema = CARRIER_SCHEMAS[carrier_id]
-    status = "verified" if schema["auth_type"] == "credentials" else "pending_auth"
+    existing_doc = await db.system_settings.find_one({"id": "master_carriers"}, {"_id": 0})
+    existing_entry = ((existing_doc or {}).get("carriers") or {}).get(carrier_id) or {}
+
+    status = existing_entry.get("status") if existing_entry.get("status") == "verified" else (
+        "verified" if schema["auth_type"] == "credentials" else "pending_auth"
+    )
+    markup = (
+        float(inp.default_markup_percent)
+        if inp.default_markup_percent is not None
+        else float(existing_entry.get("default_markup_percent", 5.0))
+    )
     entry = {
         "values": inp.values,
         "primary_code": _extract_primary_code(carrier_id, inp.values),
         "auth_type": schema["auth_type"],
         "status": status,
+        "default_markup_percent": round(markup, 2),
         "updated_at": now_iso(),
     }
     await db.system_settings.update_one(
@@ -195,11 +207,13 @@ async def create_reseller(inp: ResellerInput, _=Depends(require_super_admin)):
     features = {**DEFAULT_FEATURES, **(inp.features or {})}
     raw_pol = {**DEFAULT_POLICIES, **(inp.carrier_policies or {})}
     policies = {k: _normalize_policy(v) for k, v in raw_pol.items()}
+    markups = {k: (round(float(v), 2) if v is not None else None) for k, v in (inp.admin_carrier_markups or {}).items()}
     reseller = {
         "id": rid, "company_name": inp.company_name, "slug": slug,
         "admin_email": inp.admin_email.lower(), "plan": inp.plan,
         "features": features,
         "carrier_policies": policies,
+        "admin_carrier_markups": markups,
         "carrier_credentials": inp.carrier_credentials or {},
         "per_shipment_fee": inp.per_shipment_fee, "active": inp.active, "created_at": now_iso(),
     }
@@ -221,6 +235,7 @@ async def list_resellers(_=Depends(require_super_admin)):
     for r in items:
         raw_pol = {**DEFAULT_POLICIES, **(r.get("carrier_policies") or {})}
         r["carrier_policies"] = {k: _normalize_policy(v) for k, v in raw_pol.items()}
+        r["admin_carrier_markups"] = r.get("admin_carrier_markups") or {}
         r["user_count"] = await db.users.count_documents({"reseller_id": r["id"], "role": "user"})
         r["shipment_count"] = await db.shipments.count_documents({"reseller_id": r["id"]})
     return items
@@ -239,6 +254,11 @@ async def update_reseller(rid: str, inp: ResellerInput, _=Depends(require_super_
     if "carrier_policies" in doc and doc["carrier_policies"]:
         merged = {**DEFAULT_POLICIES, **(existing.get("carrier_policies") or {}), **doc["carrier_policies"]}
         doc["carrier_policies"] = {k: _normalize_policy(v) for k, v in merged.items()}
+    if "admin_carrier_markups" in doc and doc["admin_carrier_markups"] is not None:
+        doc["admin_carrier_markups"] = {
+            k: (round(float(v), 2) if v is not None else None)
+            for k, v in doc["admin_carrier_markups"].items()
+        }
     await db.resellers.update_one({"id": rid}, {"$set": doc})
     return {"ok": True}
 
@@ -251,18 +271,27 @@ async def reseller_billing(rid: str, _=Depends(require_super_admin)):
     ships = await db.shipments.find(
         {"reseller_id": rid},
         {"_id": 0, "id": 1, "created_at": 1, "tracking_number": 1, "carrier_id": 1,
-         "carrier_name": 1, "cost": 1, "price": 1, "on_master_codes": 1,
+         "carrier_name": 1, "cost": 1, "carrier_cost": 1, "reseller_cost": 1,
+         "admin_markup_percent": 1, "price": 1, "on_master_codes": 1,
          "contract_owner": 1, "carrier_code_used": 1, "applied_fee": 1}
     ).sort("created_at", -1).to_list(10000)
+
     on_master = [s for s in ships if s.get("contract_owner", "admin" if s.get("on_master_codes", True) else "reseller") == "admin"]
     on_own = [s for s in ships if s.get("contract_owner", "admin" if s.get("on_master_codes", True) else "reseller") == "reseller"]
-    due_standard = round(sum(s.get("cost", 0) for s in on_master), 2)
+
+    raw_carrier_cost_master = round(sum(s.get("carrier_cost", s.get("cost", 0)) for s in on_master), 2)
+    due_standard = round(sum(s.get("reseller_cost", s.get("cost", 0)) for s in on_master), 2)
+    admin_margin_earned = round(due_standard - raw_carrier_cost_master, 2)
+
     fee_unit = float(res.get("per_shipment_fee") or 0)
     due_premium = round(sum(s.get("applied_fee", fee_unit) for s in on_own), 2)
+
     return {
         "reseller": res,
         "shipments_on_master": len(on_master),
         "shipments_on_own": len(on_own),
+        "raw_carrier_cost_master": raw_carrier_cost_master,
+        "admin_margin_earned": admin_margin_earned,
         "amount_due_standard": due_standard,
         "amount_due_premium": due_premium,
         "amount_due_total": round(due_standard + due_premium, 2),
@@ -312,7 +341,7 @@ async def reseller_list_carriers(user=Depends(require_reseller_admin)):
             "auth_type": schema["auth_type"],
             "auth_note": schema.get("auth_note", ""),
             "fields": schema["fields"],
-            "policy": pol,  # admin_only | reseller_only
+            "policy": pol,
             "can_configure_own": (pol == "reseller_only"),
             "own_config": own,
         })
@@ -375,12 +404,12 @@ async def bootstrap_multitenant():
         await db.system_settings.insert_one({
             "id": "master_carriers",
             "carriers": {
-                "brt": {"values": {"user_id": "MASTER_BRT", "password": "***", "customer_code": "1029384", "depot_code": "102"}, "primary_code": "1029384", "auth_type": "credentials", "status": "verified", "updated_at": now_iso()},
-                "gls": {"values": {"sede": "MI", "customer_code": "998877", "password": "***", "contract_code": "GLS-MST01"}, "primary_code": "998877", "auth_type": "credentials", "status": "verified", "updated_at": now_iso()},
-                "dhl": {"values": {"api_key": "DHL_KEY_MST", "api_secret": "***", "account_number": "123456789"}, "primary_code": "123456789", "auth_type": "credentials", "status": "verified", "updated_at": now_iso()},
-                "ups": {"values": {"account_number": "A1B2C3", "postal_code": "20100"}, "primary_code": "A1B2C3", "auth_type": "account_link", "status": "verified", "updated_at": now_iso()},
-                "tnt": {"values": {"account_number": "987654321", "country_code": "IT"}, "primary_code": "987654321", "auth_type": "account_link", "status": "verified", "updated_at": now_iso()},
-                "poste": {"values": {"client_id": "PI_MST_ID", "client_secret": "***", "cdc_code": "CDC001"}, "primary_code": "CDC001", "auth_type": "credentials", "status": "verified", "updated_at": now_iso()},
+                "brt": {"values": {"user_id": "MASTER_BRT", "password": "***", "customer_code": "1029384", "depot_code": "102"}, "primary_code": "1029384", "auth_type": "credentials", "status": "verified", "default_markup_percent": 6.0, "updated_at": now_iso()},
+                "gls": {"values": {"sede": "MI", "customer_code": "998877", "password": "***", "contract_code": "GLS-MST01"}, "primary_code": "998877", "auth_type": "credentials", "status": "verified", "default_markup_percent": 6.0, "updated_at": now_iso()},
+                "dhl": {"values": {"api_key": "DHL_KEY_MST", "api_secret": "***", "account_number": "123456789"}, "primary_code": "123456789", "auth_type": "credentials", "status": "verified", "default_markup_percent": 5.0, "updated_at": now_iso()},
+                "ups": {"values": {"account_number": "A1B2C3", "postal_code": "20100"}, "primary_code": "A1B2C3", "auth_type": "account_link", "status": "verified", "default_markup_percent": 5.0, "updated_at": now_iso()},
+                "tnt": {"values": {"account_number": "987654321", "country_code": "IT"}, "primary_code": "987654321", "auth_type": "account_link", "status": "verified", "default_markup_percent": 5.0, "updated_at": now_iso()},
+                "poste": {"values": {"client_id": "PI_MST_ID", "client_secret": "***", "cdc_code": "CDC001"}, "primary_code": "CDC001", "auth_type": "credentials", "status": "verified", "default_markup_percent": 8.0, "updated_at": now_iso()},
             }
         })
 
@@ -395,6 +424,7 @@ async def bootstrap_multitenant():
                 "brt": "admin_only", "gls": "admin_only", "dhl": "admin_only",
                 "ups": "reseller_only", "tnt": "admin_only", "poste": "admin_only"
             },
+            "admin_carrier_markups": {},
             "carrier_credentials": {},
             "per_shipment_fee": 0.15, "active": True, "created_at": now_iso(),
         })
