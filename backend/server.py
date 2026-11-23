@@ -337,20 +337,24 @@ def _mock_carrier_cost(carrier_id: str, weight: float, zone: str, parcels_count:
     cost *= (0.9 + 0.25 * seed)
     return round(cost, 2)
 
-async def _price_with_markup(user: dict, cost: float, weight: float, zone: str) -> float:
+async def _reseller_markup_percent(user: dict, weight: float, zone: str) -> float:
+    """Restituisce la % di ricarico del Reseller (dal listino assegnato al cliente o dal listino base del tenant)."""
     default_markup = 20.0
     rate_table_id = user.get("rate_table_id")
+    table = None
     if rate_table_id:
         table = await db.rate_tables.find_one({"id": rate_table_id}, {"_id": 0})
-        if table:
-            for band in table.get("bands", []):
-                if band["zone"] == zone and band["min_weight"] <= weight <= band["max_weight"]:
-                    return round(cost * (1 + band["markup_percent"] / 100.0), 2)
-    return round(cost * (1 + default_markup / 100.0), 2)
+    if not table and user.get("reseller_id"):
+        table = await db.rate_tables.find_one({"reseller_id": user.get("reseller_id")}, {"_id": 0})
+    if table:
+        for band in table.get("bands", []):
+            if band["zone"] == zone and band["min_weight"] <= weight <= band["max_weight"]:
+                return float(band["markup_percent"])
+    return default_markup
 
 
 async def _resolve_tenant_carrier_options(user: dict) -> dict:
-    """Restituisce per ciascun corriere abilitato al tenant se usa contratto Admin o Reseller."""
+    """Restituisce per ciascun corriere abilitato: contratto (admin|reseller), codice e % margine Admin."""
     rid = user.get("reseller_id")
     master_doc = await db.system_settings.find_one({"id": "master_carriers"}, {"_id": 0})
     master_carriers = (master_doc or {}).get("carriers") or {}
@@ -364,6 +368,7 @@ async def _resolve_tenant_carrier_options(user: dict) -> dict:
                 out[cid] = {
                     "owner": "admin",
                     "code": m.get("primary_code", ""),
+                    "admin_markup_percent": 0.0,
                     "per_shipment_fee": 0.0,
                 }
         return out
@@ -372,6 +377,7 @@ async def _resolve_tenant_carrier_options(user: dict) -> dict:
     if not res:
         return {}
     policies = res.get("carrier_policies") or {}
+    custom_markups = res.get("admin_carrier_markups") or {}
     own_creds = res.get("carrier_credentials") or {}
     out = {}
 
@@ -386,9 +392,12 @@ async def _resolve_tenant_carrier_options(user: dict) -> dict:
         if pol == "admin_only":
             m = master_carriers.get(cid) or {}
             if m.get("status") == "verified":
+                override = custom_markups.get(cid)
+                admin_mk = float(override) if override is not None else float(m.get("default_markup_percent", 0.0))
                 out[cid] = {
                     "owner": "admin",
                     "code": m.get("primary_code", ""),
+                    "admin_markup_percent": round(admin_mk, 2),
                     "per_shipment_fee": 0.0,
                 }
         elif pol == "reseller_only":
@@ -397,50 +406,94 @@ async def _resolve_tenant_carrier_options(user: dict) -> dict:
                 out[cid] = {
                     "owner": "reseller",
                     "code": o.get("primary_code", ""),
+                    "admin_markup_percent": 0.0,
                     "per_shipment_fee": float(res.get("per_shipment_fee") or 0.0),
                 }
     return out
 
 
-@api_router.post("/shipments/quote")
-async def quote_shipment(q: QuoteRequest, user=Depends(require_approved)):
+async def _compute_quotes_internal(q: QuoteRequest, user: dict) -> dict:
+    """Calcola la cascata completa dei costi e dei margini per uso interno/backend."""
     total_weight = sum(p.weight for p in q.parcels)
     vol_weight = sum((p.length * p.width * p.height) / 5000.0 for p in q.parcels)
     billed_weight = max(total_weight, vol_weight)
     zone = _zone_of(q.sender, q.recipient)
     options = await _resolve_tenant_carrier_options(user)
+    reseller_mk_pct = await _reseller_markup_percent(user, billed_weight, zone)
+
     quotes = []
     for c in MOCK_CARRIERS:
         opt = options.get(c["id"])
         if not opt:
             continue
-        cost = _mock_carrier_cost(c["id"], billed_weight, zone, len(q.parcels))
+        # 1. Costo vivo dal corriere (nolo + supplementi)
+        carrier_cost = _mock_carrier_cost(c["id"], billed_weight, zone, len(q.parcels))
         service_extra = 0.0
         if q.services.insurance:
             service_extra += max(3.0, q.services.insurance_value * 0.008)
         if q.services.neutral_delivery:
             service_extra += 2.0
         if q.customs.required:
-            cost += 8.0
-        cost += service_extra
-        price = await _price_with_markup(user, cost, billed_weight, zone)
+            carrier_cost += 8.0
+        carrier_cost = round(carrier_cost + service_extra, 2)
+
+        # 2. Margine Super Admin (applicato solo se usa codice Admin)
+        admin_mk_pct = opt["admin_markup_percent"] if opt["owner"] == "admin" else 0.0
+        reseller_cost = round(carrier_cost * (1 + admin_mk_pct / 100.0), 2)
+
+        # 3. Margine Reseller (applicato sopra reseller_cost -> prezzo finale cliente)
+        client_price = round(reseller_cost * (1 + reseller_mk_pct / 100.0), 2)
+
         transit = 1 if zone.startswith("NAZ") else (3 if c["id"] in ["dhl", "ups", "tnt"] else 5)
         quotes.append({
-            "carrier_id": c["id"], "carrier_name": c["name"], "color": c["color"],
-            "cost": cost, "price": price, "transit_days": transit,
-            "billed_weight": round(billed_weight, 2), "zone": zone,
+            "carrier_id": c["id"],
+            "carrier_name": c["name"],
+            "color": c["color"],
+            "carrier_cost": carrier_cost,
+            "admin_markup_percent": admin_mk_pct,
+            "reseller_cost": reseller_cost,
+            "reseller_markup_percent": reseller_mk_pct,
+            "cost": reseller_cost,
+            "price": client_price,
+            "transit_days": transit,
+            "billed_weight": round(billed_weight, 2),
+            "zone": zone,
             "contract_owner": opt["owner"],
         })
     quotes.sort(key=lambda x: x["price"])
     return {"quotes": quotes, "billed_weight": round(billed_weight, 2), "zone": zone}
 
+
+@api_router.post("/shipments/quote")
+async def quote_shipment(q: QuoteRequest, user=Depends(require_approved)):
+    full = await _compute_quotes_internal(q, user)
+    role = user.get("role")
+    # Il cliente finale vede SOLO il prezzo marginato, mai costi vivi o margini intermedi
+    if role == "user":
+        sanitized = [
+            {
+                "carrier_id": item["carrier_id"],
+                "carrier_name": item["carrier_name"],
+                "color": item["color"],
+                "price": item["price"],
+                "transit_days": item["transit_days"],
+                "billed_weight": item["billed_weight"],
+                "zone": item["zone"],
+            }
+            for item in full["quotes"]
+        ]
+        return {"quotes": sanitized, "billed_weight": full["billed_weight"], "zone": full["zone"]}
+    return full
+
+
 def _tracking_number(carrier_id: str) -> str:
     return f"{carrier_id.upper()}{''.join(random.choices(string.digits, k=10))}"
 
+
 @api_router.post("/shipments")
 async def create_shipment(inp: CreateShipmentInput, user=Depends(require_approved)):
-    quotes = await quote_shipment(inp.quote, user)
-    chosen = next((q for q in quotes["quotes"] if q["carrier_id"] == inp.carrier_id), None)
+    full_quotes = await _compute_quotes_internal(inp.quote, user)
+    chosen = next((q for q in full_quotes["quotes"] if q["carrier_id"] == inp.carrier_id), None)
     if not chosen:
         raise HTTPException(400, "Corriere non valido o non abilitato per questo account")
 
@@ -453,12 +506,15 @@ async def create_shipment(inp: CreateShipmentInput, user=Depends(require_approve
     code_used = opt["code"]
     applied_fee = 0.0 if source == "admin" else opt.get("per_shipment_fee", 0.0)
 
+    carrier_cost = chosen["carrier_cost"]
+    reseller_cost = chosen["reseller_cost"]
     price = chosen["price"]
-    cost = chosen["cost"]
+
     if user.get("billing_type") == "prepaid":
         bal = user.get("credit_balance", 0.0)
         if bal < price:
             raise HTTPException(402, "Credito insufficiente. Ricarica il tuo saldo prepagato.")
+
     shipment = {
         "id": new_id(),
         "user_id": user["id"],
@@ -479,7 +535,11 @@ async def create_shipment(inp: CreateShipmentInput, user=Depends(require_approve
         "services": inp.quote.services.model_dump(),
         "billed_weight": chosen["billed_weight"],
         "zone": chosen["zone"],
-        "cost": cost,
+        "carrier_cost": carrier_cost,
+        "admin_markup_percent": chosen["admin_markup_percent"],
+        "reseller_cost": reseller_cost,
+        "reseller_markup_percent": chosen["reseller_markup_percent"],
+        "cost": reseller_cost,
         "price": price,
         "status": "created",
         "tracking_events": [{"ts": now_iso(), "code": "created", "label": "Spedizione creata"}],
@@ -493,12 +553,18 @@ async def create_shipment(inp: CreateShipmentInput, user=Depends(require_approve
             "type": "shipment_charge", "amount": -price, "shipment_id": shipment["id"], "created_at": now_iso()
         })
     shipment.pop("_id", None)
+    if user.get("role") == "user":
+        for secret_k in ("cost", "carrier_cost", "reseller_cost", "admin_markup_percent", "reseller_markup_percent"):
+            shipment.pop(secret_k, None)
     return shipment
 
 @api_router.get("/shipments")
 async def list_shipments(user=Depends(require_approved)):
     q = tenant_filter(user)
-    ships = await db.shipments.find(q, {"_id": 0}).sort("created_at", -1).to_list(1000)
+    proj = {"_id": 0}
+    if user.get("role") == "user":
+        proj.update({"cost": 0, "carrier_cost": 0, "reseller_cost": 0, "admin_markup_percent": 0, "reseller_markup_percent": 0})
+    ships = await db.shipments.find(q, proj).sort("created_at", -1).to_list(1000)
     for s in ships:
         s["status"] = _simulate_status(s)
     return ships
@@ -506,7 +572,10 @@ async def list_shipments(user=Depends(require_approved)):
 @api_router.get("/shipments/{sid}")
 async def get_shipment(sid: str, user=Depends(require_approved)):
     q = tenant_filter(user, {"id": sid})
-    s = await db.shipments.find_one(q, {"_id": 0})
+    proj = {"_id": 0}
+    if user.get("role") == "user":
+        proj.update({"cost": 0, "carrier_cost": 0, "reseller_cost": 0, "admin_markup_percent": 0, "reseller_markup_percent": 0})
+    s = await db.shipments.find_one(q, proj)
     if not s:
         raise HTTPException(404, "Spedizione non trovata")
     s["status"] = _simulate_status(s)
