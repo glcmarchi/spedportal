@@ -6,8 +6,8 @@ from starlette.middleware.cors import CORSMiddleware
 from motor.motor_asyncio import AsyncIOMotorClient
 import os, io, uuid, logging, random, string, hashlib, base64
 from pathlib import Path
-from pydantic import BaseModel, EmailStr
-from typing import List, Optional
+from pydantic import BaseModel, EmailStr, Field
+from typing import List, Optional, Dict, Any
 from datetime import datetime, timezone, timedelta
 import bcrypt
 import jwt as pyjwt
@@ -46,6 +46,15 @@ security = HTTPBearer(auto_error=False)
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("spedportal")
+
+EU_COUNTRIES = {
+    "AT", "BE", "BG", "HR", "CY", "CZ", "DK", "EE", "FI", "FR", "DE", "GR",
+    "HU", "IE", "IT", "LV", "LT", "LU", "MT", "NL", "PL", "PT", "RO", "SK",
+    "SI", "ES", "SE",
+}
+EUROPE_EXTRA_COUNTRIES = {"GB", "UK", "CH", "NO", "IS", "LI", "AL", "RS", "BA", "ME", "MK", "MD", "UA", "TR"}
+NORTH_AMERICA_COUNTRIES = {"US", "CA", "MX"}
+
 
 def now_iso():
     return datetime.now(timezone.utc).isoformat()
@@ -111,6 +120,14 @@ class RegisterInput(BaseModel):
     phone: Optional[str] = None
     reseller_slug: Optional[str] = None
 
+class CreateClientInput(BaseModel):
+    email: EmailStr
+    password: str
+    company_name: str
+    phone: Optional[str] = ""
+    billing_type: str = "postpaid"
+    rate_table_id: Optional[str] = None
+
 class LoginInput(BaseModel):
     email: EmailStr
     password: str
@@ -120,6 +137,7 @@ class Address(BaseModel):
     address: str
     postal_code: str
     city: str
+    province: Optional[str] = ""
     country: str
     reference: Optional[str] = ""
     email: Optional[str] = ""
@@ -135,11 +153,17 @@ class OptionalServices(BaseModel):
     insurance: bool = False
     insurance_value: float = 0
     neutral_delivery: bool = False
+    cod: bool = False
+    cod_amount: float = 0
+    saturday_delivery: bool = False
+    residential_delivery: bool = False
 
 class CustomsDocs(BaseModel):
     required: bool = False
     proforma_name: Optional[str] = ""
     dae_name: Optional[str] = ""
+    eori_number: Optional[str] = ""
+    customs_value: float = 0
 
 class QuoteRequest(BaseModel):
     sender: Address
@@ -155,9 +179,9 @@ class CreateShipmentInput(BaseModel):
     carrier_id: str
 
 class PickupRequestInput(BaseModel):
-    pickup_date: str           # YYYY-MM-DD
-    ready_time: str = "10:00"  # HH:MM
-    close_time: str = "18:00"  # HH:MM
+    pickup_date: str
+    ready_time: str = "10:00"
+    close_time: str = "18:00"
     remarks: Optional[str] = ""
 
 class UpdateUserInput(BaseModel):
@@ -167,9 +191,9 @@ class UpdateUserInput(BaseModel):
 
 class RateBand(BaseModel):
     zone: str
-    min_weight: float
-    max_weight: float
-    markup_percent: float
+    min_weight: float = Field(ge=0)
+    max_weight: float = Field(gt=0)
+    markup_percent: float = Field(ge=0)
 
 class RateTableInput(BaseModel):
     name: str
@@ -242,15 +266,28 @@ async def me(user=Depends(get_current_user)):
     rid = user.get("reseller_id")
     if user.get("role") == "super_admin":
         user["features"] = {
-            "customs": True, "insurance": True, "prepaid": True, "manifests": True,
-            "address_book": True, "parcels": True, "broadcasts": True,
-            "premium_own_carriers": True,
+            "address_book": True, "manifests": True, "parcels": True,
+            "sub_clients": True, "rate_tables": True, "broadcasts": True,
+            "client_prepaid": True, "client_billing": True,
+        }
+        user["enabled_surcharges"] = {
+            "insurance": True, "cod": True, "saturday_delivery": True,
+            "neutral_delivery": True, "residential_delivery": True,
         }
         user["can_manage_own_carriers"] = True
     elif rid:
-        res = await db.resellers.find_one({"id": rid}, {"_id": 0, "features": 1, "company_name": 1, "carrier_policies": 1})
+        res = await db.resellers.find_one({"id": rid}, {"_id": 0})
         user["features"] = (res or {}).get("features", {})
+        user["enabled_surcharges"] = (res or {}).get("enabled_surcharges") or {
+            "insurance": True, "cod": True, "saturday_delivery": True,
+            "neutral_delivery": True, "residential_delivery": True,
+        }
         user["reseller_name"] = (res or {}).get("company_name", "")
+        user["reseller_slug"] = (res or {}).get("slug", "")
+        user["reseller_plan"] = (res or {}).get("plan", "basic")
+        if user.get("role") == "reseller_admin":
+            user["billing_type"] = (res or {}).get("billing_type", user.get("billing_type", "prepaid"))
+            user["credit_balance"] = float((res or {}).get("credit_balance") or user.get("credit_balance") or 0.0)
         policies = (res or {}).get("carrier_policies") or {}
         user["can_manage_own_carriers"] = any(p in ("reseller_only", "hybrid") for p in policies.values())
     return user
@@ -261,6 +298,33 @@ async def list_users(user=Depends(require_admin)):
     if user.get("role") == "reseller_admin":
         q["reseller_id"] = user["reseller_id"]
     return await db.users.find(q, {"_id": 0, "password": 0}).to_list(1000)
+
+@api_router.post("/admin/users")
+async def create_client_user(inp: CreateClientInput, admin=Depends(require_admin)):
+    if await db.users.find_one({"email": inp.email.lower()}):
+        raise HTTPException(400, "Email già registrata")
+    rid = admin.get("reseller_id")
+    if not rid:
+        demo = await db.resellers.find_one({"active": True})
+        rid = demo["id"] if demo else None
+    doc = {
+        "id": new_id(),
+        "email": inp.email.lower(),
+        "password": hash_pw(inp.password),
+        "company_name": inp.company_name,
+        "phone": inp.phone or "",
+        "role": "user",
+        "reseller_id": rid,
+        "status": "approved",
+        "billing_type": inp.billing_type if inp.billing_type in ("prepaid", "postpaid") else "postpaid",
+        "rate_table_id": inp.rate_table_id,
+        "credit_balance": 0.0,
+        "created_at": now_iso(),
+    }
+    await db.users.insert_one(doc)
+    doc.pop("_id", None)
+    doc.pop("password", None)
+    return doc
 
 @api_router.patch("/admin/users/{user_id}")
 async def update_user(user_id: str, inp: UpdateUserInput, admin=Depends(require_admin)):
@@ -288,6 +352,13 @@ async def update_user(user_id: str, inp: UpdateUserInput, admin=Depends(require_
                 pass
     return {"ok": True}
 
+def _validate_bands(bands: List[RateBand]):
+    for b in bands:
+        if b.min_weight < 0:
+            raise HTTPException(400, "Il peso minimo non può essere negativo")
+        if b.max_weight <= b.min_weight:
+            raise HTTPException(400, "Il peso massimo deve essere maggiore del peso minimo")
+
 @api_router.get("/admin/rate-tables")
 async def list_rate_tables(user=Depends(require_admin)):
     q = {} if user.get("role") == "super_admin" else {"reseller_id": user.get("reseller_id")}
@@ -295,6 +366,7 @@ async def list_rate_tables(user=Depends(require_admin)):
 
 @api_router.post("/admin/rate-tables")
 async def create_rate_table(inp: RateTableInput, user=Depends(require_admin)):
+    _validate_bands(inp.bands)
     doc = {"id": new_id(), "reseller_id": user.get("reseller_id"),
            "name": inp.name, "bands": [b.model_dump() for b in inp.bands],
            "created_at": now_iso()}
@@ -304,6 +376,7 @@ async def create_rate_table(inp: RateTableInput, user=Depends(require_admin)):
 
 @api_router.put("/admin/rate-tables/{tid}")
 async def update_rate_table(tid: str, inp: RateTableInput, user=Depends(require_admin)):
+    _validate_bands(inp.bands)
     q = {"id": tid} if user.get("role") == "super_admin" else {"id": tid, "reseller_id": user.get("reseller_id")}
     r = await db.rate_tables.update_one(q, {"$set": {
         "name": inp.name, "bands": [b.model_dump() for b in inp.bands]
@@ -331,7 +404,7 @@ MOCK_CARRIERS = [
 async def list_carriers(_=Depends(require_approved)):
     return MOCK_CARRIERS
 
-def _zone_of(sender: Address, recipient: Address) -> str:
+def _zone_of(sender: Address, recipient: Address) -> dict:
     s = (sender.country or "IT").upper()
     r = (recipient.country or "IT").upper()
     if s == "IT" and r == "IT":
@@ -339,20 +412,55 @@ def _zone_of(sender: Address, recipient: Address) -> str:
             fd = int((recipient.postal_code or "0")[0])
         except Exception:
             fd = 0
-        zone = "A" if fd <= 3 else ("B" if fd <= 6 else "C")
-        return f"NAZ-{zone}"
-    return f"INT-{r}"
+        sub = "NAZ-A" if fd <= 3 else ("NAZ-B" if fd <= 6 else "NAZ-C")
+        return {"macro": "NAZ", "sub": sub, "is_extra_eu": False}
+    if r in EU_COUNTRIES:
+        return {"macro": "UE", "sub": f"INT-{r}", "is_extra_eu": False}
+    if r in EUROPE_EXTRA_COUNTRIES:
+        return {"macro": "EUR-EXTRA", "sub": f"INT-{r}", "is_extra_eu": True}
+    if r in NORTH_AMERICA_COUNTRIES:
+        return {"macro": "USA-CA", "sub": f"INT-{r}", "is_extra_eu": True}
+    return {"macro": "WORLD", "sub": f"INT-{r}", "is_extra_eu": True}
 
-def _mock_carrier_cost(carrier_id: str, weight: float, zone: str, parcels_count: int) -> float:
+def _mock_carrier_breakdown(carrier_id: str, weight: float, zone_info: dict, parcels_count: int, services: OptionalServices, is_extra_eu: bool) -> dict:
     base_map = {"brt": 4.5, "gls": 4.8, "dhl": 12.0, "ups": 11.0, "tnt": 10.5, "poste": 5.2}
     base = base_map.get(carrier_id, 8.0)
-    intl_mult = 2.4 if zone.startswith("INT") else 1.0
-    cost = (base + weight * 0.85) * intl_mult * max(1, parcels_count) * 0.9
-    seed = int(hashlib.md5((carrier_id + zone).encode()).hexdigest()[:4], 16) / 65535
-    cost *= (0.9 + 0.25 * seed)
-    return round(cost, 2)
+    mult = {"NAZ": 1.0, "UE": 1.9, "EUR-EXTRA": 2.3, "USA-CA": 2.8, "WORLD": 3.4}.get(zone_info["macro"], 2.0)
+    freight = (base + weight * 0.85) * mult * max(1, parcels_count) * 0.85
+    seed = int(hashlib.md5((carrier_id + zone_info["sub"]).encode()).hexdigest()[:4], 16) / 65535
+    freight = round(freight * (0.9 + 0.25 * seed), 2)
 
-async def _reseller_markup_percent(user: dict, weight: float, zone: str) -> float:
+    surcharge_items = []
+    fuel = round(freight * 0.11, 2)
+    surcharge_items.append({"type": "FUEL", "label": "Supplemento Carburante (Fuel)", "amount": fuel})
+    if services.insurance:
+        ins = round(max(3.5, services.insurance_value * 0.008), 2)
+        surcharge_items.append({"type": "INSURANCE", "label": "Assicurazione", "amount": ins})
+    if services.cod:
+        cod_fee = round(max(4.0, services.cod_amount * 0.015), 2)
+        surcharge_items.append({"type": "COD", "label": "Contrassegno (COD)", "amount": cod_fee})
+    if services.saturday_delivery:
+        surcharge_items.append({"type": "SATURDAY", "label": "Consegna al Sabato", "amount": 8.50})
+    if services.residential_delivery:
+        surcharge_items.append({"type": "RESIDENTIAL", "label": "Consegna Indirizzo Privato", "amount": 2.80})
+    if services.neutral_delivery:
+        surcharge_items.append({"type": "NEUTRAL", "label": "Consegna Neutra", "amount": 2.00})
+    if is_extra_eu:
+        surcharge_items.append({"type": "CUSTOMS", "label": "Oneri Sdoganamento Export", "amount": 8.00})
+
+    surcharges_total = round(sum(x["amount"] for x in surcharge_items), 2)
+    return {
+        "base_freight": freight,
+        "surcharges_total": surcharges_total,
+        "surcharge_items": surcharge_items,
+        "total_cost": round(freight + surcharges_total, 2),
+    }
+
+async def _reseller_markup_percent(user: dict, weight: float, zone_info: dict) -> float:
+    """Il Reseller o Super Admin vede il suo costo netto (0% auto-ricarico). Solo i sub-clienti ricevono il listino."""
+    if user.get("role") in ("reseller_admin", "super_admin", "admin"):
+        return 0.0
+
     default_markup = 20.0
     rate_table_id = user.get("rate_table_id")
     table = None
@@ -361,9 +469,11 @@ async def _reseller_markup_percent(user: dict, weight: float, zone: str) -> floa
     if not table and user.get("reseller_id"):
         table = await db.rate_tables.find_one({"reseller_id": user.get("reseller_id")}, {"_id": 0})
     if table:
-        for band in table.get("bands", []):
-            if band["zone"] == zone and band["min_weight"] <= weight <= band["max_weight"]:
-                return float(band["markup_percent"])
+        # Cerca prima per sub-zona specifica (es. NAZ-A / INT-FR), poi per macro-zona (es. NAZ / UE / WORLD)
+        for target_zone in (zone_info["sub"], zone_info["macro"]):
+            for band in table.get("bands", []):
+                if band["zone"] == target_zone and band["min_weight"] <= weight <= band["max_weight"]:
+                    return float(band["markup_percent"])
     return default_markup
 
 
@@ -429,9 +539,9 @@ async def _compute_quotes_internal(q: QuoteRequest, user: dict) -> dict:
     total_weight = sum(p.weight for p in q.parcels)
     vol_weight = sum((p.length * p.width * p.height) / 5000.0 for p in q.parcels)
     billed_weight = max(total_weight, vol_weight)
-    zone = _zone_of(q.sender, q.recipient)
+    zone_info = _zone_of(q.sender, q.recipient)
     options = await _resolve_tenant_carrier_options(user)
-    reseller_mk_pct = await _reseller_markup_percent(user, billed_weight, zone)
+    reseller_mk_pct = await _reseller_markup_percent(user, billed_weight, zone_info)
 
     quotes = []
     for c in MOCK_CARRIERS:
@@ -449,9 +559,12 @@ async def _compute_quotes_internal(q: QuoteRequest, user: dict) -> dict:
                     recipient=q.recipient.model_dump(),
                     parcels=[p.model_dump() for p in q.parcels],
                     parcel_type=q.parcel_type,
-                    customs_required=q.customs.required,
+                    customs_required=zone_info["is_extra_eu"] or q.customs.required,
                     goods_description=q.goods_description,
                     insured_value=q.services.insurance_value if q.services.insurance else 0.0,
+                    saturday_delivery=q.services.saturday_delivery,
+                    residential_delivery=q.services.residential_delivery,
+                    cod_amount=q.services.cod_amount if q.services.cod else 0.0,
                 )
                 if fx_rates:
                     fx_rates.sort(key=lambda x: x["carrier_cost"])
@@ -461,27 +574,39 @@ async def _compute_quotes_internal(q: QuoteRequest, user: dict) -> dict:
 
         if live_fedex:
             carrier_cost = live_fedex["carrier_cost"]
+            raw_freight = live_fedex["base_charge"]
+            raw_surcharges_total = live_fedex["surcharges"]
+            raw_surcharge_items = list(live_fedex["surcharge_list"])
+            if q.services.neutral_delivery:
+                raw_surcharge_items.append({"type": "NEUTRAL", "label": "Consegna Neutra", "amount": 2.00})
+                raw_surcharges_total = round(raw_surcharges_total + 2.00, 2)
+                carrier_cost = round(carrier_cost + 2.00, 2)
             transit = live_fedex["transit_days"]
             service_type = live_fedex["service_type"]
             carrier_label = live_fedex["service_name"]
             is_live = True
         else:
-            carrier_cost = _mock_carrier_cost(cid, billed_weight, zone, len(q.parcels))
-            service_extra = 0.0
-            if q.services.insurance:
-                service_extra += max(3.0, q.services.insurance_value * 0.008)
-            if q.services.neutral_delivery:
-                service_extra += 2.0
-            if q.customs.required:
-                carrier_cost += 8.0
-            carrier_cost = round(carrier_cost + service_extra, 2)
-            transit = 1 if zone.startswith("NAZ") else (3 if cid in ["dhl", "ups", "tnt"] else 5)
-            service_type = "INTERNATIONAL_PRIORITY" if zone.startswith("INT") else "FEDEX_PRIORITY"
+            bk = _mock_carrier_breakdown(cid, billed_weight, zone_info, len(q.parcels), q.services, zone_info["is_extra_eu"])
+            carrier_cost = bk["total_cost"]
+            raw_freight = bk["base_freight"]
+            raw_surcharges_total = bk["surcharges_total"]
+            raw_surcharge_items = bk["surcharge_items"]
+            transit = 1 if zone_info["macro"] == "NAZ" else (3 if cid in ["dhl", "ups", "tnt"] else 5)
+            service_type = "INTERNATIONAL_PRIORITY" if zone_info["macro"] != "NAZ" else "FEDEX_PRIORITY"
             carrier_label = c["name"]
             is_live = False
 
         admin_mk_pct = opt["admin_markup_percent"] if opt["owner"] == "admin" else 0.0
-        reseller_cost = round(carrier_cost * (1 + admin_mk_pct / 100.0), 2)
+        mult_admin = 1 + admin_mk_pct / 100.0
+
+        reseller_base_freight = round(raw_freight * mult_admin, 2)
+        reseller_surcharge_items = [
+            {**item, "amount": round(item["amount"] * mult_admin, 2)}
+            for item in raw_surcharge_items
+        ]
+        reseller_surcharges_total = round(sum(x["amount"] for x in reseller_surcharge_items), 2)
+        reseller_cost = round(reseller_base_freight + reseller_surcharges_total, 2)
+
         client_price = round(reseller_cost * (1 + reseller_mk_pct / 100.0), 2)
 
         quotes.append({
@@ -492,17 +617,20 @@ async def _compute_quotes_internal(q: QuoteRequest, user: dict) -> dict:
             "is_live": is_live,
             "carrier_cost": carrier_cost,
             "admin_markup_percent": admin_mk_pct,
+            "reseller_base_freight": reseller_base_freight,
+            "reseller_surcharges_total": reseller_surcharges_total,
+            "reseller_surcharge_items": reseller_surcharge_items,
             "reseller_cost": reseller_cost,
             "reseller_markup_percent": reseller_mk_pct,
             "cost": reseller_cost,
             "price": client_price,
             "transit_days": transit,
             "billed_weight": round(billed_weight, 2),
-            "zone": zone,
+            "zone": zone_info["macro"],
             "contract_owner": opt["owner"],
         })
     quotes.sort(key=lambda x: x["price"])
-    return {"quotes": quotes, "billed_weight": round(billed_weight, 2), "zone": zone}
+    return {"quotes": quotes, "billed_weight": round(billed_weight, 2), "zone": zone_info["macro"], "is_extra_eu": zone_info["is_extra_eu"]}
 
 
 @api_router.post("/shipments/quote")
@@ -522,7 +650,7 @@ async def quote_shipment(q: QuoteRequest, user=Depends(require_approved)):
             }
             for item in full["quotes"]
         ]
-        return {"quotes": sanitized, "billed_weight": full["billed_weight"], "zone": full["zone"]}
+        return {"quotes": sanitized, "billed_weight": full["billed_weight"], "zone": full["zone"], "is_extra_eu": full["is_extra_eu"]}
     return full
 
 
@@ -550,10 +678,24 @@ async def create_shipment(inp: CreateShipmentInput, user=Depends(require_approve
     reseller_cost = chosen["reseller_cost"]
     price = chosen["price"]
 
-    if user.get("billing_type") == "prepaid":
-        bal = user.get("credit_balance", 0.0)
+    # Importo che il Reseller deve all'Admin per questa spedizione
+    admin_charge_to_reseller = reseller_cost if source == "admin" else applied_fee
+
+    # 1. Controllo credito sub-cliente (se role == user e prepagato)
+    if user.get("role") == "user" and user.get("billing_type") == "prepaid":
+        bal = float(user.get("credit_balance") or 0.0)
         if bal < price:
             raise HTTPException(402, "Credito insufficiente. Ricarica il tuo saldo prepagato.")
+
+    # 2. Controllo credito Reseller verso Super Admin (se il Reseller è prepagato)
+    rid = user.get("reseller_id")
+    reseller_doc = await db.resellers.find_one({"id": rid}) if rid else None
+    if reseller_doc and reseller_doc.get("billing_type", "prepaid") == "prepaid" and admin_charge_to_reseller > 0:
+        res_bal = float(reseller_doc.get("credit_balance") or 0.0)
+        if res_bal < admin_charge_to_reseller:
+            if user.get("role") == "reseller_admin":
+                raise HTTPException(402, f"Credito piattaforma insufficiente (€ {res_bal:.2f}). Contatta l'amministratore per ricaricare.")
+            raise HTTPException(402, "Servizio temporaneamente sospeso per credito agenzia esaurito.")
 
     tracking_num = _tracking_number(inp.carrier_id)
     label_b64 = ""
@@ -569,8 +711,11 @@ async def create_shipment(inp: CreateShipmentInput, user=Depends(require_approve
                 service_type=chosen.get("service_type") or "INTERNATIONAL_PRIORITY",
                 parcel_type=inp.quote.parcel_type,
                 goods_description=inp.quote.goods_description,
-                customs_required=inp.quote.customs.required,
+                customs_required=full_quotes["is_extra_eu"] or inp.quote.customs.required,
                 insured_value=inp.quote.services.insurance_value if inp.quote.services.insurance else 0.0,
+                saturday_delivery=inp.quote.services.saturday_delivery,
+                residential_delivery=inp.quote.services.residential_delivery,
+                cod_amount=inp.quote.services.cod_amount if inp.quote.services.cod else 0.0,
             )
             if fx_ship.get("tracking_number"):
                 tracking_num = fx_ship["tracking_number"]
@@ -582,7 +727,7 @@ async def create_shipment(inp: CreateShipmentInput, user=Depends(require_approve
     shipment = {
         "id": new_id(),
         "user_id": user["id"],
-        "reseller_id": user.get("reseller_id"),
+        "reseller_id": rid,
         "on_master_codes": (source == "admin"),
         "contract_owner": source,
         "carrier_code_used": code_used,
@@ -613,12 +758,27 @@ async def create_shipment(inp: CreateShipmentInput, user=Depends(require_approve
         "created_at": now_iso(),
     }
     await db.shipments.insert_one(shipment)
-    if user.get("billing_type") == "prepaid":
+
+    # Addebito wallet sub-cliente
+    if user.get("role") == "user" and user.get("billing_type") == "prepaid":
         await db.users.update_one({"id": user["id"]}, {"$inc": {"credit_balance": -price}})
         await db.ledger.insert_one({
-            "id": new_id(), "user_id": user["id"], "reseller_id": user.get("reseller_id"),
+            "id": new_id(), "user_id": user["id"], "reseller_id": rid,
             "type": "shipment_charge", "amount": -price, "shipment_id": shipment["id"], "created_at": now_iso()
         })
+
+    # Addebito wallet Reseller verso Super Admin
+    if reseller_doc and reseller_doc.get("billing_type", "prepaid") == "prepaid" and admin_charge_to_reseller > 0:
+        await db.resellers.update_one({"id": rid}, {"$inc": {"credit_balance": -admin_charge_to_reseller}})
+        await db.users.update_many({"reseller_id": rid, "role": "reseller_admin"}, {"$inc": {"credit_balance": -admin_charge_to_reseller}})
+        await db.reseller_ledger.insert_one({
+            "id": new_id(), "reseller_id": rid, "shipment_id": shipment["id"],
+            "type": "shipment_charge" if source == "admin" else "label_fee",
+            "amount": -admin_charge_to_reseller,
+            "note": f"Spedizione {tracking_num} ({chosen['carrier_name']})",
+            "created_at": now_iso(),
+        })
+
     shipment.pop("_id", None)
     shipment.pop("label_pdf_base64", None)
     if user.get("role") == "user":
@@ -844,17 +1004,27 @@ async def cancel_shipment(sid: str, user=Depends(require_approved)):
     )
 
     owner_user = await db.users.find_one({"id": s["user_id"]})
-    if owner_user and owner_user.get("billing_type") == "prepaid":
+    if owner_user and owner_user.get("role") == "user" and owner_user.get("billing_type") == "prepaid":
         refund_amount = float(s.get("price") or 0.0)
         if refund_amount > 0:
             await db.users.update_one({"id": s["user_id"]}, {"$inc": {"credit_balance": refund_amount}})
             await db.ledger.insert_one({
-                "id": new_id(),
-                "user_id": s["user_id"],
-                "reseller_id": s.get("reseller_id"),
-                "type": "shipment_refund",
-                "amount": refund_amount,
-                "shipment_id": sid,
+                "id": new_id(), "user_id": s["user_id"], "reseller_id": s.get("reseller_id"),
+                "type": "shipment_refund", "amount": refund_amount, "shipment_id": sid, "created_at": now_iso(),
+            })
+
+    rid = s.get("reseller_id")
+    reseller_doc = await db.resellers.find_one({"id": rid}) if rid else None
+    if reseller_doc and reseller_doc.get("billing_type", "prepaid") == "prepaid":
+        owner_contract = s.get("contract_owner", "admin" if s.get("on_master_codes", True) else "reseller")
+        res_refund = float(s.get("reseller_cost") or 0.0) if owner_contract == "admin" else float(s.get("applied_fee") or 0.0)
+        if res_refund > 0:
+            await db.resellers.update_one({"id": rid}, {"$inc": {"credit_balance": res_refund}})
+            await db.users.update_many({"reseller_id": rid, "role": "reseller_admin"}, {"$inc": {"credit_balance": res_refund}})
+            await db.reseller_ledger.insert_one({
+                "id": new_id(), "reseller_id": rid, "shipment_id": sid,
+                "type": "shipment_refund", "amount": res_refund,
+                "note": f"Rimborso annullamento {s.get('tracking_number', '')}",
                 "created_at": now_iso(),
             })
 
@@ -911,7 +1081,7 @@ async def download_label(sid: str, user=Depends(require_approved)):
     c.setFont("Helvetica-Bold", 8); c.drawString(6 * mm, y, "MITTENTE"); y -= 4 * mm
     c.setFont("Helvetica", 9)
     for line in [s["sender"]["company_name"], s["sender"]["address"],
-                 f"{s['sender']['postal_code']} {s['sender']['city']} {s['sender']['country']}"]:
+                 f"{s['sender']['postal_code']} {s['sender']['city']} {s['sender'].get('province', '')} {s['sender']['country']}"]:
         c.drawString(6 * mm, y, line[:60]); y -= 4 * mm
     y -= 3 * mm
     c.setFont("Helvetica-Bold", 10); c.drawString(6 * mm, y, "DESTINATARIO"); y -= 5 * mm
@@ -919,7 +1089,7 @@ async def download_label(sid: str, user=Depends(require_approved)):
     c.drawString(6 * mm, y, s["recipient"]["company_name"][:40]); y -= 5 * mm
     c.setFont("Helvetica", 10)
     c.drawString(6 * mm, y, s["recipient"]["address"][:50]); y -= 4 * mm
-    c.drawString(6 * mm, y, f"{s['recipient']['postal_code']} {s['recipient']['city']}"); y -= 4 * mm
+    c.drawString(6 * mm, y, f"{s['recipient']['postal_code']} {s['recipient']['city']} {s['recipient'].get('province', '')}"); y -= 4 * mm
     c.setFont("Helvetica-Bold", 11)
     c.drawString(6 * mm, y, s["recipient"]["country"]); y -= 8 * mm
     c.setFont("Courier-Bold", 12)
@@ -939,7 +1109,7 @@ async def export_shipments(user=Depends(require_approved)):
     wb = openpyxl.Workbook()
     ws = wb.active
     ws.title = "Spedizioni"
-    headers = ["Data", "Tracking", "Corriere", "Contratto", "Codice Usato", "Mittente", "Destinatario", "Città", "Nazione",
+    headers = ["Data", "Tracking", "Corriere", "Contratto", "Codice Usato", "Mittente", "Destinatario", "Città", "Prov.", "Nazione",
                "Colli", "Peso (kg)", "Zona", "Prezzo (€)", "Stato"]
     ws.append(headers)
     for cell in ws[1]:
@@ -955,6 +1125,7 @@ async def export_shipments(user=Depends(require_approved)):
             s.get("sender", {}).get("company_name", ""),
             s.get("recipient", {}).get("company_name", ""),
             s.get("recipient", {}).get("city", ""),
+            s.get("recipient", {}).get("province", ""),
             s.get("recipient", {}).get("country", ""),
             len(s.get("parcels", [])), s.get("billed_weight", 0),
             s.get("zone", ""), s.get("price", 0), st,
@@ -969,6 +1140,14 @@ async def export_shipments(user=Depends(require_approved)):
 
 @api_router.get("/wallet/balance")
 async def wallet_balance(user=Depends(require_approved)):
+    if user.get("role") == "reseller_admin" and user.get("reseller_id"):
+        res = await db.resellers.find_one({"id": user["reseller_id"]}, {"_id": 0})
+        ledger = await db.reseller_ledger.find({"reseller_id": user["reseller_id"]}, {"_id": 0}).sort("created_at", -1).limit(100).to_list(100)
+        return {
+            "balance": float((res or {}).get("credit_balance") or 0.0),
+            "ledger": ledger,
+            "billing_type": (res or {}).get("billing_type", "prepaid"),
+        }
     u = await db.users.find_one({"id": user["id"]}, {"_id": 0, "password": 0})
     ledger = await db.ledger.find({"user_id": user["id"]}, {"_id": 0}).sort("created_at", -1).limit(100).to_list(100)
     return {"balance": u.get("credit_balance", 0.0), "ledger": ledger,
@@ -1019,11 +1198,20 @@ async def payment_status(session_id: str, user=Depends(get_current_user)):
                 )
                 if result.modified_count > 0:
                     amount = rec.get("amount", 0.0)
-                    await db.users.update_one({"id": rec["user_id"]}, {"$inc": {"credit_balance": amount}})
-                    await db.ledger.insert_one({
-                        "id": new_id(), "user_id": rec["user_id"], "reseller_id": rec.get("reseller_id"),
-                        "type": "topup", "amount": amount, "session_id": session_id, "created_at": now_iso()
-                    })
+                    u_doc = await db.users.find_one({"id": rec["user_id"]})
+                    if u_doc and u_doc.get("role") == "reseller_admin" and u_doc.get("reseller_id"):
+                        await db.resellers.update_one({"id": u_doc["reseller_id"]}, {"$inc": {"credit_balance": amount}})
+                        await db.users.update_many({"reseller_id": u_doc["reseller_id"], "role": "reseller_admin"}, {"$inc": {"credit_balance": amount}})
+                        await db.reseller_ledger.insert_one({
+                            "id": new_id(), "reseller_id": u_doc["reseller_id"],
+                            "type": "stripe_topup", "amount": amount, "note": "Ricarica online", "created_at": now_iso()
+                        })
+                    else:
+                        await db.users.update_one({"id": rec["user_id"]}, {"$inc": {"credit_balance": amount}})
+                        await db.ledger.insert_one({
+                            "id": new_id(), "user_id": rec["user_id"], "reseller_id": rec.get("reseller_id"),
+                            "type": "topup", "amount": amount, "session_id": session_id, "created_at": now_iso()
+                        })
                 rec = await db.payment_transactions.find_one({"session_id": session_id}, {"_id": 0})
         except Exception as e:
             logger.exception("Stripe status error: %s", e)
@@ -1141,14 +1329,13 @@ async def bootstrap():
     if await db.rate_tables.count_documents({}) == 0:
         demo = await db.resellers.find_one({"company_name": "SpedPortal Demo"})
         await db.rate_tables.insert_one({
-            "id": new_id(), "reseller_id": demo["id"] if demo else None, "name": "Listino Standard",
+            "id": new_id(), "reseller_id": demo["id"] if demo else None, "name": "Listino Clienti Standard",
             "bands": [
-                {"zone": "NAZ-A", "min_weight": 0, "max_weight": 999, "markup_percent": 20},
-                {"zone": "NAZ-B", "min_weight": 0, "max_weight": 999, "markup_percent": 25},
-                {"zone": "NAZ-C", "min_weight": 0, "max_weight": 999, "markup_percent": 30},
-                {"zone": "INT-FR", "min_weight": 0, "max_weight": 3, "markup_percent": 50},
-                {"zone": "INT-FR", "min_weight": 3, "max_weight": 10, "markup_percent": 80},
-                {"zone": "INT-DE", "min_weight": 0, "max_weight": 10, "markup_percent": 55},
+                {"zone": "NAZ", "min_weight": 0, "max_weight": 999, "markup_percent": 20},
+                {"zone": "UE", "min_weight": 0, "max_weight": 999, "markup_percent": 35},
+                {"zone": "EUR-EXTRA", "min_weight": 0, "max_weight": 999, "markup_percent": 45},
+                {"zone": "USA-CA", "min_weight": 0, "max_weight": 999, "markup_percent": 50},
+                {"zone": "WORLD", "min_weight": 0, "max_weight": 999, "markup_percent": 60},
             ],
             "created_at": now_iso(),
         })
