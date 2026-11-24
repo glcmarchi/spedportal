@@ -70,7 +70,9 @@ export default function SuperAdmin() {
   const [topupNote, setTopupNote] = useState("");
 
   const empty = {
-    company_name: "", admin_email: "", admin_password: "", plan: "basic",
+    company_name: "", admin_email: "", admin_password: "",
+    address: "", postal_code: "", city: "", province: "", country: "IT", phone: "",
+    plan: "basic",
     billing_type: "prepaid",
     features: { ...PLAN_PRESETS.basic },
     enabled_surcharges: Object.fromEntries(SURCHARGE_KEYS.map(([k]) => [k, true])),
@@ -95,6 +97,16 @@ export default function SuperAdmin() {
     });
   };
   useEffect(() => { load(); }, []);
+
+  const lookupCap = async (cap) => {
+    if (!cap) return;
+    try {
+      const r = await api.get(`/geo/lookup?country=${form.country || "IT"}&cap=${encodeURIComponent(cap)}`);
+      if (r.data.city || r.data.province) {
+        setForm(f => ({ ...f, city: r.data.city || f.city, province: r.data.province || f.province }));
+      }
+    } catch {}
+  };
 
   const handlePlanChange = (newPlan) => {
     const preset = PLAN_PRESETS[newPlan] || PLAN_PRESETS.basic;
@@ -226,7 +238,7 @@ export default function SuperAdmin() {
                         </span>
                       </div>
                       <div className="text-xs text-slate-500 mt-0.5">
-                        {r.admin_email} · sub-clienti: <b>{r.user_count}</b> · spedizioni: <b>{r.shipment_count}</b> · fee codici propri: <b>€ {Number(r.per_shipment_fee || 0).toFixed(2)}/sped</b>
+                        {r.admin_email} {r.city && `· ${r.city} (${r.province})`} · sub-clienti: <b>{r.user_count}</b> · fee codici propri: <b>€ {Number(r.per_shipment_fee || 0).toFixed(2)}/sped</b>
                       </div>
                       <div className="flex flex-wrap gap-1.5 mt-2">
                         {CARRIERS.map(c => {
@@ -367,9 +379,9 @@ export default function SuperAdmin() {
           <DialogHeader><DialogTitle style={{ fontFamily: "Chivo" }}>{editing ? "Configura" : "Nuovo"} Reseller</DialogTitle></DialogHeader>
           <div className="space-y-5">
             <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
-              <div><Label className="label-caps">Ragione Sociale</Label><Input value={form.company_name} onChange={(e) => setForm({ ...form, company_name: e.target.value })} className="mt-1 rounded-sm h-10" /></div>
-              <div><Label className="label-caps">Email Admin Reseller</Label><Input type="email" disabled={!!editing} value={form.admin_email} onChange={(e) => setForm({ ...form, admin_email: e.target.value })} className="mt-1 rounded-sm h-10" /></div>
-              {!editing && <div><Label className="label-caps">Password</Label><Input value={form.admin_password} onChange={(e) => setForm({ ...form, admin_password: e.target.value })} className="mt-1 rounded-sm h-10" /></div>}
+              <div><Label className="label-caps">Ragione Sociale*</Label><Input value={form.company_name} onChange={(e) => setForm({ ...form, company_name: e.target.value })} className="mt-1 rounded-sm h-10" /></div>
+              <div><Label className="label-caps">Email Admin Reseller*</Label><Input type="email" disabled={!!editing} value={form.admin_email} onChange={(e) => setForm({ ...form, admin_email: e.target.value })} className="mt-1 rounded-sm h-10" /></div>
+              {!editing && <div><Label className="label-caps">Password*</Label><Input value={form.admin_password} onChange={(e) => setForm({ ...form, admin_password: e.target.value })} className="mt-1 rounded-sm h-10" /></div>}
               <div>
                 <Label className="label-caps">Pacchetto Commerciale</Label>
                 <Select value={form.plan} onValueChange={handlePlanChange}>
@@ -392,6 +404,19 @@ export default function SuperAdmin() {
                 </Select>
               </div>
               <div><Label className="label-caps">Fee per lettera di vettura su codici Reseller (€)</Label><Input type="number" step="0.01" min="0" value={form.per_shipment_fee} onChange={(e) => setForm({ ...form, per_shipment_fee: parseFloat(e.target.value) || 0 })} className="mt-1 rounded-sm h-10" /></div>
+            </div>
+
+            {/* SEDE MITTENTE PREDEFINITA DEL RESELLER */}
+            <div className="border-t pt-4">
+              <div className="label-caps text-slate-900 mb-2">Indirizzo Sede Reseller (per compilazione rapida Mittente)</div>
+              <div className="grid grid-cols-1 sm:grid-cols-6 gap-2">
+                <div className="sm:col-span-6"><Label className="label-caps">Indirizzo</Label><Input value={form.address || ""} onChange={(e) => setForm({ ...form, address: e.target.value })} className="mt-1 rounded-sm h-9 text-xs" placeholder="Via Roma 10" /></div>
+                <div className="sm:col-span-1"><Label className="label-caps">Naz.</Label><Input maxLength={2} value={form.country || "IT"} onChange={(e) => setForm({ ...form, country: e.target.value.toUpperCase() })} className="mt-1 rounded-sm h-9 text-xs" /></div>
+                <div className="sm:col-span-1"><Label className="label-caps">CAP</Label><Input value={form.postal_code || ""} onChange={(e) => setForm({ ...form, postal_code: e.target.value })} onBlur={(e) => lookupCap(e.target.value)} className="mt-1 rounded-sm h-9 text-xs" /></div>
+                <div className="sm:col-span-2"><Label className="label-caps">Città</Label><Input value={form.city || ""} onChange={(e) => setForm({ ...form, city: e.target.value })} className="mt-1 rounded-sm h-9 text-xs" /></div>
+                <div className="sm:col-span-1"><Label className="label-caps">Prov.</Label><Input maxLength={2} value={form.province || ""} onChange={(e) => setForm({ ...form, province: e.target.value.toUpperCase() })} className="mt-1 rounded-sm h-9 text-xs" /></div>
+                <div className="sm:col-span-1"><Label className="label-caps">Tel.</Label><Input value={form.phone || ""} onChange={(e) => setForm({ ...form, phone: e.target.value })} className="mt-1 rounded-sm h-9 text-xs" /></div>
+              </div>
             </div>
 
             <div className="border-t pt-4">
