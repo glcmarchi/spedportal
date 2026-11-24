@@ -18,15 +18,38 @@ from reportlab.lib.units import mm
 from reportlab.lib import colors as rl_colors
 import openpyxl
 from openpyxl.styles import Font, PatternFill
-from carriers.fedex import (
-    is_fedex_configured,
-    get_fedex_rates,
-    create_fedex_shipment,
-    cancel_fedex_shipment,
-    schedule_fedex_pickup,
-    cancel_fedex_pickup,
-    track_fedex_shipment,
-)
+
+try:
+    from carriers.fedex import (
+        is_fedex_configured,
+        get_fedex_rates,
+        create_fedex_shipment,
+        cancel_fedex_shipment,
+        schedule_fedex_pickup,
+        cancel_fedex_pickup,
+        track_fedex_shipment,
+    )
+except ImportError:
+    try:
+        from backend.carriers.fedex import (
+            is_fedex_configured,
+            get_fedex_rates,
+            create_fedex_shipment,
+            cancel_fedex_shipment,
+            schedule_fedex_pickup,
+            cancel_fedex_pickup,
+            track_fedex_shipment,
+        )
+    except ImportError:
+        from fedex import (
+            is_fedex_configured,
+            get_fedex_rates,
+            create_fedex_shipment,
+            cancel_fedex_shipment,
+            schedule_fedex_pickup,
+            cancel_fedex_pickup,
+            track_fedex_shipment,
+        )
 
 ROOT_DIR = Path(__file__).parent
 load_dotenv(ROOT_DIR / '.env')
@@ -160,6 +183,7 @@ class OptionalServices(BaseModel):
 
 class CustomsDocs(BaseModel):
     required: bool = False
+    incoterms: str = "DAP"  # DAP (dazi a carico destinatario) | DDP (dazi a carico mittente)
     proforma_name: Optional[str] = ""
     dae_name: Optional[str] = ""
     eori_number: Optional[str] = ""
@@ -285,6 +309,16 @@ async def me(user=Depends(get_current_user)):
         user["reseller_name"] = (res or {}).get("company_name", "")
         user["reseller_slug"] = (res or {}).get("slug", "")
         user["reseller_plan"] = (res or {}).get("plan", "basic")
+        user["reseller_address"] = {
+            "company_name": (res or {}).get("company_name", ""),
+            "address": (res or {}).get("address", ""),
+            "postal_code": (res or {}).get("postal_code", ""),
+            "city": (res or {}).get("city", ""),
+            "province": (res or {}).get("province", ""),
+            "country": (res or {}).get("country", "IT"),
+            "phone": (res or {}).get("phone", ""),
+            "email": (res or {}).get("admin_email", user.get("email", "")),
+        }
         if user.get("role") == "reseller_admin":
             user["billing_type"] = (res or {}).get("billing_type", user.get("billing_type", "prepaid"))
             user["credit_balance"] = float((res or {}).get("credit_balance") or user.get("credit_balance") or 0.0)
@@ -422,7 +456,15 @@ def _zone_of(sender: Address, recipient: Address) -> dict:
         return {"macro": "USA-CA", "sub": f"INT-{r}", "is_extra_eu": True}
     return {"macro": "WORLD", "sub": f"INT-{r}", "is_extra_eu": True}
 
-def _mock_carrier_breakdown(carrier_id: str, weight: float, zone_info: dict, parcels_count: int, services: OptionalServices, is_extra_eu: bool) -> dict:
+def _mock_carrier_breakdown(
+    carrier_id: str,
+    weight: float,
+    zone_info: dict,
+    parcels_count: int,
+    services: OptionalServices,
+    customs: CustomsDocs,
+    is_extra_eu: bool,
+) -> dict:
     base_map = {"brt": 4.5, "gls": 4.8, "dhl": 12.0, "ups": 11.0, "tnt": 10.5, "poste": 5.2}
     base = base_map.get(carrier_id, 8.0)
     mult = {"NAZ": 1.0, "UE": 1.9, "EUR-EXTRA": 2.3, "USA-CA": 2.8, "WORLD": 3.4}.get(zone_info["macro"], 2.0)
@@ -447,6 +489,8 @@ def _mock_carrier_breakdown(carrier_id: str, weight: float, zone_info: dict, par
         surcharge_items.append({"type": "NEUTRAL", "label": "Consegna Neutra", "amount": 2.00})
     if is_extra_eu:
         surcharge_items.append({"type": "CUSTOMS", "label": "Oneri Sdoganamento Export", "amount": 8.00})
+        if (customs.incoterms or "DAP").upper() == "DDP":
+            surcharge_items.append({"type": "DDP", "label": "Gestione Resa DDP (Dazi Mittente)", "amount": 15.00})
 
     surcharges_total = round(sum(x["amount"] for x in surcharge_items), 2)
     return {
@@ -469,7 +513,6 @@ async def _reseller_markup_percent(user: dict, weight: float, zone_info: dict) -
     if not table and user.get("reseller_id"):
         table = await db.rate_tables.find_one({"reseller_id": user.get("reseller_id")}, {"_id": 0})
     if table:
-        # Cerca prima per sub-zona specifica (es. NAZ-A / INT-FR), poi per macro-zona (es. NAZ / UE / WORLD)
         for target_zone in (zone_info["sub"], zone_info["macro"]):
             for band in table.get("bands", []):
                 if band["zone"] == target_zone and band["min_weight"] <= weight <= band["max_weight"]:
@@ -581,12 +624,16 @@ async def _compute_quotes_internal(q: QuoteRequest, user: dict) -> dict:
                 raw_surcharge_items.append({"type": "NEUTRAL", "label": "Consegna Neutra", "amount": 2.00})
                 raw_surcharges_total = round(raw_surcharges_total + 2.00, 2)
                 carrier_cost = round(carrier_cost + 2.00, 2)
+            if zone_info["is_extra_eu"] and (q.customs.incoterms or "DAP").upper() == "DDP":
+                raw_surcharge_items.append({"type": "DDP", "label": "Gestione Resa DDP (Dazi Mittente)", "amount": 15.00})
+                raw_surcharges_total = round(raw_surcharges_total + 15.00, 2)
+                carrier_cost = round(carrier_cost + 15.00, 2)
             transit = live_fedex["transit_days"]
             service_type = live_fedex["service_type"]
             carrier_label = live_fedex["service_name"]
             is_live = True
         else:
-            bk = _mock_carrier_breakdown(cid, billed_weight, zone_info, len(q.parcels), q.services, zone_info["is_extra_eu"])
+            bk = _mock_carrier_breakdown(cid, billed_weight, zone_info, len(q.parcels), q.services, q.customs, zone_info["is_extra_eu"])
             carrier_cost = bk["total_cost"]
             raw_freight = bk["base_freight"]
             raw_surcharges_total = bk["surcharges_total"]
@@ -678,16 +725,13 @@ async def create_shipment(inp: CreateShipmentInput, user=Depends(require_approve
     reseller_cost = chosen["reseller_cost"]
     price = chosen["price"]
 
-    # Importo che il Reseller deve all'Admin per questa spedizione
     admin_charge_to_reseller = reseller_cost if source == "admin" else applied_fee
 
-    # 1. Controllo credito sub-cliente (se role == user e prepagato)
     if user.get("role") == "user" and user.get("billing_type") == "prepaid":
         bal = float(user.get("credit_balance") or 0.0)
         if bal < price:
             raise HTTPException(402, "Credito insufficiente. Ricarica il tuo saldo prepagato.")
 
-    # 2. Controllo credito Reseller verso Super Admin (se il Reseller è prepagato)
     rid = user.get("reseller_id")
     reseller_doc = await db.resellers.find_one({"id": rid}) if rid else None
     if reseller_doc and reseller_doc.get("billing_type", "prepaid") == "prepaid" and admin_charge_to_reseller > 0:
@@ -759,7 +803,6 @@ async def create_shipment(inp: CreateShipmentInput, user=Depends(require_approve
     }
     await db.shipments.insert_one(shipment)
 
-    # Addebito wallet sub-cliente
     if user.get("role") == "user" and user.get("billing_type") == "prepaid":
         await db.users.update_one({"id": user["id"]}, {"$inc": {"credit_balance": -price}})
         await db.ledger.insert_one({
@@ -767,7 +810,6 @@ async def create_shipment(inp: CreateShipmentInput, user=Depends(require_approve
             "type": "shipment_charge", "amount": -price, "shipment_id": shipment["id"], "created_at": now_iso()
         })
 
-    # Addebito wallet Reseller verso Super Admin
     if reseller_doc and reseller_doc.get("billing_type", "prepaid") == "prepaid" and admin_charge_to_reseller > 0:
         await db.resellers.update_one({"id": rid}, {"$inc": {"credit_balance": -admin_charge_to_reseller}})
         await db.users.update_many({"reseller_id": rid, "role": "reseller_admin"}, {"$inc": {"credit_balance": -admin_charge_to_reseller}})
