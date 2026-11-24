@@ -114,6 +114,7 @@ export function StatusBadge({ status }) {
     in_customs: { c: "bg-yellow-50 text-yellow-800 border-yellow-200", l: "In Dogana" },
     in_storage: { c: "bg-red-50 text-red-700 border-red-200", l: "Giacenza" },
     exception: { c: "bg-red-50 text-red-700 border-red-200", l: "Anomalia" },
+    cancelled: { c: "bg-red-100 text-red-800 border-red-300", l: "Annullata" },
   };
   const m = map[status] || map.created;
   return <span className={`inline-block px-2.5 py-0.5 text-xs font-semibold border rounded-sm ${m.c}`}>{m.l}</span>;
