@@ -44,7 +44,6 @@ def is_fedex_configured() -> bool:
 
 
 async def get_fedex_token(child_key: Optional[str] = None, child_secret: Optional[str] = None) -> str:
-    """Ottiene o rinnova il Bearer Token OAuth 2.0 da FedEx (/oauth/token)."""
     if not is_fedex_configured():
         raise RuntimeError("FEDEX_CLIENT_ID o FEDEX_CLIENT_SECRET non configurati su Render")
 
@@ -126,6 +125,7 @@ def _extract_net_charge(rated_details: List[Dict[str, Any]]) -> Dict[str, Any]:
     currency = chosen.get("currency") or srd.get("currency") or "EUR"
 
     fx = srd.get("currencyExchangeRate") or {}
+    rate = 1.0
     if currency != "EUR" and fx.get("intoCurrency") == "EUR" and fx.get("rate"):
         rate = float(fx["rate"])
         net = round(net * rate, 2)
@@ -133,13 +133,37 @@ def _extract_net_charge(rated_details: List[Dict[str, Any]]) -> Dict[str, Any]:
         surcharges = round(surcharges * rate, 2)
         currency = "EUR"
 
+    raw_surcharges = srd.get("surCharges") or []
+    clean_surcharges = []
+    for sc in raw_surcharges:
+        amt = round(float(sc.get("amount") or 0.0) * rate, 2)
+        if amt > 0:
+            clean_surcharges.append({
+                "type": sc.get("type") or sc.get("surchargeType") or "SURCHARGE",
+                "label": sc.get("description") or sc.get("name") or sc.get("type") or "Supplemento",
+                "amount": amt,
+            })
+
     return {
         "net_charge": round(net, 2),
         "base_charge": round(base, 2),
         "surcharges": round(surcharges, 2),
         "currency": currency,
-        "surcharge_list": srd.get("surCharges") or [],
+        "surcharge_list": clean_surcharges,
     }
+
+
+def _addr_obj(addr: Dict[str, Any], residential: bool = False) -> Dict[str, Any]:
+    out: Dict[str, Any] = {
+        "postalCode": str(addr.get("postal_code", "")).strip(),
+        "countryCode": (addr.get("country") or "IT").upper(),
+        "city": (addr.get("city") or "")[:35],
+        "residential": bool(residential),
+    }
+    prov = (addr.get("province") or "").strip().upper()
+    if prov and len(prov) <= 3:
+        out["stateOrProvinceCode"] = prov[:2]
+    return out
 
 
 async def get_fedex_rates(
@@ -151,6 +175,9 @@ async def get_fedex_rates(
     customs_required: bool = False,
     goods_description: str = "",
     insured_value: float = 0.0,
+    saturday_delivery: bool = False,
+    residential_delivery: bool = False,
+    cod_amount: float = 0.0,
 ) -> List[Dict[str, Any]]:
     token = await get_fedex_token()
     ship_date = datetime.now(timezone.utc).strftime("%Y-%m-%d")
@@ -159,20 +186,8 @@ async def get_fedex_rates(
     is_intl = s_country != r_country
 
     requested_shipment: Dict[str, Any] = {
-        "shipper": {
-            "address": {
-                "postalCode": str(sender.get("postal_code", "")).strip(),
-                "countryCode": s_country,
-                "city": sender.get("city", ""),
-            }
-        },
-        "recipient": {
-            "address": {
-                "postalCode": str(recipient.get("postal_code", "")).strip(),
-                "countryCode": r_country,
-                "city": recipient.get("city", ""),
-            }
-        },
+        "shipper": {"address": _addr_obj(sender, False)},
+        "recipient": {"address": _addr_obj(recipient, residential_delivery)},
         "shipDateStamp": ship_date,
         "pickupType": "DROPOFF_AT_FEDEX_LOCATION",
         "packagingType": "FEDEX_ENVELOPE" if parcel_type in ("busta", "documenti") else "YOUR_PACKAGING",
@@ -180,6 +195,20 @@ async def get_fedex_rates(
         "preferredCurrency": "EUR",
         "requestedPackageLineItems": _build_package_items(parcels, insured_value),
     }
+
+    special_types = []
+    special_block: Dict[str, Any] = {}
+    if saturday_delivery:
+        special_types.append("SATURDAY_DELIVERY")
+    if cod_amount > 0:
+        special_types.append("COD")
+        special_block["shipmentCODDetail"] = {
+            "codCollectionType": "ANY",
+            "codCollectionAmount": {"amount": round(float(cod_amount), 2), "currency": "EUR"},
+        }
+    if special_types:
+        special_block["specialServiceTypes"] = special_types
+        requested_shipment["shipmentSpecialServices"] = special_block
 
     if is_intl or customs_required:
         total_w = round(sum(float(p["weight"]) for p in parcels), 2)
@@ -259,6 +288,9 @@ async def create_fedex_shipment(
     goods_description: str = "",
     customs_required: bool = False,
     insured_value: float = 0.0,
+    saturday_delivery: bool = False,
+    residential_delivery: bool = False,
+    cod_amount: float = 0.0,
 ) -> Dict[str, Any]:
     token = await get_fedex_token()
     ship_date = datetime.now(timezone.utc).strftime("%Y-%m-%d")
@@ -267,6 +299,15 @@ async def create_fedex_shipment(
     is_intl = s_country != r_country
     total_w = round(sum(float(p["weight"]) for p in parcels), 2)
 
+    shipper_addr = {
+        "streetLines": _split_street(sender.get("address", "")),
+        **_addr_obj(sender, False),
+    }
+    recipient_addr = {
+        "streetLines": _split_street(recipient.get("address", "")),
+        **_addr_obj(recipient, residential_delivery),
+    }
+
     requested_shipment: Dict[str, Any] = {
         "shipDatestamp": ship_date,
         "pickupType": "DROPOFF_AT_FEDEX_LOCATION",
@@ -274,12 +315,7 @@ async def create_fedex_shipment(
         "packagingType": "FEDEX_ENVELOPE" if parcel_type in ("busta", "documenti") else "YOUR_PACKAGING",
         "totalWeight": max(0.1, total_w),
         "shipper": {
-            "address": {
-                "streetLines": _split_street(sender.get("address", "")),
-                "city": (sender.get("city") or "")[:35],
-                "postalCode": str(sender.get("postal_code", "")).strip(),
-                "countryCode": s_country,
-            },
+            "address": shipper_addr,
             "contact": {
                 "personName": (sender.get("reference") or sender.get("company_name") or "Mittente")[:35],
                 "companyName": (sender.get("company_name") or "")[:35],
@@ -289,12 +325,7 @@ async def create_fedex_shipment(
         },
         "recipients": [
             {
-                "address": {
-                    "streetLines": _split_street(recipient.get("address", "")),
-                    "city": (recipient.get("city") or "")[:35],
-                    "postalCode": str(recipient.get("postal_code", "")).strip(),
-                    "countryCode": r_country,
-                },
+                "address": recipient_addr,
                 "contact": {
                     "personName": (recipient.get("reference") or recipient.get("company_name") or "Destinatario")[:35],
                     "companyName": (recipient.get("company_name") or "")[:35],
@@ -314,6 +345,20 @@ async def create_fedex_shipment(
         },
         "requestedPackageLineItems": _build_package_items(parcels, insured_value),
     }
+
+    special_types = []
+    special_block: Dict[str, Any] = {}
+    if saturday_delivery:
+        special_types.append("SATURDAY_DELIVERY")
+    if cod_amount > 0:
+        special_types.append("COD")
+        special_block["shipmentCODDetail"] = {
+            "codCollectionType": "ANY",
+            "codCollectionAmount": {"amount": round(float(cod_amount), 2), "currency": "EUR"},
+        }
+    if special_types:
+        special_block["specialServiceTypes"] = special_types
+        requested_shipment["shipmentSpecialServices"] = special_block
 
     if is_intl or customs_required:
         requested_shipment["customsClearanceDetail"] = {
@@ -434,12 +479,11 @@ async def schedule_fedex_pickup(
     tracking_number: str,
     package_count: int,
     total_weight: float,
-    pickup_date: str,          # YYYY-MM-DD
-    ready_time: str = "10:00", # HH:MM
-    close_time: str = "18:00", # HH:MM
+    pickup_date: str,
+    ready_time: str = "10:00",
+    close_time: str = "18:00",
     remarks: str = "",
 ) -> Dict[str, Any]:
-    """Chiama POST /pickup/v1/pickups (Pickup Request API) per prenotare il ritiro corriere."""
     token = await get_fedex_token()
     s_country = (sender.get("country") or "IT").upper()
     r_country = (recipient_country or "IT").upper()
@@ -452,6 +496,17 @@ async def schedule_fedex_pickup(
     phone_digits = "".join(ch for ch in (sender.get("phone") or "0200000000") if ch.isdigit())
     if len(phone_digits) < 8:
         phone_digits = phone_digits.ljust(10, "0")
+
+    pickup_addr: Dict[str, Any] = {
+        "streetLines": _split_street(sender.get("address", "")),
+        "city": (sender.get("city") or "")[:35],
+        "postalCode": str(sender.get("postal_code", "")).strip(),
+        "countryCode": s_country,
+        "residential": False,
+    }
+    prov = (sender.get("province") or "").strip().upper()
+    if prov and len(prov) <= 3:
+        pickup_addr["stateOrProvinceCode"] = prov[:2]
 
     payload: Dict[str, Any] = {
         "associatedAccountNumber": {"value": str(account_number).strip()},
@@ -468,13 +523,7 @@ async def schedule_fedex_pickup(
                     "personName": (sender.get("reference") or sender.get("company_name") or "Mittente")[:35],
                     "phoneNumber": phone_digits[:13],
                 },
-                "address": {
-                    "streetLines": _split_street(sender.get("address", "")),
-                    "city": (sender.get("city") or "")[:35],
-                    "postalCode": str(sender.get("postal_code", "")).strip(),
-                    "countryCode": s_country,
-                    "residential": False,
-                },
+                "address": pickup_addr,
             },
             "readyDateTimestamp": ready_ts,
             "customerCloseTime": close_hhmmss,
@@ -519,7 +568,6 @@ async def cancel_fedex_pickup(
     scheduled_date: str,
     location: str = "",
 ) -> Dict[str, Any]:
-    """Chiama PUT /pickup/v1/pickups/cancel per annullare un ritiro prenotato."""
     token = await get_fedex_token()
     payload: Dict[str, Any] = {
         "associatedAccountNumber": {"value": str(account_number).strip()},
