@@ -148,8 +148,14 @@ class ResellerInput(BaseModel):
     slug: Optional[str] = None
     admin_email: EmailStr
     admin_password: Optional[str] = None
+    address: Optional[str] = ""
+    postal_code: Optional[str] = ""
+    city: Optional[str] = ""
+    province: Optional[str] = ""
+    country: Optional[str] = "IT"
+    phone: Optional[str] = ""
     plan: str = "basic"
-    billing_type: str = "prepaid"  # prepaid | postpaid
+    billing_type: str = "prepaid"
     features: Optional[Dict[str, bool]] = None
     enabled_surcharges: Optional[Dict[str, bool]] = None
     carrier_policies: Optional[Dict[str, str]] = None
@@ -248,7 +254,14 @@ async def create_reseller(inp: ResellerInput, _=Depends(require_super_admin)):
     markups = {k: (round(float(v), 2) if v is not None else None) for k, v in (inp.admin_carrier_markups or {}).items()}
     reseller = {
         "id": rid, "company_name": inp.company_name, "slug": slug,
-        "admin_email": inp.admin_email.lower(), "plan": inp.plan,
+        "admin_email": inp.admin_email.lower(),
+        "address": inp.address or "",
+        "postal_code": inp.postal_code or "",
+        "city": inp.city or "",
+        "province": (inp.province or "").strip().upper()[:2],
+        "country": (inp.country or "IT").strip().upper()[:2],
+        "phone": inp.phone or "",
+        "plan": inp.plan,
         "billing_type": inp.billing_type if inp.billing_type in ("prepaid", "postpaid") else "prepaid",
         "credit_balance": 0.0,
         "features": features,
@@ -262,7 +275,7 @@ async def create_reseller(inp: ResellerInput, _=Depends(require_super_admin)):
     pw = inp.admin_password or new_id()[:12]
     await db.users.insert_one({
         "id": new_id(), "email": inp.admin_email.lower(), "password": hash_pw(pw),
-        "company_name": inp.company_name, "phone": "", "role": "reseller_admin",
+        "company_name": inp.company_name, "phone": inp.phone or "", "role": "reseller_admin",
         "reseller_id": rid, "status": "approved", "billing_type": reseller["billing_type"],
         "credit_balance": 0.0, "created_at": now_iso(),
     })
@@ -293,6 +306,10 @@ async def update_reseller(rid: str, inp: ResellerInput, _=Depends(require_super_
     doc = inp.model_dump(exclude_unset=True)
     doc.pop("admin_email", None)
     doc.pop("admin_password", None)
+    if "province" in doc:
+        doc["province"] = (doc["province"] or "").strip().upper()[:2]
+    if "country" in doc:
+        doc["country"] = (doc["country"] or "IT").strip().upper()[:2]
     if "features" in doc and doc["features"]:
         doc["features"] = {**DEFAULT_FEATURES, **doc["features"]}
     if "enabled_surcharges" in doc and doc["enabled_surcharges"]:
@@ -306,11 +323,15 @@ async def update_reseller(rid: str, inp: ResellerInput, _=Depends(require_super_
             for k, v in doc["admin_carrier_markups"].items()
         }
     await db.resellers.update_one({"id": rid}, {"$set": doc})
+    user_sync = {}
     if "billing_type" in doc:
-        await db.users.update_many(
-            {"reseller_id": rid, "role": "reseller_admin"},
-            {"$set": {"billing_type": doc["billing_type"]}},
-        )
+        user_sync["billing_type"] = doc["billing_type"]
+    if "company_name" in doc:
+        user_sync["company_name"] = doc["company_name"]
+    if "phone" in doc:
+        user_sync["phone"] = doc["phone"]
+    if user_sync:
+        await db.users.update_many({"reseller_id": rid, "role": "reseller_admin"}, {"$set": user_sync})
     return {"ok": True}
 
 
@@ -505,7 +526,9 @@ async def bootstrap_multitenant():
         demo_id = new_id()
         await db.resellers.insert_one({
             "id": demo_id, "company_name": "SpedPortal Demo", "slug": "demo",
-            "admin_email": "reseller@spedportal.it", "plan": "premium",
+            "admin_email": "reseller@spedportal.it",
+            "address": "Via Monte Napoleone 10", "postal_code": "20121", "city": "Milano", "province": "MI", "country": "IT", "phone": "0212345678",
+            "plan": "premium",
             "billing_type": "prepaid", "credit_balance": 500.0,
             "features": {**PLAN_PRESETS["premium"]},
             "enabled_surcharges": {**DEFAULT_SURCHARGES},
@@ -520,7 +543,7 @@ async def bootstrap_multitenant():
         if not await db.users.find_one({"email": "reseller@spedportal.it"}):
             await db.users.insert_one({
                 "id": new_id(), "email": "reseller@spedportal.it", "password": hash_pw("Reseller@2026"),
-                "company_name": "SpedPortal Demo", "phone": "", "role": "reseller_admin", "reseller_id": demo_id,
+                "company_name": "SpedPortal Demo", "phone": "0212345678", "role": "reseller_admin", "reseller_id": demo_id,
                 "status": "approved", "billing_type": "prepaid", "credit_balance": 500.0, "created_at": now_iso(),
             })
         logger.info("Demo reseller seeded: reseller@spedportal.it / Reseller@2026")
