@@ -207,12 +207,39 @@ async def manifest_pdf(mid: str, user=Depends(require_approved)):
     c.showPage(); c.save(); buf.seek(0)
     return StreamingResponse(buf, media_type="application/pdf", headers={"Content-Disposition": f"attachment; filename={m['number']}.pdf"})
 
-IT_CAPS = {
-    "20121": ("Milano", "MI"), "20122": ("Milano", "MI"), "20100": ("Milano", "MI"),
-    "00100": ("Roma", "RM"), "00184": ("Roma", "RM"), "10121": ("Torino", "TO"),
-    "80121": ("Napoli", "NA"), "50121": ("Firenze", "FI"), "40121": ("Bologna", "BO"),
-    "35121": ("Padova", "PD"), "37121": ("Verona", "VR"), "16121": ("Genova", "GE"),
+# Mappa prefissi CAP -> Sigla Provincia italiana (2 lettere)
+IT_PROV_PREFIX = {
+    "00": "RM", "01": "VT", "02": "RI", "03": "FR", "04": "LT", "05": "TR", "06": "PG",
+    "07": "SS", "08": "NU", "09": "CA", "10": "TO", "11": "AO", "12": "CN", "13": "VC",
+    "14": "AT", "15": "AL", "16": "GE", "17": "SV", "18": "IM", "19": "SP", "20": "MI",
+    "21": "VA", "22": "CO", "23": "SO", "24": "BG", "25": "BS", "26": "CR", "27": "PV",
+    "28": "VB", "29": "PC", "30": "VE", "31": "TV", "32": "BL", "33": "UD", "34": "TS",
+    "35": "PD", "36": "VI", "37": "VR", "38": "TN", "39": "BZ", "40": "BO", "41": "MO",
+    "42": "RE", "43": "PR", "44": "FE", "45": "RO", "46": "MN", "47": "FC", "48": "RA",
+    "50": "FI", "51": "PT", "52": "AR", "53": "SI", "54": "MS", "55": "LU", "56": "PI",
+    "57": "LI", "58": "GR", "59": "PO", "60": "AN", "61": "PU", "62": "MC", "63": "AP",
+    "64": "TE", "65": "PE", "66": "CH", "67": "AQ", "70": "BA", "71": "FG", "72": "BR",
+    "73": "LE", "74": "TA", "75": "MT", "76": "BT", "80": "NA", "81": "CE", "82": "BN",
+    "83": "AV", "84": "SA", "85": "PZ", "86": "CB", "87": "CS", "88": "CZ", "89": "RC",
+    "90": "PA", "91": "TP", "92": "AG", "93": "CL", "94": "EN", "95": "CT", "96": "SR",
+    "97": "RG", "98": "ME",
 }
+
+def _it_province_from_cap(cap: str) -> str:
+    if len(cap) < 5 or not cap.isdigit():
+        return ""
+    p3 = cap[:3]
+    if p3 == "209": return "MB"
+    if p3 == "239": return "LC"
+    if p3 == "269": return "LO"
+    if p3 == "139": return "BI"
+    if p3 == "479": return "RN"
+    if p3 == "639": return "FM"
+    if p3 == "861": return "IS"
+    if p3 in ("889", "888"): return "KR"
+    if p3 == "899": return "VV"
+    if p3 == "090": return "SU"
+    return IT_PROV_PREFIX.get(cap[:2], "")
 
 @extra_router.get("/geo/lookup")
 async def geo_lookup(country: str = "IT", cap: str = ""):
@@ -221,9 +248,9 @@ async def geo_lookup(country: str = "IT", cap: str = ""):
     if not cap:
         return {"country": country, "cap": cap, "city": None, "province": None}
 
-    if country == "IT" and cap in IT_CAPS:
-        city, prov = IT_CAPS[cap]
-        return {"country": country, "cap": cap, "city": city, "province": prov}
+    it_prov = _it_province_from_cap(cap) if country == "IT" else ""
+    city = None
+    ext_prov = ""
 
     try:
         zippo_cc = "gb" if country == "UK" else country.lower()
@@ -234,11 +261,12 @@ async def geo_lookup(country: str = "IT", cap: str = ""):
                 if places:
                     p0 = places[0]
                     city = p0.get("place name")
-                    prov = (p0.get("state abbreviation") or "")[:2].upper()
-                    return {"country": country, "cap": cap, "city": city, "province": prov}
+                    ext_prov = (p0.get("state abbreviation") or "")[:2].upper()
     except Exception:
         pass
-    return {"country": country, "cap": cap, "city": None, "province": None}
+
+    final_prov = it_prov or (ext_prov if country != "IT" else "")
+    return {"country": country, "cap": cap, "city": city, "province": final_prov or None}
 
 class CustomTopUpInput(BaseModel):
     amount: float = Field(gt=0, le=100000); method: str; origin_url: str
