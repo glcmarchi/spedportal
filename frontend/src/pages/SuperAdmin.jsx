@@ -8,13 +8,44 @@ import { Dialog, DialogContent, DialogHeader, DialogTitle } from "@/components/u
 import { Checkbox } from "@/components/ui/checkbox";
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
 import { toast } from "sonner";
-import { Buildings, Plus, Receipt, Gear, Key, CheckCircle, WarningCircle, ShieldCheck } from "@phosphor-icons/react";
+import { Buildings, Plus, Receipt, Gear, Key, CheckCircle, WarningCircle, ShieldCheck, Wallet } from "@phosphor-icons/react";
 
 const FEATURE_KEYS = [
-  ["customs", "Dogana"], ["insurance", "Assicurazione"], ["prepaid", "Prepagato"],
-  ["manifests", "Manifest"], ["address_book", "Rubrica"], ["parcels", "I miei pacchi"],
-  ["broadcasts", "Comunicazioni"], ["premium_own_carriers", "Codici corriere propri"],
+  ["address_book", "Rubrica"],
+  ["manifests", "Manifest"],
+  ["parcels", "I miei pacchi"],
+  ["sub_clients", "Gestione Sub-Clienti (B2B2B)"],
+  ["rate_tables", "Listini Clienti"],
+  ["broadcasts", "Comunicazioni Clienti"],
+  ["client_prepaid", "Prepagato Sub-Clienti"],
+  ["client_billing", "Fatturazione Clienti"],
 ];
+
+const SURCHARGE_KEYS = [
+  ["insurance", "Assicurazione"],
+  ["cod", "Contrassegno (COD)"],
+  ["saturday_delivery", "Consegna al Sabato"],
+  ["neutral_delivery", "Consegna Neutra"],
+  ["residential_delivery", "Indirizzo Privato / Residenziale"],
+];
+
+const PLAN_PRESETS = {
+  basic: {
+    address_book: true, manifests: true, parcels: false,
+    sub_clients: false, rate_tables: false, broadcasts: false,
+    client_prepaid: false, client_billing: false,
+  },
+  full: {
+    address_book: true, manifests: true, parcels: true,
+    sub_clients: false, rate_tables: false, broadcasts: false,
+    client_prepaid: false, client_billing: false,
+  },
+  premium: {
+    address_book: true, manifests: true, parcels: true,
+    sub_clients: true, rate_tables: true, broadcasts: true,
+    client_prepaid: true, client_billing: true,
+  },
+};
 
 const CARRIERS = ["brt", "gls", "dhl", "ups", "tnt", "poste"];
 
@@ -34,10 +65,15 @@ export default function SuperAdmin() {
   const [open, setOpen] = useState(false);
   const [editing, setEditing] = useState(null);
   const [billing, setBilling] = useState(null);
+  const [topupTarget, setTopupTarget] = useState(null);
+  const [topupAmount, setTopupAmount] = useState("250");
+  const [topupNote, setTopupNote] = useState("");
 
   const empty = {
     company_name: "", admin_email: "", admin_password: "", plan: "basic",
-    features: Object.fromEntries(FEATURE_KEYS.map(([k]) => [k, true])),
+    billing_type: "prepaid",
+    features: { ...PLAN_PRESETS.basic },
+    enabled_surcharges: Object.fromEntries(SURCHARGE_KEYS.map(([k]) => [k, true])),
     carrier_policies: Object.fromEntries(CARRIERS.map(c => [c, "admin_only"])),
     admin_carrier_markups: {},
     per_shipment_fee: 0.15, active: true,
@@ -60,6 +96,11 @@ export default function SuperAdmin() {
   };
   useEffect(() => { load(); }, []);
 
+  const handlePlanChange = (newPlan) => {
+    const preset = PLAN_PRESETS[newPlan] || PLAN_PRESETS.basic;
+    setForm({ ...form, plan: newPlan, features: { ...preset } });
+  };
+
   const saveReseller = async () => {
     try {
       if (editing) {
@@ -73,6 +114,22 @@ export default function SuperAdmin() {
       load();
     } catch (err) {
       toast.error(err?.response?.data?.detail || "Errore salvataggio");
+    }
+  };
+
+  const submitTopup = async () => {
+    if (!topupTarget) return;
+    try {
+      await api.post(`/super/resellers/${topupTarget.id}/topup`, {
+        amount: parseFloat(topupAmount) || 0,
+        note: topupNote,
+      });
+      toast.success("Saldo Reseller aggiornato");
+      setTopupTarget(null);
+      setTopupNote("");
+      load();
+    } catch (err) {
+      toast.error(err?.response?.data?.detail || "Errore accredito");
     }
   };
 
@@ -109,6 +166,8 @@ export default function SuperAdmin() {
     setForm({
       ...empty,
       ...r,
+      features: { ...empty.features, ...(r.features || {}) },
+      enabled_surcharges: { ...empty.enabled_surcharges, ...(r.enabled_surcharges || {}) },
       carrier_policies: { ...empty.carrier_policies, ...(r.carrier_policies || {}) },
       admin_carrier_markups: { ...(r.admin_carrier_markups || {}) },
       admin_email: r.admin_email,
@@ -152,14 +211,23 @@ export default function SuperAdmin() {
           {resellers.map(r => {
             const pols = r.carrier_policies || {};
             const customMk = r.admin_carrier_markups || {};
+            const isPre = (r.billing_type || "prepaid") === "prepaid";
             return (
               <div key={r.id} className="bg-white border border-slate-200 rounded-sm p-5">
                 <div className="flex items-start justify-between gap-4 flex-wrap">
                   <div className="flex items-center gap-4">
                     <div className="w-12 h-12 bg-slate-900 text-white rounded-sm flex items-center justify-center"><Buildings size={22} weight="fill" /></div>
                     <div>
-                      <div className="font-black text-xl" style={{ fontFamily: "Chivo" }}>{r.company_name}</div>
-                      <div className="text-xs text-slate-500">{r.admin_email} · piano <b className="uppercase">{r.plan}</b> · fee codici propri: <b>€ {Number(r.per_shipment_fee || 0).toFixed(2)}/sped</b></div>
+                      <div className="flex items-center gap-2 flex-wrap">
+                        <span className="font-black text-xl" style={{ fontFamily: "Chivo" }}>{r.company_name}</span>
+                        <span className="text-[10px] font-bold uppercase px-2 py-0.5 rounded-sm bg-slate-900 text-white">{r.plan}</span>
+                        <span className={`text-[10px] font-bold uppercase px-2 py-0.5 rounded-sm ${isPre ? "bg-green-100 text-green-800" : "bg-amber-100 text-amber-800"}`}>
+                          {isPre ? `Prepagato · € ${Number(r.credit_balance || 0).toFixed(2)}` : "Fatturazione Fine Mese"}
+                        </span>
+                      </div>
+                      <div className="text-xs text-slate-500 mt-0.5">
+                        {r.admin_email} · sub-clienti: <b>{r.user_count}</b> · spedizioni: <b>{r.shipment_count}</b> · fee codici propri: <b>€ {Number(r.per_shipment_fee || 0).toFixed(2)}/sped</b>
+                      </div>
                       <div className="flex flex-wrap gap-1.5 mt-2">
                         {CARRIERS.map(c => {
                           const p = pols[c] || "admin_only";
@@ -172,9 +240,14 @@ export default function SuperAdmin() {
                       </div>
                     </div>
                   </div>
-                  <div className="flex gap-2">
-                    <Button variant="outline" size="sm" onClick={() => showBilling(r)} className="rounded-sm"><Receipt size={14} className="mr-1" /> Fatturazione</Button>
-                    <Button variant="outline" size="sm" onClick={() => startEdit(r)} className="rounded-sm">Permessi & Margini</Button>
+                  <div className="flex gap-2 flex-wrap">
+                    {isPre && (
+                      <Button variant="outline" size="sm" onClick={() => { setTopupTarget(r); setTopupAmount("250"); }} className="rounded-sm border-green-200 text-green-700 hover:bg-green-50">
+                        <Wallet size={14} className="mr-1" /> Ricarica Saldo
+                      </Button>
+                    )}
+                    <Button variant="outline" size="sm" onClick={() => showBilling(r)} className="rounded-sm"><Receipt size={14} className="mr-1" /> Contabilità</Button>
+                    <Button variant="outline" size="sm" onClick={() => startEdit(r)} className="rounded-sm">Configura</Button>
                   </div>
                 </div>
               </div>
@@ -260,7 +333,35 @@ export default function SuperAdmin() {
         </div>
       )}
 
-      {/* DIALOG MODIFICA RESELLER, PERMESSI E MARGINI PERSONALIZZATI */}
+      {/* DIALOG RICARICA SALDO RESELLER */}
+      <Dialog open={!!topupTarget} onOpenChange={(o) => !o && setTopupTarget(null)}>
+        <DialogContent className="max-w-md rounded-sm">
+          {topupTarget && (
+            <>
+              <DialogHeader><DialogTitle style={{ fontFamily: "Chivo" }}>Accredita Credito — {topupTarget.company_name}</DialogTitle></DialogHeader>
+              <div className="space-y-4 text-sm">
+                <div className="bg-slate-50 p-3 rounded-sm border">
+                  Saldo attuale: <b>€ {Number(topupTarget.credit_balance || 0).toFixed(2)}</b>
+                </div>
+                <div>
+                  <Label className="label-caps">Importo da accreditare (€)</Label>
+                  <Input type="number" step="10" value={topupAmount} onChange={(e) => setTopupAmount(e.target.value)} className="mt-1 rounded-sm h-10" />
+                </div>
+                <div>
+                  <Label className="label-caps">Causale / Riferimento Bonifico</Label>
+                  <Input placeholder="Es. Bonifico CRO 123456" value={topupNote} onChange={(e) => setTopupNote(e.target.value)} className="mt-1 rounded-sm h-10" />
+                </div>
+                <div className="flex justify-end gap-2">
+                  <Button variant="outline" onClick={() => setTopupTarget(null)} className="rounded-sm">Annulla</Button>
+                  <Button onClick={submitTopup} className="bg-green-600 hover:bg-green-700 rounded-sm">Conferma Accredito</Button>
+                </div>
+              </div>
+            </>
+          )}
+        </DialogContent>
+      </Dialog>
+
+      {/* DIALOG MODIFICA RESELLER */}
       <Dialog open={open} onOpenChange={setOpen}>
         <DialogContent className="max-w-3xl rounded-sm max-h-[90vh] overflow-y-auto">
           <DialogHeader><DialogTitle style={{ fontFamily: "Chivo" }}>{editing ? "Configura" : "Nuovo"} Reseller</DialogTitle></DialogHeader>
@@ -269,17 +370,34 @@ export default function SuperAdmin() {
               <div><Label className="label-caps">Ragione Sociale</Label><Input value={form.company_name} onChange={(e) => setForm({ ...form, company_name: e.target.value })} className="mt-1 rounded-sm h-10" /></div>
               <div><Label className="label-caps">Email Admin Reseller</Label><Input type="email" disabled={!!editing} value={form.admin_email} onChange={(e) => setForm({ ...form, admin_email: e.target.value })} className="mt-1 rounded-sm h-10" /></div>
               {!editing && <div><Label className="label-caps">Password</Label><Input value={form.admin_password} onChange={(e) => setForm({ ...form, admin_password: e.target.value })} className="mt-1 rounded-sm h-10" /></div>}
-              <div><Label className="label-caps">Piano</Label>
-                <Select value={form.plan} onValueChange={(v) => setForm({ ...form, plan: v })}><SelectTrigger className="mt-1 rounded-sm h-10"><SelectValue /></SelectTrigger>
-                  <SelectContent><SelectItem value="basic">Basic</SelectItem><SelectItem value="full">Full</SelectItem><SelectItem value="premium">Premium</SelectItem></SelectContent></Select>
+              <div>
+                <Label className="label-caps">Pacchetto Commerciale</Label>
+                <Select value={form.plan} onValueChange={handlePlanChange}>
+                  <SelectTrigger className="mt-1 rounded-sm h-10"><SelectValue /></SelectTrigger>
+                  <SelectContent>
+                    <SelectItem value="basic">Basic (Essenziale: Rubrica + Manifest)</SelectItem>
+                    <SelectItem value="full">Full (Basic + I miei pacchi)</SelectItem>
+                    <SelectItem value="premium">Premium B2B2B (Sub-Clienti + Listini + Fatture)</SelectItem>
+                  </SelectContent>
+                </Select>
               </div>
-              <div><Label className="label-caps">Fee su spedizioni con codice Reseller (€)</Label><Input type="number" step="0.01" value={form.per_shipment_fee} onChange={(e) => setForm({ ...form, per_shipment_fee: parseFloat(e.target.value) || 0 })} className="mt-1 rounded-sm h-10" /></div>
+              <div>
+                <Label className="label-caps">Pagamento verso Piattaforma</Label>
+                <Select value={form.billing_type} onValueChange={(v) => setForm({ ...form, billing_type: v })}>
+                  <SelectTrigger className="mt-1 rounded-sm h-10"><SelectValue /></SelectTrigger>
+                  <SelectContent>
+                    <SelectItem value="prepaid">Prepagato (Wallet Reseller)</SelectItem>
+                    <SelectItem value="postpaid">Fatturazione Fine Mese</SelectItem>
+                  </SelectContent>
+                </Select>
+              </div>
+              <div><Label className="label-caps">Fee per lettera di vettura su codici Reseller (€)</Label><Input type="number" step="0.01" min="0" value={form.per_shipment_fee} onChange={(e) => setForm({ ...form, per_shipment_fee: parseFloat(e.target.value) || 0 })} className="mt-1 rounded-sm h-10" /></div>
             </div>
 
             <div className="border-t pt-4">
               <div className="label-caps text-orange-600 mb-1">Assegnazione Codici Corrieri & Margine Admin</div>
               <p className="text-xs text-slate-500 mb-3">
-                Per i corrieri su <b>Codice Admin</b> puoi lasciare vuoto il campo % per usare il margine di default, oppure inserire una % personalizzata per questo Reseller.
+                Se imposti <b>Codice Reseller (Proprio)</b>, il Reseller inserirà il suo contratto e vedrà i suoi costi netti (tu incassi la fee fissa).
               </p>
               <div className="space-y-2">
                 {CARRIERS.map(cid => {
@@ -331,36 +449,52 @@ export default function SuperAdmin() {
               </div>
             </div>
 
-            <div className="border-t pt-4">
-              <div className="label-caps mb-2">Moduli abilitati</div>
-              <div className="grid grid-cols-2 gap-2">
-                {FEATURE_KEYS.map(([k, l]) => (
-                  <label key={k} className="flex items-center gap-2 cursor-pointer text-sm">
-                    <Checkbox checked={form.features[k] !== false} onCheckedChange={(v) => setForm({ ...form, features: { ...form.features, [k]: !!v } })} />{l}
-                  </label>
-                ))}
+            <div className="grid grid-cols-1 sm:grid-cols-2 gap-4 border-t pt-4">
+              <div>
+                <div className="label-caps mb-2 text-slate-900">Moduli Piattaforma Inclusi</div>
+                <div className="space-y-2">
+                  {FEATURE_KEYS.map(([k, l]) => (
+                    <label key={k} className="flex items-center gap-2 cursor-pointer text-sm">
+                      <Checkbox checked={!!form.features[k]} onCheckedChange={(v) => setForm({ ...form, features: { ...form.features, [k]: !!v } })} />{l}
+                    </label>
+                  ))}
+                </div>
+              </div>
+              <div>
+                <div className="label-caps mb-2 text-slate-900">Supplementi & Servizi Corriere Abilitati</div>
+                <div className="space-y-2">
+                  {SURCHARGE_KEYS.map(([k, l]) => (
+                    <label key={k} className="flex items-center gap-2 cursor-pointer text-sm">
+                      <Checkbox checked={form.enabled_surcharges?.[k] !== false} onCheckedChange={(v) => setForm({ ...form, enabled_surcharges: { ...(form.enabled_surcharges || {}), [k]: !!v } })} />{l}
+                    </label>
+                  ))}
+                </div>
               </div>
             </div>
 
-            <label className="flex items-center gap-2 cursor-pointer"><Checkbox checked={form.active} onCheckedChange={(v) => setForm({ ...form, active: !!v })} /><span className="text-sm font-semibold">Account Reseller Attivo</span></label>
+            <label className="flex items-center gap-2 cursor-pointer border-t pt-3"><Checkbox checked={form.active} onCheckedChange={(v) => setForm({ ...form, active: !!v })} /><span className="text-sm font-semibold">Account Reseller Attivo</span></label>
             <div className="flex justify-end gap-2"><Button variant="outline" onClick={() => setOpen(false)} className="rounded-sm">Annulla</Button><Button onClick={saveReseller} className="bg-orange-600 hover:bg-orange-700 rounded-sm">Salva Configurazione</Button></div>
           </div>
         </DialogContent>
       </Dialog>
 
-      {/* DIALOG REPORT FATTURAZIONE & MARGINI */}
+      {/* DIALOG REPORT CONTABILITA' & MARGINI */}
       <Dialog open={!!billing} onOpenChange={(o) => !o && setBilling(null)}>
         <DialogContent className="rounded-sm max-w-2xl max-h-[85vh] overflow-y-auto">
           {billing && (
             <>
-              <DialogHeader><DialogTitle style={{ fontFamily: "Chivo" }}>Fatturazione & Margini — {billing.reseller.company_name}</DialogTitle></DialogHeader>
+              <DialogHeader><DialogTitle style={{ fontFamily: "Chivo" }}>Contabilità & Margini — {billing.reseller.company_name}</DialogTitle></DialogHeader>
               <div className="space-y-2 text-sm">
+                <div className="flex justify-between py-2 border-b"><span>Modalità pagamento</span><b className="uppercase">{billing.reseller.billing_type || "prepaid"}</b></div>
+                {(billing.reseller.billing_type || "prepaid") === "prepaid" && (
+                  <div className="flex justify-between py-2 border-b bg-green-50 px-2 rounded-sm"><span>Credito residuo nel Wallet</span><b className="text-green-700">€ {Number(billing.reseller.credit_balance || 0).toFixed(2)}</b></div>
+                )}
                 <div className="flex justify-between py-2 border-b"><span>Spedizioni su codici Admin</span><b>{billing.shipments_on_master}</b></div>
                 <div className="flex justify-between py-2 border-b text-slate-500"><span>Costo vivo API corriere (codici Admin)</span><span>€ {(billing.raw_carrier_cost_master ?? billing.amount_due_standard).toFixed(2)}</span></div>
                 <div className="flex justify-between py-2 border-b text-green-700"><span>Margine Admin maturato</span><b>+ € {(billing.admin_margin_earned ?? 0).toFixed(2)}</b></div>
-                <div className="flex justify-between py-2 border-b"><span>Totale trasporto da rifatturare al Reseller</span><b>€ {billing.amount_due_standard.toFixed(2)}</b></div>
-                <div className="flex justify-between py-2 border-b"><span>Spedizioni su codici propri Reseller ({billing.shipments_on_own})</span><b>€ {billing.amount_due_premium.toFixed(2)}</b></div>
-                <div className="flex justify-between py-3 border-t-2 border-slate-900 text-lg"><span className="font-black">Totale da fatturare</span><b className="text-orange-600">€ {billing.amount_due_total.toFixed(2)}</b></div>
+                <div className="flex justify-between py-2 border-b"><span>Totale trasporto codici Admin</span><b>€ {billing.amount_due_standard.toFixed(2)}</b></div>
+                <div className="flex justify-between py-2 border-b"><span>Fee lettere di vettura su codici Reseller ({billing.shipments_on_own})</span><b>€ {billing.amount_due_premium.toFixed(2)}</b></div>
+                <div className="flex justify-between py-3 border-t-2 border-slate-900 text-lg"><span className="font-black">Volume complessivo Admin</span><b className="text-orange-600">€ {billing.amount_due_total.toFixed(2)}</b></div>
               </div>
               {billing.recent_shipments?.length > 0 && (
                 <div className="mt-4">
@@ -374,7 +508,7 @@ export default function SuperAdmin() {
                           <th className="p-2">Titolare</th>
                           <th className="p-2">Codice</th>
                           <th className="p-2 text-right">Costo API</th>
-                          <th className="p-2 text-right">Fatt. Reseller</th>
+                          <th className="p-2 text-right">Addebito Reseller</th>
                         </tr>
                       </thead>
                       <tbody>
