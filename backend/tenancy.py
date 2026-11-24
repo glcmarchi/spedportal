@@ -7,10 +7,42 @@ super_router = APIRouter(prefix="/api/super")
 reseller_router = APIRouter(prefix="/api/reseller")
 
 DEFAULT_FEATURES = {
-    "customs": True, "insurance": True, "prepaid": True, "manifests": True,
-    "address_book": True, "parcels": True, "broadcasts": True,
-    "premium_own_carriers": True,
+    "address_book": True,
+    "manifests": True,
+    "parcels": False,
+    "sub_clients": False,
+    "rate_tables": False,
+    "broadcasts": False,
+    "client_prepaid": False,
+    "client_billing": False,
 }
+
+DEFAULT_SURCHARGES = {
+    "insurance": True,
+    "cod": True,
+    "saturday_delivery": True,
+    "neutral_delivery": True,
+    "residential_delivery": True,
+}
+
+PLAN_PRESETS = {
+    "basic": {
+        "address_book": True, "manifests": True, "parcels": False,
+        "sub_clients": False, "rate_tables": False, "broadcasts": False,
+        "client_prepaid": False, "client_billing": False,
+    },
+    "full": {
+        "address_book": True, "manifests": True, "parcels": True,
+        "sub_clients": False, "rate_tables": False, "broadcasts": False,
+        "client_prepaid": False, "client_billing": False,
+    },
+    "premium": {
+        "address_book": True, "manifests": True, "parcels": True,
+        "sub_clients": True, "rate_tables": True, "broadcasts": True,
+        "client_prepaid": True, "client_billing": True,
+    },
+}
+
 DEFAULT_CARRIERS = ["brt", "gls", "dhl", "ups", "tnt", "poste"]
 
 CARRIER_SCHEMAS = {
@@ -46,7 +78,7 @@ CARRIER_SCHEMAS = {
     "ups": {
         "name": "UPS",
         "auth_type": "account_link",
-        "auth_note": "Inserisci solo il codice cliente UPS (6 caratteri) e clicca su Autentica Account per collegarlo tramite OAuth.",
+        "auth_note": "Inserisci il codice cliente UPS (6 caratteri) e clicca su Autentica Account.",
         "fields": [
             {"key": "account_number", "label": "Codice Cliente UPS (Account Number)", "type": "text", "required": True},
             {"key": "postal_code", "label": "CAP Fatturazione (verifica)", "type": "text", "required": False},
@@ -55,7 +87,7 @@ CARRIER_SCHEMAS = {
     "tnt": {
         "name": "FedEx / TNT",
         "auth_type": "account_link",
-        "auth_note": "Inserisci solo il tuo Account Number FedEx/TNT (9 cifre) e avvia la verifica/autenticazione account.",
+        "auth_note": "Inserisci il tuo Account Number FedEx/TNT (9 cifre) e avvia la verifica/autenticazione account.",
         "fields": [
             {"key": "account_number", "label": "Account Number FedEx / TNT", "type": "text", "required": True},
             {"key": "country_code", "label": "Nazione Contratto (es. IT)", "type": "text", "required": False},
@@ -117,12 +149,19 @@ class ResellerInput(BaseModel):
     admin_email: EmailStr
     admin_password: Optional[str] = None
     plan: str = "basic"
+    billing_type: str = "prepaid"  # prepaid | postpaid
     features: Optional[Dict[str, bool]] = None
-    carrier_policies: Optional[Dict[str, str]] = None  # admin_only | reseller_only | disabled
-    admin_carrier_markups: Optional[Dict[str, Optional[float]]] = None  # None = usa default corriere, float = override
+    enabled_surcharges: Optional[Dict[str, bool]] = None
+    carrier_policies: Optional[Dict[str, str]] = None
+    admin_carrier_markups: Optional[Dict[str, Optional[float]]] = None
     carrier_credentials: Optional[Dict[str, Dict[str, Any]]] = None
     per_shipment_fee: float = 0.0
     active: bool = True
+
+
+class ResellerTopUpInput(BaseModel):
+    amount: float
+    note: Optional[str] = ""
 
 
 class CarrierCredsSave(BaseModel):
@@ -130,7 +169,6 @@ class CarrierCredsSave(BaseModel):
     default_markup_percent: Optional[float] = None
 
 
-# --- ENDPOINT SCHEMI CORRIERI ---
 @super_router.get("/carrier-schemas")
 async def get_carrier_schemas_super(_=Depends(require_super_admin)):
     return CARRIER_SCHEMAS
@@ -141,7 +179,6 @@ async def get_carrier_schemas_reseller(_=Depends(get_current_user)):
     return CARRIER_SCHEMAS
 
 
-# --- CODICI MASTER DEL SUPER ADMIN + MARGINE DEFAULT ---
 @super_router.get("/master-carriers")
 async def list_master_carriers(_=Depends(require_super_admin)):
     doc = await db.system_settings.find_one({"id": "master_carriers"}, {"_id": 0})
@@ -197,21 +234,25 @@ async def authenticate_master_carrier(carrier_id: str, _=Depends(require_super_a
     return {"ok": True, "status": "verified"}
 
 
-# --- GESTIONE RESELLER DAL SUPER ADMIN ---
 @super_router.post("/resellers")
 async def create_reseller(inp: ResellerInput, _=Depends(require_super_admin)):
     if await db.resellers.find_one({"admin_email": inp.admin_email.lower()}):
         raise HTTPException(400, "Admin email già utilizzata")
     rid = new_id()
     slug = (inp.slug or inp.company_name.lower().replace(" ", "-"))
-    features = {**DEFAULT_FEATURES, **(inp.features or {})}
+    preset = PLAN_PRESETS.get(inp.plan, DEFAULT_FEATURES)
+    features = {**DEFAULT_FEATURES, **preset, **(inp.features or {})}
+    surcharges = {**DEFAULT_SURCHARGES, **(inp.enabled_surcharges or {})}
     raw_pol = {**DEFAULT_POLICIES, **(inp.carrier_policies or {})}
     policies = {k: _normalize_policy(v) for k, v in raw_pol.items()}
     markups = {k: (round(float(v), 2) if v is not None else None) for k, v in (inp.admin_carrier_markups or {}).items()}
     reseller = {
         "id": rid, "company_name": inp.company_name, "slug": slug,
         "admin_email": inp.admin_email.lower(), "plan": inp.plan,
+        "billing_type": inp.billing_type if inp.billing_type in ("prepaid", "postpaid") else "prepaid",
+        "credit_balance": 0.0,
         "features": features,
+        "enabled_surcharges": surcharges,
         "carrier_policies": policies,
         "admin_carrier_markups": markups,
         "carrier_credentials": inp.carrier_credentials or {},
@@ -222,7 +263,7 @@ async def create_reseller(inp: ResellerInput, _=Depends(require_super_admin)):
     await db.users.insert_one({
         "id": new_id(), "email": inp.admin_email.lower(), "password": hash_pw(pw),
         "company_name": inp.company_name, "phone": "", "role": "reseller_admin",
-        "reseller_id": rid, "status": "approved", "billing_type": "postpaid",
+        "reseller_id": rid, "status": "approved", "billing_type": reseller["billing_type"],
         "credit_balance": 0.0, "created_at": now_iso(),
     })
     reseller.pop("_id", None)
@@ -236,6 +277,9 @@ async def list_resellers(_=Depends(require_super_admin)):
         raw_pol = {**DEFAULT_POLICIES, **(r.get("carrier_policies") or {})}
         r["carrier_policies"] = {k: _normalize_policy(v) for k, v in raw_pol.items()}
         r["admin_carrier_markups"] = r.get("admin_carrier_markups") or {}
+        r["enabled_surcharges"] = {**DEFAULT_SURCHARGES, **(r.get("enabled_surcharges") or {})}
+        r["billing_type"] = r.get("billing_type") or "prepaid"
+        r["credit_balance"] = float(r.get("credit_balance") or 0.0)
         r["user_count"] = await db.users.count_documents({"reseller_id": r["id"], "role": "user"})
         r["shipment_count"] = await db.shipments.count_documents({"reseller_id": r["id"]})
     return items
@@ -251,6 +295,8 @@ async def update_reseller(rid: str, inp: ResellerInput, _=Depends(require_super_
     doc.pop("admin_password", None)
     if "features" in doc and doc["features"]:
         doc["features"] = {**DEFAULT_FEATURES, **doc["features"]}
+    if "enabled_surcharges" in doc and doc["enabled_surcharges"]:
+        doc["enabled_surcharges"] = {**DEFAULT_SURCHARGES, **doc["enabled_surcharges"]}
     if "carrier_policies" in doc and doc["carrier_policies"]:
         merged = {**DEFAULT_POLICIES, **(existing.get("carrier_policies") or {}), **doc["carrier_policies"]}
         doc["carrier_policies"] = {k: _normalize_policy(v) for k, v in merged.items()}
@@ -260,7 +306,37 @@ async def update_reseller(rid: str, inp: ResellerInput, _=Depends(require_super_
             for k, v in doc["admin_carrier_markups"].items()
         }
     await db.resellers.update_one({"id": rid}, {"$set": doc})
+    if "billing_type" in doc:
+        await db.users.update_many(
+            {"reseller_id": rid, "role": "reseller_admin"},
+            {"$set": {"billing_type": doc["billing_type"]}},
+        )
     return {"ok": True}
+
+
+@super_router.post("/resellers/{rid}/topup")
+async def super_topup_reseller(rid: str, inp: ResellerTopUpInput, _=Depends(require_super_admin)):
+    res = await db.resellers.find_one({"id": rid})
+    if not res:
+        raise HTTPException(404, "Reseller non trovato")
+    amount = round(float(inp.amount), 2)
+    if amount == 0:
+        raise HTTPException(400, "Importo non valido")
+    await db.resellers.update_one({"id": rid}, {"$inc": {"credit_balance": amount}})
+    await db.users.update_many(
+        {"reseller_id": rid, "role": "reseller_admin"},
+        {"$inc": {"credit_balance": amount}},
+    )
+    await db.reseller_ledger.insert_one({
+        "id": new_id(),
+        "reseller_id": rid,
+        "type": "admin_topup" if amount > 0 else "admin_adjustment",
+        "amount": amount,
+        "note": inp.note or "Accredito manuale Super Admin",
+        "created_at": now_iso(),
+    })
+    updated = await db.resellers.find_one({"id": rid}, {"_id": 0})
+    return {"ok": True, "credit_balance": round(float(updated.get("credit_balance") or 0.0), 2)}
 
 
 @super_router.get("/resellers/{rid}/billing")
@@ -269,7 +345,7 @@ async def reseller_billing(rid: str, _=Depends(require_super_admin)):
     if not res:
         raise HTTPException(404)
     ships = await db.shipments.find(
-        {"reseller_id": rid},
+        {"reseller_id": rid, "status": {"$ne": "cancelled"}},
         {"_id": 0, "id": 1, "created_at": 1, "tracking_number": 1, "carrier_id": 1,
          "carrier_name": 1, "cost": 1, "carrier_cost": 1, "reseller_cost": 1,
          "admin_markup_percent": 1, "price": 1, "on_master_codes": 1,
@@ -286,6 +362,8 @@ async def reseller_billing(rid: str, _=Depends(require_super_admin)):
     fee_unit = float(res.get("per_shipment_fee") or 0)
     due_premium = round(sum(s.get("applied_fee", fee_unit) for s in on_own), 2)
 
+    ledger = await db.reseller_ledger.find({"reseller_id": rid}, {"_id": 0}).sort("created_at", -1).limit(30).to_list(30)
+
     return {
         "reseller": res,
         "shipments_on_master": len(on_master),
@@ -296,29 +374,38 @@ async def reseller_billing(rid: str, _=Depends(require_super_admin)):
         "amount_due_premium": due_premium,
         "amount_due_total": round(due_standard + due_premium, 2),
         "recent_shipments": ships[:30],
+        "ledger": ledger,
     }
 
 
 @super_router.get("/me/features")
 async def my_features(user=Depends(get_current_user)):
     if user.get("role") == "super_admin":
-        return {"features": {**DEFAULT_FEATURES, "premium_own_carriers": True}, "role": "super_admin"}
+        all_true = {k: True for k in DEFAULT_FEATURES}
+        return {"features": all_true, "enabled_surcharges": DEFAULT_SURCHARGES, "role": "super_admin"}
     rid = user.get("reseller_id")
     if not rid:
-        return {"features": DEFAULT_FEATURES, "role": user.get("role")}
-    res = await db.resellers.find_one({"id": rid}, {"_id": 0, "features": 1, "company_name": 1, "plan": 1, "carrier_policies": 1})
+        return {"features": DEFAULT_FEATURES, "enabled_surcharges": DEFAULT_SURCHARGES, "role": user.get("role")}
+    res = await db.resellers.find_one({"id": rid}, {"_id": 0})
     features = {**DEFAULT_FEATURES, **((res or {}).get("features") or {})}
+    surcharges = {**DEFAULT_SURCHARGES, **((res or {}).get("enabled_surcharges") or {})}
     policies = {k: _normalize_policy(v) for k, v in {**DEFAULT_POLICIES, **((res or {}).get("carrier_policies") or {})}.items()}
     can_manage_own = any(p == "reseller_only" for p in policies.values())
     return {
         "features": features,
+        "enabled_surcharges": surcharges,
         "can_manage_own_carriers": can_manage_own,
         "role": user.get("role"),
-        "reseller": {"company_name": (res or {}).get("company_name", ""), "plan": (res or {}).get("plan", "basic")},
+        "reseller": {
+            "company_name": (res or {}).get("company_name", ""),
+            "slug": (res or {}).get("slug", ""),
+            "plan": (res or {}).get("plan", "basic"),
+            "billing_type": (res or {}).get("billing_type", "prepaid"),
+            "credit_balance": float((res or {}).get("credit_balance") or 0.0),
+        },
     }
 
 
-# --- PORTALE RESELLER: CONFIGURAZIONE PROPRI CODICI CORRIERE ---
 @reseller_router.get("/carriers")
 async def reseller_list_carriers(user=Depends(require_reseller_admin)):
     res = await db.resellers.find_one({"id": user["reseller_id"]}, {"_id": 0})
@@ -418,8 +505,10 @@ async def bootstrap_multitenant():
         demo_id = new_id()
         await db.resellers.insert_one({
             "id": demo_id, "company_name": "SpedPortal Demo", "slug": "demo",
-            "admin_email": "reseller@spedportal.it", "plan": "full",
-            "features": {**DEFAULT_FEATURES, "premium_own_carriers": True},
+            "admin_email": "reseller@spedportal.it", "plan": "premium",
+            "billing_type": "prepaid", "credit_balance": 500.0,
+            "features": {**PLAN_PRESETS["premium"]},
+            "enabled_surcharges": {**DEFAULT_SURCHARGES},
             "carrier_policies": {
                 "brt": "admin_only", "gls": "admin_only", "dhl": "admin_only",
                 "ups": "reseller_only", "tnt": "admin_only", "poste": "admin_only"
@@ -432,7 +521,7 @@ async def bootstrap_multitenant():
             await db.users.insert_one({
                 "id": new_id(), "email": "reseller@spedportal.it", "password": hash_pw("Reseller@2026"),
                 "company_name": "SpedPortal Demo", "phone": "", "role": "reseller_admin", "reseller_id": demo_id,
-                "status": "approved", "billing_type": "postpaid", "credit_balance": 0.0, "created_at": now_iso(),
+                "status": "approved", "billing_type": "prepaid", "credit_balance": 500.0, "created_at": now_iso(),
             })
         logger.info("Demo reseller seeded: reseller@spedportal.it / Reseller@2026")
     else:
