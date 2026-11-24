@@ -4,6 +4,7 @@ from pydantic import BaseModel, Field
 from typing import List, Optional
 from datetime import datetime, timezone
 import io, csv, base64, os
+import httpx
 import stripe
 from reportlab.lib.pagesizes import A4
 from reportlab.pdfgen import canvas
@@ -19,6 +20,7 @@ class AddressBookEntry(BaseModel):
     address: str
     postal_code: str
     city: str
+    province: Optional[str] = ""
     country: str = "IT"
     reference: Optional[str] = ""
     email: Optional[str] = ""
@@ -30,13 +32,19 @@ async def list_addresses(user=Depends(require_approved)):
 
 @extra_router.post("/addressbook")
 async def create_address(entry: AddressBookEntry, user=Depends(require_approved)):
-    doc = {"id": new_id(), "user_id": user["id"], "reseller_id": user.get("reseller_id"), **entry.model_dump(), "created_at": now_iso()}
+    data = entry.model_dump()
+    data["province"] = (data.get("province") or "").strip().upper()[:2]
+    data["country"] = (data.get("country") or "IT").strip().upper()[:2]
+    doc = {"id": new_id(), "user_id": user["id"], "reseller_id": user.get("reseller_id"), **data, "created_at": now_iso()}
     await db.addressbook.insert_one(doc); doc.pop("_id", None)
     return doc
 
 @extra_router.put("/addressbook/{aid}")
 async def update_address(aid: str, entry: AddressBookEntry, user=Depends(require_approved)):
-    r = await db.addressbook.update_one(tenant_filter(user, {"id": aid}), {"$set": entry.model_dump()})
+    data = entry.model_dump()
+    data["province"] = (data.get("province") or "").strip().upper()[:2]
+    data["country"] = (data.get("country") or "IT").strip().upper()[:2]
+    r = await db.addressbook.update_one(tenant_filter(user, {"id": aid}), {"$set": data})
     if r.matched_count == 0: raise HTTPException(404, "Non trovato")
     return {"ok": True}
 
@@ -48,8 +56,8 @@ async def delete_address(aid: str, user=Depends(require_approved)):
 @extra_router.get("/addressbook/template")
 async def address_template(_=Depends(require_approved)):
     buf = io.StringIO(); w = csv.writer(buf)
-    w.writerow(["label", "company_name", "address", "postal_code", "city", "country", "reference", "email", "phone"])
-    w.writerow(["Sede Milano", "Acme SRL", "Via Roma 1", "20121", "Milano", "IT", "Mario Rossi", "mario@acme.it", "+39 02 12345"])
+    w.writerow(["label", "company_name", "address", "postal_code", "city", "province", "country", "reference", "email", "phone"])
+    w.writerow(["Sede Milano", "Acme SRL", "Via Roma 1", "20121", "Milano", "MI", "IT", "Mario Rossi", "mario@acme.it", "+39 02 12345"])
     return StreamingResponse(io.BytesIO(buf.getvalue().encode("utf-8-sig")), media_type="text/csv",
         headers={"Content-Disposition": "attachment; filename=rubrica_template.csv"})
 
@@ -63,7 +71,9 @@ async def import_addresses(file: UploadFile = File(...), user=Depends(require_ap
             "id": new_id(), "user_id": user["id"], "reseller_id": user.get("reseller_id"),
             "label": row.get("label", ""), "company_name": row["company_name"],
             "address": row.get("address", ""), "postal_code": row.get("postal_code", ""),
-            "city": row.get("city", ""), "country": (row.get("country", "IT") or "IT").upper(),
+            "city": row.get("city", ""),
+            "province": (row.get("province", "") or "").strip().upper()[:2],
+            "country": (row.get("country", "IT") or "IT").upper()[:2],
             "reference": row.get("reference", ""), "email": row.get("email", ""),
             "phone": row.get("phone", ""), "created_at": now_iso(),
         })
@@ -197,13 +207,38 @@ async def manifest_pdf(mid: str, user=Depends(require_approved)):
     c.showPage(); c.save(); buf.seek(0)
     return StreamingResponse(buf, media_type="application/pdf", headers={"Content-Disposition": f"attachment; filename={m['number']}.pdf"})
 
-IT_CAPS = {"20121": "Milano", "20122": "Milano", "00100": "Roma", "00184": "Roma", "10121": "Torino", "80121": "Napoli", "50121": "Firenze", "40121": "Bologna"}
-CAP_DB = {"IT": IT_CAPS, "FR": {"75001": "Paris"}, "DE": {"10115": "Berlin"}, "ES": {"28001": "Madrid"}, "UK": {"EC1A": "London"}}
+IT_CAPS = {
+    "20121": ("Milano", "MI"), "20122": ("Milano", "MI"), "20100": ("Milano", "MI"),
+    "00100": ("Roma", "RM"), "00184": ("Roma", "RM"), "10121": ("Torino", "TO"),
+    "80121": ("Napoli", "NA"), "50121": ("Firenze", "FI"), "40121": ("Bologna", "BO"),
+    "35121": ("Padova", "PD"), "37121": ("Verona", "VR"), "16121": ("Genova", "GE"),
+}
 
 @extra_router.get("/geo/lookup")
 async def geo_lookup(country: str = "IT", cap: str = ""):
-    country = (country or "IT").upper(); cap = (cap or "").strip().upper()
-    return {"country": country, "cap": cap, "city": CAP_DB.get(country, {}).get(cap)}
+    country = (country or "IT").upper().strip()
+    cap = (cap or "").strip().upper()
+    if not cap:
+        return {"country": country, "cap": cap, "city": None, "province": None}
+
+    if country == "IT" and cap in IT_CAPS:
+        city, prov = IT_CAPS[cap]
+        return {"country": country, "cap": cap, "city": city, "province": prov}
+
+    try:
+        zippo_cc = "gb" if country == "UK" else country.lower()
+        async with httpx.AsyncClient(timeout=4.0) as client:
+            r = await client.get(f"https://api.zippopotam.us/{zippo_cc}/{cap}")
+            if r.status_code == 200:
+                places = r.json().get("places") or []
+                if places:
+                    p0 = places[0]
+                    city = p0.get("place name")
+                    prov = (p0.get("state abbreviation") or "")[:2].upper()
+                    return {"country": country, "cap": cap, "city": city, "province": prov}
+    except Exception:
+        pass
+    return {"country": country, "cap": cap, "city": None, "province": None}
 
 class CustomTopUpInput(BaseModel):
     amount: float = Field(gt=0, le=100000); method: str; origin_url: str
