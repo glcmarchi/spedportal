@@ -37,7 +37,14 @@ export default function NewShipment() {
   const [parcelType, setParcelType] = useState("pacco");
   const [parcels, setParcels] = useState([{ ...emptyParcel }]);
   const [goods, setGoods] = useState("");
-  const [customs, setCustoms] = useState({ required: false, proforma_name: "", dae_name: "", eori_number: "", customs_value: 0 });
+  const [customs, setCustoms] = useState({
+    required: false,
+    incoterms: "DAP",
+    proforma_name: "",
+    dae_name: "",
+    eori_number: "",
+    customs_value: 0,
+  });
   const [services, setServices] = useState({
     insurance: false, insurance_value: 0,
     neutral_delivery: false,
@@ -70,7 +77,24 @@ export default function NewShipment() {
     }
   }, [features.address_book, features.parcels]);
 
-  const loadClientAsSender = () => setSender({ ...emptyAddr, company_name: user?.company_name || "", phone: user?.phone || "", email: user?.email || "" });
+  const loadMyAddress = () => {
+    const ra = user?.reseller_address || {};
+    setSender({
+      ...emptyAddr,
+      company_name: ra.company_name || user?.company_name || "",
+      address: ra.address || "",
+      postal_code: ra.postal_code || "",
+      city: ra.city || "",
+      province: ra.province || "",
+      country: ra.country || "IT",
+      phone: ra.phone || user?.phone || "",
+      email: ra.email || user?.email || "",
+    });
+    if (!ra.address) {
+      toast.info("Indirizzo sede non ancora compilato dall'amministratore: completa Via, CAP e Città.");
+    }
+  };
+
   const buildBody = () => ({
     sender,
     recipient,
@@ -133,7 +157,7 @@ export default function NewShipment() {
       </div>
 
       <div className="bg-white border border-slate-200 rounded-sm p-6 sm:p-8">
-        {step === 0 && <AddressForm title="Dati Mittente" data={sender} setData={setSender} addressbook={addressbook} onClient={loadClientAsSender} />}
+        {step === 0 && <AddressForm title="Dati Mittente" data={sender} setData={setSender} addressbook={addressbook} onClient={loadMyAddress} />}
         {step === 1 && <AddressForm title="Dati Destinatario" data={recipient} setData={setRecipient} addressbook={addressbook} />}
         {step === 2 && (
           <div className="space-y-6">
@@ -263,24 +287,35 @@ export default function NewShipment() {
                 <div className="flex items-center justify-between gap-2">
                   <div>
                     <div className="label-caps text-amber-800">Documenti Doganali Obbligatori (Destinazione Extra-UE: {destCountry})</div>
-                    <p className="text-xs text-slate-600 mt-0.5">Per spedizioni fuori dall'Unione Europea i documenti doganali sono richiesti dalle autorità doganali.</p>
+                    <p className="text-xs text-slate-600 mt-0.5">Per spedizioni fuori dall'Unione Europea i documenti doganali e i termini di resa sono richiesti dalle autorità doganali.</p>
                   </div>
                   <Popover>
                     <PopoverTrigger asChild>
                       <button type="button" className="inline-flex items-center gap-1 text-xs font-bold bg-amber-100 hover:bg-amber-200 text-amber-900 px-3 py-1.5 rounded-sm shrink-0">
-                        <Question size={16} weight="fill" /> Guida Documenti
+                        <Question size={16} weight="fill" /> Guida Dogana & DAP/DDP
                       </button>
                     </PopoverTrigger>
                     <PopoverContent align="end" className="w-96 text-xs space-y-2 p-4 rounded-sm">
-                      <div className="font-bold text-slate-900 text-sm">Quali documenti servono per l'Extra-UE?</div>
-                      <p><b>1. Fattura Commerciale o Proforma (Obbligatoria):</b> indica valore della merce, valuta, codice doganale (HS Code), paese d'origine e causale (vendita o campione senza valore).</p>
-                      <p><b>2. Codice EORI:</b> obbligatorio per tutte le aziende che esportano fuori dall'UE.</p>
-                      <p><b>3. DAE (Documento Accompagnamento Esportazione):</b> obbligatorio se il valore della merce esportata supera i <b>1.000 €</b> (emesso dallo spedizioniere doganale o dal portale Agenzia Dogane).</p>
+                      <div className="font-bold text-slate-900 text-sm">Documenti & Termini di Resa Extra-UE</div>
+                      <p><b>• DAP (Delivered At Place):</b> dazi e IVA d'importazione sono pagati dal <b>destinatario</b> alla consegna.</p>
+                      <p><b>• DDP (Delivered Duty Paid):</b> dazi e IVA d'importazione sono addebitati al <b>mittente</b> (comporta diritti di gestione DDP).</p>
+                      <p><b>• Fattura Commerciale o Proforma (Obbligatoria):</b> indica valore della merce, valuta, codice doganale (HS Code), paese d'origine e causale.</p>
+                      <p><b>• DAE:</b> obbligatorio se il valore esportato supera i <b>1.000 €</b>.</p>
                     </PopoverContent>
                   </Popover>
                 </div>
 
                 <div className="grid gap-3 sm:grid-cols-2">
+                  <div className="sm:col-span-2">
+                    <Label className="label-caps">Termini di Resa Doganale (Incoterms)*</Label>
+                    <Select value={customs.incoterms} onValueChange={(v) => setCustoms({ ...customs, incoterms: v })}>
+                      <SelectTrigger className="mt-1 rounded-sm h-10 bg-white"><SelectValue /></SelectTrigger>
+                      <SelectContent>
+                        <SelectItem value="DAP">DAP — Dazi e oneri doganali a carico del Destinatario</SelectItem>
+                        <SelectItem value="DDP">DDP — Dazi e oneri doganali a carico del Mittente</SelectItem>
+                      </SelectContent>
+                    </Select>
+                  </div>
                   <div>
                     <Label className="label-caps">Fattura Proforma / Commerciale*</Label>
                     <Input value={customs.proforma_name} onChange={(e) => setCustoms({ ...customs, proforma_name: e.target.value })} className="mt-1 rounded-sm h-10 bg-white" placeholder="es. proforma_INV-2026.pdf" />
@@ -341,7 +376,7 @@ export default function NewShipment() {
 
                 {/* SPACCATO NOLO + SUPPLEMENTI VISIBILE SOLO A RESELLER E ADMIN */}
                 {isResellerOrAdmin && q.reseller_base_freight !== undefined && (
-                  <div className="mt-3 pt-3 border-t border-slate-100 text-xs text-slate-600 flex flex-wrap items-center justify-between gap-2 bg-slate-50/70 px-3 py-2 rounded-sm">
+                  <div className="mt-3 pt-3 border-t border-slate-100 text-xs text-slate-600 bg-slate-50/70 px-3 py-2 rounded-sm">
                     <div className="flex flex-wrap gap-x-4 gap-y-1">
                       <span>Nolo base: <b className="text-slate-900">€ {q.reseller_base_freight.toFixed(2)}</b></span>
                       <span>Supplementi totali: <b className="text-slate-900">€ {(q.reseller_surcharges_total ?? 0).toFixed(2)}</b></span>
@@ -421,7 +456,7 @@ function AddressForm({ title, data, setData, addressbook = [], onClient }) {
         <div className="flex gap-2">
           {onClient && (
             <button onClick={onClient} className="inline-flex items-center gap-1 px-3 h-9 bg-slate-100 hover:bg-slate-200 rounded-sm text-xs font-semibold">
-              <User size={14} weight="fill" /> I miei dati
+              <User size={14} weight="fill" /> Il mio indirizzo
             </button>
           )}
           <Popover>
