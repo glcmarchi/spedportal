@@ -32,7 +32,8 @@ export default function Layout() {
 
   const isAdmin = ["admin", "reseller_admin", "super_admin"].includes(user?.role);
   const features = user?.features || {};
-  const isPrepaid = user?.billing_type === "prepaid" && features.prepaid !== false;
+  const isReseller = user?.role === "reseller_admin";
+  const isPrepaid = user?.billing_type === "prepaid" && (isReseller || features.client_prepaid !== false);
 
   const nav_items = [
     { to: "/dashboard", icon: House, label: "Dashboard", testid: "nav-dashboard" },
@@ -40,19 +41,19 @@ export default function Layout() {
     { to: "/shipments", icon: ListChecks, label: "Spedizioni", testid: "nav-shipments" },
     ...(features.manifests !== false ? [{ to: "/manifests", icon: ClipboardText, label: "Manifest", testid: "nav-manifests" }] : []),
     ...(features.address_book !== false ? [{ to: "/addressbook", icon: AddressBook, label: "Rubrica", testid: "nav-addressbook" }] : []),
-    ...(features.parcels !== false ? [{ to: "/parcels", icon: Package, label: "I miei pacchi", testid: "nav-parcels" }] : []),
-    { to: "/billing", icon: Receipt, label: "Fatture", testid: "nav-billing" },
-    ...(isPrepaid ? [{ to: "/topup", icon: Wallet, label: "Ricariche", testid: "nav-topup" }] : []),
+    ...(features.parcels ? [{ to: "/parcels", icon: Package, label: "I miei pacchi", testid: "nav-parcels" }] : []),
+    ...(features.client_billing ? [{ to: "/billing", icon: Receipt, label: "Fatture", testid: "nav-billing" }] : []),
+    ...(isPrepaid ? [{ to: "/topup", icon: Wallet, label: isReseller ? "Wallet & Credito" : "Ricariche", testid: "nav-topup" }] : []),
     { to: "/support", icon: Headset, label: "Supporto", testid: "nav-support" },
   ];
 
   const admin_items = [
-    { to: "/admin/users", icon: Users, label: "Clienti", testid: "nav-admin-users" },
-    { to: "/admin/rates", icon: ChartBar, label: "Listini", testid: "nav-admin-rates" },
-    ...(user?.role === "reseller_admin" && user?.can_manage_own_carriers
+    ...(features.sub_clients ? [{ to: "/admin/users", icon: Users, label: "Sub-Clienti", testid: "nav-admin-users" }] : []),
+    ...(features.rate_tables ? [{ to: "/admin/rates", icon: ChartBar, label: "Listini Clienti", testid: "nav-admin-rates" }] : []),
+    ...(isReseller && user?.can_manage_own_carriers
       ? [{ to: "/admin/carriers", icon: Key, label: "I Miei Corrieri", testid: "nav-admin-carriers" }]
       : []),
-    ...(features.broadcasts !== false ? [{ to: "/admin/broadcast", icon: Megaphone, label: "Comunicazioni", testid: "nav-admin-bc" }] : []),
+    ...(features.broadcasts ? [{ to: "/admin/broadcast", icon: Megaphone, label: "Comunicazioni", testid: "nav-admin-bc" }] : []),
   ];
 
   const SideContent = () => (
@@ -67,9 +68,9 @@ export default function Layout() {
       <nav className="flex-1 p-3 space-y-1 overflow-y-auto">
         <div className="label-caps text-slate-500 px-3 pt-2 pb-1">Operazioni</div>
         {nav_items.map((n) => <NavItem key={n.to} {...n} active={isActive(n.to)} onClick={() => setOpen(false)} />)}
-        {isAdmin && (
+        {isAdmin && admin_items.length > 0 && (
           <>
-            <div className="label-caps text-slate-500 px-3 pt-6 pb-1">Admin</div>
+            <div className="label-caps text-slate-500 px-3 pt-6 pb-1">Gestione Agenzia</div>
             {admin_items.map((n) => <NavItem key={n.to} {...n} active={isActive(n.to)} onClick={() => setOpen(false)} />)}
           </>
         )}
