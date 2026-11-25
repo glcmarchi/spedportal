@@ -1363,4 +1363,91 @@ async def generate_invoice(user_id: str, admin=Depends(require_admin)):
 
 @api_router.get("/invoices/{iid}/pdf")
 async def invoice_pdf(iid: str, user=Depends(require_approved)):
-    inv = await db.invoices.find_one(tenant_
+    inv = await db.invoices.find_one(tenant_filter(user, {"id": iid}), {"_id": 0})
+    if not inv:
+        raise HTTPException(404, "Fattura non trovata")
+    ships = await db.shipments.find({"id": {"$in": inv["shipment_ids"]}}, {"_id": 0, "label_pdf_base64": 0}).to_list(1000)
+    u = await db.users.find_one({"id": inv["user_id"]}, {"_id": 0, "password": 0})
+    buf = io.BytesIO()
+    c = canvas.Canvas(buf, pagesize=A4)
+    W, H = A4
+    c.setFillColor(rl_colors.HexColor("#0F172A")); c.rect(0, H - 30 * mm, W, 30 * mm, fill=1, stroke=0)
+    c.setFillColor(rl_colors.HexColor("#EA580C")); c.rect(0, H - 30 * mm, 4 * mm, 30 * mm, fill=1, stroke=0)
+    c.setFillColor(rl_colors.white); c.setFont("Helvetica-Bold", 20); c.drawString(15 * mm, H - 15 * mm, "FATTURA")
+    c.setFont("Helvetica", 11); c.drawString(15 * mm, H - 22 * mm, f"N. {inv['invoice_number']}")
+    c.drawRightString(W - 15 * mm, H - 15 * mm, "SpedPortal S.r.l.")
+    c.setFont("Helvetica", 9); c.drawRightString(W - 15 * mm, H - 22 * mm, f"Data: {inv['created_at'][:10]}")
+    c.setFillColor(rl_colors.black); y = H - 45 * mm
+    c.setFont("Helvetica-Bold", 10); c.drawString(15 * mm, y, "Cliente:"); y -= 5 * mm
+    c.setFont("Helvetica", 10); c.drawString(15 * mm, y, (u or {}).get("company_name", "")); y -= 4 * mm
+    c.drawString(15 * mm, y, (u or {}).get("email", "")); y -= 10 * mm
+    c.setFont("Helvetica-Bold", 9); c.setFillColor(rl_colors.HexColor("#F1F5F9"))
+    c.rect(15 * mm, y - 2, W - 30 * mm, 6 * mm, fill=1, stroke=0); c.setFillColor(rl_colors.black)
+    c.drawString(17 * mm, y, "Data"); c.drawString(38 * mm, y, "Tracking"); c.drawString(72 * mm, y, "Corriere")
+    c.drawString(100 * mm, y, "Destinatario"); c.drawRightString(W - 17 * mm, y, "Prezzo €"); y -= 6 * mm
+    c.setFont("Helvetica", 8)
+    for s in ships:
+        if y < 40 * mm:
+            c.showPage(); y = H - 20 * mm
+        c.drawString(17 * mm, y, s.get("created_at", "")[:10])
+        c.drawString(38 * mm, y, s.get("tracking_number", ""))
+        c.drawString(72 * mm, y, s.get("carrier_name", "")[:14])
+        c.drawString(100 * mm, y, s.get("recipient", {}).get("company_name", "")[:28])
+        c.drawRightString(W - 17 * mm, y, f"{s.get('price', 0):.2f}"); y -= 5 * mm
+    y -= 4 * mm; c.setFont("Helvetica-Bold", 10)
+    c.drawRightString(W - 40 * mm, y, "Imponibile:"); c.drawRightString(W - 17 * mm, y, f"€ {inv['total']:.2f}"); y -= 5 * mm
+    c.drawRightString(W - 40 * mm, y, "IVA 22%:"); c.drawRightString(W - 17 * mm, y, f"€ {inv['vat']:.2f}"); y -= 5 * mm
+    c.setFont("Helvetica-Bold", 12); c.setFillColor(rl_colors.HexColor("#EA580C"))
+    c.drawRightString(W - 40 * mm, y, "TOTALE:"); c.drawRightString(W - 17 * mm, y, f"€ {inv['grand_total']:.2f}")
+    c.showPage(); c.save(); buf.seek(0)
+    return StreamingResponse(buf, media_type="application/pdf",
+        headers={"Content-Disposition": f"attachment; filename={inv['invoice_number']}.pdf"})
+
+@app.on_event("startup")
+async def bootstrap():
+    admin = await db.users.find_one({"email": "admin@spedportal.it"})
+    if not admin:
+        await db.users.insert_one({
+            "id": new_id(), "email": "admin@spedportal.it", "password": hash_pw("Admin@2026"),
+            "company_name": "SpedPortal Admin", "phone": "", "role": "super_admin",
+            "reseller_id": None, "status": "approved", "billing_type": "postpaid",
+            "rate_table_id": None, "credit_balance": 0.0, "created_at": now_iso(),
+        })
+        logger.info("Super Admin seeded: admin@spedportal.it / Admin@2026")
+    await bootstrap_multitenant()
+    if await db.rate_tables.count_documents({}) == 0:
+        demo = await db.resellers.find_one({"company_name": "SpedPortal Demo"})
+        await db.rate_tables.insert_one({
+            "id": new_id(), "reseller_id": demo["id"] if demo else None, "name": "Listino Clienti Standard",
+            "bands": [
+                {"zone": "NAZ", "min_weight": 0, "max_weight": 999, "markup_percent": 20},
+                {"zone": "UE", "min_weight": 0, "max_weight": 999, "markup_percent": 35},
+                {"zone": "EUR-EXTRA", "min_weight": 0, "max_weight": 999, "markup_percent": 45},
+                {"zone": "USA-CA", "min_weight": 0, "max_weight": 999, "markup_percent": 50},
+                {"zone": "WORLD", "min_weight": 0, "max_weight": 999, "markup_percent": 60},
+            ],
+            "created_at": now_iso(),
+        })
+
+@api_router.get("/")
+async def root():
+    return {"service": "SpedPortal API", "status": "ok", "fedex_live": is_fedex_configured()}
+
+app.include_router(api_router)
+from extras import extra_router
+from mail import mail_router, send_email, tpl_registration, tpl_approved, FRONTEND_URL
+from tenancy import super_router, reseller_router, bootstrap_multitenant
+app.include_router(extra_router)
+app.include_router(mail_router)
+app.include_router(super_router)
+app.include_router(reseller_router)
+
+app.add_middleware(
+    CORSMiddleware, allow_credentials=True,
+    allow_origins=os.environ.get('CORS_ORIGINS', '*').split(','),
+    allow_methods=["*"], allow_headers=["*"],
+)
+
+@app.on_event("shutdown")
+async def shutdown_db_client():
+    client.close()
