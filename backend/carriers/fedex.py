@@ -93,7 +93,6 @@ def _headers(token: str) -> Dict[str, str]:
 
 
 async def validate_fedex_postal(country_code: str, postal_code: str, state_code: str = "") -> Optional[Dict[str, Any]]:
-    """Chiama POST /country/v1/postal/validate per verificare CAP internazionali e ottenere dati normalizzati."""
     if not is_fedex_configured() or not postal_code:
         return None
     token = await get_fedex_token()
@@ -129,7 +128,7 @@ async def validate_fedex_postal(country_code: str, postal_code: str, state_code:
 
 
 async def validate_fedex_address(addr: Dict[str, Any]) -> Dict[str, Any]:
-    """Chiama POST /address/v1/addresses/resolve per validazione indirizzo e classificazione BUSINESS/RESIDENTIAL."""
+    """Chiama POST /address/v1/addresses/resolve; ignora silenziosamente se non supportato in Sandbox."""
     if not is_fedex_configured():
         return {"supported": False}
     token = await get_fedex_token()
@@ -156,12 +155,15 @@ async def validate_fedex_address(addr: Dict[str, Any]) -> Dict[str, Any]:
                 headers=_headers(token),
             )
             if resp.status_code != 200:
-                return {"supported": True, "resolved": False, "warning": "Impossibile verificare automaticamente l'indirizzo con FedEx."}
+                logger.info("FedEx Address Validation non disponibile per %s (%s)", cc, resp.status_code)
+                return {"supported": False}
             resolved_list = ((resp.json().get("output") or {}).get("resolvedAddresses")) or []
             if not resolved_list:
-                return {"supported": True, "resolved": False, "warning": "Indirizzo non trovato negli archivi postali FedEx."}
+                return {"supported": False}
             ra = resolved_list[0]
             attrs = ra.get("attributes") or {}
+            if attrs.get("CountrySupported") is False:
+                return {"supported": False}
             classification = (ra.get("classification") or "UNKNOWN").upper()
             msgs = [m.get("message") for m in (ra.get("customerMessage") or []) if isinstance(m, dict) and m.get("message")]
             return {
@@ -185,7 +187,6 @@ async def upload_fedex_etd_documents(
     destination_country: str,
     documents: List[Dict[str, Any]],
 ) -> Dict[str, Any]:
-    """Carica PDF su POST /documents/v1/etds/encodedmultiupload (PreShipment) e restituisce i docId."""
     if not is_fedex_configured() or not documents:
         return {"uploaded": [], "paperless_ok": False, "fallback_paper": True}
 
@@ -326,6 +327,33 @@ def _addr_obj(addr: Dict[str, Any], residential: bool = False) -> Dict[str, Any]
     return out
 
 
+def _build_commodity_item(
+    goods_description: str,
+    origin_country: str,
+    total_weight: float,
+    pkg_count: int,
+    customs_value: float,
+    currency: str = "EUR",
+    hs_code: str = "",
+) -> Dict[str, Any]:
+    val = round(max(1.0, float(customs_value or 50.0)), 2)
+    curr = (currency or "EUR").upper()
+    item: Dict[str, Any] = {
+        "description": (goods_description or "Commercial Goods Sample")[:400],
+        "countryOfManufacture": origin_country,
+        "numberOfPieces": max(1, int(pkg_count)),
+        "quantity": 1,
+        "quantityUnits": "PCS",
+        "weight": {"units": "KG", "value": max(0.1, total_weight)},
+        "unitPrice": {"amount": val, "currency": curr},
+        "customsValue": {"amount": val, "currency": curr},
+    }
+    clean_hs = "".join(ch for ch in (hs_code or "") if ch.isdigit())
+    if len(clean_hs) >= 6:
+        item["harmonizedCode"] = clean_hs[:10]
+    return item
+
+
 async def get_fedex_rates(
     account_number: str,
     sender: Dict[str, Any],
@@ -334,6 +362,9 @@ async def get_fedex_rates(
     parcel_type: str = "pacco",
     customs_required: bool = False,
     incoterms: str = "DAP",
+    customs_value: float = 0.0,
+    customs_currency: str = "EUR",
+    hs_code: str = "",
     goods_description: str = "",
     insured_value: float = 0.0,
     saturday_delivery: bool = False,
@@ -377,13 +408,15 @@ async def get_fedex_rates(
         requested_shipment["customsClearanceDetail"] = {
             "dutiesPayment": {"paymentType": duties_payor},
             "commodities": [
-                {
-                    "description": (goods_description or "Commercial Goods")[:400],
-                    "quantity": 1,
-                    "quantityUnits": "PCS",
-                    "weight": {"units": "KG", "value": max(0.1, total_w)},
-                    "customsValue": {"amount": max(1.0, insured_value or 50.0), "currency": "EUR"},
-                }
+                _build_commodity_item(
+                    goods_description=goods_description,
+                    origin_country=s_country,
+                    total_weight=total_w,
+                    pkg_count=len(parcels),
+                    customs_value=customs_value or insured_value or 50.0,
+                    currency=customs_currency,
+                    hs_code=hs_code,
+                )
             ],
         }
 
@@ -451,6 +484,8 @@ async def create_fedex_shipment(
     customs_required: bool = False,
     incoterms: str = "DAP",
     customs_value: float = 0.0,
+    customs_currency: str = "EUR",
+    hs_code: str = "",
     etd_docs: Optional[List[Dict[str, Any]]] = None,
     insured_value: float = 0.0,
     saturday_delivery: bool = False,
@@ -547,19 +582,19 @@ async def create_fedex_shipment(
         if duties_payor == "SENDER":
             duties_block["payor"] = {"responsibleParty": {"accountNumber": {"value": str(account_number).strip()}}}
 
-        decl_val = max(1.0, float(customs_value or insured_value or 50.0))
         requested_shipment["customsClearanceDetail"] = {
             "dutiesPayment": duties_block,
             "commercialInvoice": {"shipmentPurpose": "SOLD"},
             "commodities": [
-                {
-                    "description": (goods_description or "Commercial Goods")[:400],
-                    "countryOfManufacture": s_country,
-                    "quantity": 1,
-                    "quantityUnits": "PCS",
-                    "weight": {"units": "KG", "value": max(0.1, total_w)},
-                    "customsValue": {"amount": decl_val, "currency": "EUR"},
-                }
+                _build_commodity_item(
+                    goods_description=goods_description,
+                    origin_country=s_country,
+                    total_weight=total_w,
+                    pkg_count=len(parcels),
+                    customs_value=customs_value or insured_value or 50.0,
+                    currency=customs_currency,
+                    hs_code=hs_code,
+                )
             ],
         }
 
