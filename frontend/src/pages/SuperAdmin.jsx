@@ -74,6 +74,7 @@ export default function SuperAdmin() {
     address: "", postal_code: "", city: "", province: "", country: "IT", phone: "",
     plan: "basic",
     billing_type: "prepaid",
+    allow_ddp: false,
     features: { ...PLAN_PRESETS.basic },
     enabled_surcharges: Object.fromEntries(SURCHARGE_KEYS.map(([k]) => [k, true])),
     carrier_policies: Object.fromEntries(CARRIERS.map(c => [c, "admin_only"])),
@@ -178,6 +179,7 @@ export default function SuperAdmin() {
     setForm({
       ...empty,
       ...r,
+      allow_ddp: !!r.allow_ddp,
       features: { ...empty.features, ...(r.features || {}) },
       enabled_surcharges: { ...empty.enabled_surcharges, ...(r.enabled_surcharges || {}) },
       carrier_policies: { ...empty.carrier_policies, ...(r.carrier_policies || {}) },
@@ -236,6 +238,9 @@ export default function SuperAdmin() {
                         <span className={`text-[10px] font-bold uppercase px-2 py-0.5 rounded-sm ${isPre ? "bg-green-100 text-green-800" : "bg-amber-100 text-amber-800"}`}>
                           {isPre ? `Prepagato · € ${Number(r.credit_balance || 0).toFixed(2)}` : "Fatturazione Fine Mese"}
                         </span>
+                        {r.allow_ddp && (
+                          <span className="text-[10px] font-bold uppercase px-2 py-0.5 rounded-sm bg-red-100 text-red-800">DDP Attivo</span>
+                        )}
                       </div>
                       <div className="text-xs text-slate-500 mt-0.5">
                         {r.admin_email} {r.city && `· ${r.city} (${r.province})`} · sub-clienti: <b>{r.user_count}</b> · fee codici propri: <b>€ {Number(r.per_shipment_fee || 0).toFixed(2)}/sped</b>
@@ -406,7 +411,6 @@ export default function SuperAdmin() {
               <div><Label className="label-caps">Fee per lettera di vettura su codici Reseller (€)</Label><Input type="number" step="0.01" min="0" value={form.per_shipment_fee} onChange={(e) => setForm({ ...form, per_shipment_fee: parseFloat(e.target.value) || 0 })} className="mt-1 rounded-sm h-10" /></div>
             </div>
 
-            {/* SEDE MITTENTE PREDEFINITA DEL RESELLER */}
             <div className="border-t pt-4">
               <div className="label-caps text-slate-900 mb-2">Indirizzo Sede Reseller (per compilazione rapida Mittente)</div>
               <div className="grid grid-cols-1 sm:grid-cols-6 gap-2">
@@ -486,13 +490,22 @@ export default function SuperAdmin() {
                 </div>
               </div>
               <div>
-                <div className="label-caps mb-2 text-slate-900">Supplementi & Servizi Corriere Abilitati</div>
+                <div className="label-caps mb-2 text-slate-900">Supplementi & Opzioni Doganali</div>
                 <div className="space-y-2">
                   {SURCHARGE_KEYS.map(([k, l]) => (
                     <label key={k} className="flex items-center gap-2 cursor-pointer text-sm">
                       <Checkbox checked={form.enabled_surcharges?.[k] !== false} onCheckedChange={(v) => setForm({ ...form, enabled_surcharges: { ...(form.enabled_surcharges || {}), [k]: !!v } })} />{l}
                     </label>
                   ))}
+                  <div className="pt-2 mt-2 border-t border-red-200 bg-red-50/60 p-2.5 rounded-sm">
+                    <label className="flex items-start gap-2 cursor-pointer text-sm">
+                      <Checkbox checked={!!form.allow_ddp} onCheckedChange={(v) => setForm({ ...form, allow_ddp: !!v })} className="mt-0.5" />
+                      <div>
+                        <div className="font-bold text-red-900 text-xs">Abilita resa doganale DDP (Dazi a carico mittente)</div>
+                        <div className="text-[11px] text-red-700">Attenzione: in DDP eventuali dazi e IVA esteri vengono addebitati sul codice pagante del trasporto.</div>
+                      </div>
+                    </label>
+                  </div>
                 </div>
               </div>
             </div>
