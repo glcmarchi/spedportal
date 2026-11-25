@@ -672,7 +672,7 @@ async def _compute_quotes_internal(q: QuoteRequest, user: dict) -> dict:
                 )
             except Exception as e:
                 logger.warning("FedEx Rate API non ha restituito tariffe: %s", e)
-                warnings.append("FedEx: servizio temporaneamente non quotabile per questa tratta.")
+                warnings.append(f"FedEx: {e}")
                 continue
 
             for fx in live_fedex_list:
