@@ -11,6 +11,11 @@ logger = logging.getLogger("spedportal.fedex")
 FEDEX_BASE_URL = os.environ.get("FEDEX_BASE_URL", "https://apis-sandbox.fedex.com").rstrip("/")
 FEDEX_CLIENT_ID = os.environ.get("FEDEX_CLIENT_ID", "")
 FEDEX_CLIENT_SECRET = os.environ.get("FEDEX_CLIENT_SECRET", "")
+FEDEX_DOC_URL = (
+    "https://documentapi.prod.fedex.com"
+    if "apis.fedex.com" in FEDEX_BASE_URL and "sandbox" not in FEDEX_BASE_URL
+    else "https://documentapitest.prod.fedex.com/sandbox"
+)
 
 _TOKEN_CACHE: Dict[str, Any] = {"access_token": None, "expires_at": 0.0}
 
@@ -87,6 +92,160 @@ def _headers(token: str) -> Dict[str, str]:
     }
 
 
+async def validate_fedex_postal(country_code: str, postal_code: str, state_code: str = "") -> Optional[Dict[str, Any]]:
+    """Chiama POST /country/v1/postal/validate per verificare CAP internazionali e ottenere dati normalizzati."""
+    if not is_fedex_configured() or not postal_code:
+        return None
+    token = await get_fedex_token()
+    ship_date = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    cc = (country_code or "IT").upper().strip()
+    payload: Dict[str, Any] = {
+        "carrierCode": "FDXE",
+        "countryCode": cc,
+        "postalCode": str(postal_code).strip().upper(),
+        "shipDate": ship_date,
+        "stateOrProvinceCode": (state_code or "").strip().upper()[:2],
+        "checkForMismatch": False,
+    }
+    try:
+        async with httpx.AsyncClient(timeout=10.0) as client:
+            resp = await client.post(
+                f"{FEDEX_BASE_URL}/country/v1/postal/validate",
+                json=payload,
+                headers=_headers(token),
+            )
+            if resp.status_code != 200:
+                return {"valid": False, "error": "CAP non riconosciuto per la nazione selezionata"}
+            out = (resp.json().get("output") or {})
+            return {
+                "valid": True,
+                "cleaned_postal_code": out.get("cleanedPostalCode") or postal_code,
+                "province": (out.get("stateOrProvinceCode") or "")[:2].upper(),
+                "city_initials": out.get("cityFirstInitials") or "",
+            }
+    except Exception as e:
+        logger.warning("FedEx Postal Validation fallback: %s", e)
+        return None
+
+
+async def validate_fedex_address(addr: Dict[str, Any]) -> Dict[str, Any]:
+    """Chiama POST /address/v1/addresses/resolve per validazione indirizzo e classificazione BUSINESS/RESIDENTIAL."""
+    if not is_fedex_configured():
+        return {"supported": False}
+    token = await get_fedex_token()
+    cc = (addr.get("country") or "IT").upper().strip()
+    address_block: Dict[str, Any] = {
+        "streetLines": _split_street(addr.get("address", "")),
+        "city": (addr.get("city") or "")[:35],
+        "postalCode": str(addr.get("postal_code", "")).strip(),
+        "countryCode": cc,
+    }
+    prov = (addr.get("province") or "").strip().upper()
+    if prov and cc in ("IT", "US", "CA", "AU"):
+        address_block["stateOrProvinceCode"] = prov[:2]
+
+    payload = {
+        "validateAddressControlParameters": {"includeResolutionTokens": True},
+        "addressesToValidate": [{"address": address_block}],
+    }
+    try:
+        async with httpx.AsyncClient(timeout=15.0) as client:
+            resp = await client.post(
+                f"{FEDEX_BASE_URL}/address/v1/addresses/resolve",
+                json=payload,
+                headers=_headers(token),
+            )
+            if resp.status_code != 200:
+                return {"supported": True, "resolved": False, "warning": "Impossibile verificare automaticamente l'indirizzo con FedEx."}
+            resolved_list = ((resp.json().get("output") or {}).get("resolvedAddresses")) or []
+            if not resolved_list:
+                return {"supported": True, "resolved": False, "warning": "Indirizzo non trovato negli archivi postali FedEx."}
+            ra = resolved_list[0]
+            attrs = ra.get("attributes") or {}
+            classification = (ra.get("classification") or "UNKNOWN").upper()
+            msgs = [m.get("message") for m in (ra.get("customerMessage") or []) if isinstance(m, dict) and m.get("message")]
+            return {
+                "supported": True,
+                "resolved": bool(attrs.get("Resolved", True)),
+                "matched": bool(attrs.get("Matched", True)),
+                "classification": classification,
+                "is_residential": classification == "RESIDENTIAL",
+                "normalized_street": ", ".join(ra.get("streetLinesToken") or []),
+                "normalized_city": ra.get("city") or addr.get("city", ""),
+                "normalized_province": ra.get("stateOrProvinceCode") or prov,
+                "messages": msgs,
+            }
+    except Exception as e:
+        logger.warning("FedEx Address Validation error: %s", e)
+        return {"supported": False}
+
+
+async def upload_fedex_etd_documents(
+    origin_country: str,
+    destination_country: str,
+    documents: List[Dict[str, Any]],
+) -> Dict[str, Any]:
+    """Carica PDF su POST /documents/v1/etds/encodedmultiupload (PreShipment) e restituisce i docId."""
+    if not is_fedex_configured() or not documents:
+        return {"uploaded": [], "paperless_ok": False, "fallback_paper": True}
+
+    token = await get_fedex_token()
+    meta_list = []
+    for idx, d in enumerate(documents, start=1):
+        b64 = d.get("base64") or ""
+        if "," in b64:
+            b64 = b64.split(",", 1)[1]
+        if not b64:
+            continue
+        meta_list.append({
+            "fileReferenceId": f"DOC_{idx}_{uuid.uuid4().hex[:6]}",
+            "contentType": d.get("content_type") or "application/pdf",
+            "shipDocumentType": d.get("doc_type") or "PRO_FORMA_INVOICE",
+            "fileContentBase64": b64,
+        })
+
+    if not meta_list:
+        return {"uploaded": [], "paperless_ok": False, "fallback_paper": True}
+
+    payload = {
+        "workflowName": "ETDPreshipment",
+        "carrierCode": "FDXE",
+        "originCountryCode": (origin_country or "IT").upper(),
+        "destinationCountryCode": (destination_country or "CH").upper(),
+        "metaData": meta_list,
+    }
+
+    try:
+        async with httpx.AsyncClient(timeout=30.0) as client:
+            resp = await client.post(
+                f"{FEDEX_DOC_URL}/documents/v1/etds/encodedmultiupload",
+                json=payload,
+                headers=_headers(token),
+            )
+            if resp.status_code not in (200, 201):
+                logger.warning("FedEx ETD upload %s: %s", resp.status_code, resp.text[:500])
+                return {"uploaded": [], "paperless_ok": False, "fallback_paper": True}
+
+            data = resp.json()
+            doc_resps = ((data.get("output") or {}).get("documentResponses")) or []
+            uploaded = []
+            for dr in doc_resps:
+                md = dr.get("metaData") or {}
+                if md.get("docId"):
+                    uploaded.append({
+                        "doc_id": md["docId"],
+                        "doc_type": md.get("documentType") or "PRO",
+                    })
+            return {
+                "uploaded": uploaded,
+                "paperless_ok": len(uploaded) > 0,
+                "fallback_paper": len(uploaded) == 0,
+            }
+    except Exception as e:
+        logger.warning("FedEx ETD upload exception: %s", e)
+        return {"uploaded": [], "paperless_ok": False, "fallback_paper": True}
+
+
 def _build_package_items(parcels: List[Dict[str, Any]], insured_value: float = 0.0) -> List[Dict[str, Any]]:
     items = []
     per_pkg_ins = round(insured_value / max(1, len(parcels)), 2) if insured_value > 0 else 0.0
@@ -154,14 +313,15 @@ def _extract_net_charge(rated_details: List[Dict[str, Any]]) -> Dict[str, Any]:
 
 
 def _addr_obj(addr: Dict[str, Any], residential: bool = False) -> Dict[str, Any]:
+    cc = (addr.get("country") or "IT").upper()
     out: Dict[str, Any] = {
         "postalCode": str(addr.get("postal_code", "")).strip(),
-        "countryCode": (addr.get("country") or "IT").upper(),
+        "countryCode": cc,
         "city": (addr.get("city") or "")[:35],
         "residential": bool(residential),
     }
     prov = (addr.get("province") or "").strip().upper()
-    if prov and len(prov) <= 3:
+    if prov and cc in ("IT", "US", "CA", "AU"):
         out["stateOrProvinceCode"] = prov[:2]
     return out
 
@@ -173,6 +333,7 @@ async def get_fedex_rates(
     parcels: List[Dict[str, Any]],
     parcel_type: str = "pacco",
     customs_required: bool = False,
+    incoterms: str = "DAP",
     goods_description: str = "",
     insured_value: float = 0.0,
     saturday_delivery: bool = False,
@@ -212,8 +373,9 @@ async def get_fedex_rates(
 
     if is_intl or customs_required:
         total_w = round(sum(float(p["weight"]) for p in parcels), 2)
+        duties_payor = "SENDER" if (incoterms or "DAP").upper() == "DDP" else "RECIPIENT"
         requested_shipment["customsClearanceDetail"] = {
-            "dutiesPayment": {"paymentType": "SENDER"},
+            "dutiesPayment": {"paymentType": duties_payor},
             "commodities": [
                 {
                     "description": (goods_description or "Commercial Goods")[:400],
@@ -287,6 +449,9 @@ async def create_fedex_shipment(
     parcel_type: str = "pacco",
     goods_description: str = "",
     customs_required: bool = False,
+    incoterms: str = "DAP",
+    customs_value: float = 0.0,
+    etd_docs: Optional[List[Dict[str, Any]]] = None,
     insured_value: float = 0.0,
     saturday_delivery: bool = False,
     residential_delivery: bool = False,
@@ -356,16 +521,35 @@ async def create_fedex_shipment(
             "codCollectionType": "ANY",
             "codCollectionAmount": {"amount": round(float(cod_amount), 2), "currency": "EUR"},
         }
+
+    etd_result = {"uploaded": [], "paperless_ok": False, "fallback_paper": False}
+    if (is_intl or customs_required) and etd_docs:
+        etd_result = await upload_fedex_etd_documents(s_country, r_country, etd_docs)
+        if etd_result["paperless_ok"]:
+            special_types.append("ELECTRONIC_TRADE_DOCUMENTS")
+            special_block["etdDetail"] = {
+                "attachedDocuments": [
+                    {
+                        "documentType": item["doc_type"],
+                        "documentId": item["doc_id"],
+                    }
+                    for item in etd_result["uploaded"]
+                ]
+            }
+
     if special_types:
         special_block["specialServiceTypes"] = special_types
         requested_shipment["shipmentSpecialServices"] = special_block
 
     if is_intl or customs_required:
+        duties_payor = "SENDER" if (incoterms or "DAP").upper() == "DDP" else "RECIPIENT"
+        duties_block: Dict[str, Any] = {"paymentType": duties_payor}
+        if duties_payor == "SENDER":
+            duties_block["payor"] = {"responsibleParty": {"accountNumber": {"value": str(account_number).strip()}}}
+
+        decl_val = max(1.0, float(customs_value or insured_value or 50.0))
         requested_shipment["customsClearanceDetail"] = {
-            "dutiesPayment": {
-                "paymentType": "SENDER",
-                "payor": {"responsibleParty": {"accountNumber": {"value": str(account_number).strip()}}},
-            },
+            "dutiesPayment": duties_block,
             "commercialInvoice": {"shipmentPurpose": "SOLD"},
             "commodities": [
                 {
@@ -374,7 +558,7 @@ async def create_fedex_shipment(
                     "quantity": 1,
                     "quantityUnits": "PCS",
                     "weight": {"units": "KG", "value": max(0.1, total_w)},
-                    "customsValue": {"amount": max(1.0, insured_value or 50.0), "currency": "EUR"},
+                    "customsValue": {"amount": decl_val, "currency": "EUR"},
                 }
             ],
         }
@@ -431,6 +615,8 @@ async def create_fedex_shipment(
             "service_type": tx.get("serviceType", service_type),
             "service_name": tx.get("serviceName", "FedEx"),
             "label_pdf_base64": label_b64,
+            "paperless_ok": etd_result["paperless_ok"],
+            "fallback_paper": (is_intl or customs_required) and not etd_result["paperless_ok"],
         }
 
 
@@ -505,7 +691,7 @@ async def schedule_fedex_pickup(
         "residential": False,
     }
     prov = (sender.get("province") or "").strip().upper()
-    if prov and len(prov) <= 3:
+    if prov and s_country in ("IT", "US", "CA", "AU"):
         pickup_addr["stateOrProvinceCode"] = prov[:2]
 
     payload: Dict[str, Any] = {
