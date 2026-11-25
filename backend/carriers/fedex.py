@@ -128,7 +128,6 @@ async def validate_fedex_postal(country_code: str, postal_code: str, state_code:
 
 
 async def validate_fedex_address(addr: Dict[str, Any]) -> Dict[str, Any]:
-    """Chiama POST /address/v1/addresses/resolve; ignora silenziosamente se non supportato in Sandbox."""
     if not is_fedex_configured():
         return {"supported": False}
     token = await get_fedex_token()
@@ -155,7 +154,6 @@ async def validate_fedex_address(addr: Dict[str, Any]) -> Dict[str, Any]:
                 headers=_headers(token),
             )
             if resp.status_code != 200:
-                logger.info("FedEx Address Validation non disponibile per %s (%s)", cc, resp.status_code)
                 return {"supported": False}
             resolved_list = ((resp.json().get("output") or {}).get("resolvedAddresses")) or []
             if not resolved_list:
@@ -180,6 +178,57 @@ async def validate_fedex_address(addr: Dict[str, Any]) -> Dict[str, Any]:
     except Exception as e:
         logger.warning("FedEx Address Validation error: %s", e)
         return {"supported": False}
+
+
+async def get_fedex_transit_times(
+    sender: Dict[str, Any],
+    recipient: Dict[str, Any],
+    parcels: List[Dict[str, Any]],
+) -> List[Dict[str, Any]]:
+    """Chiama POST /availability/v1/transittimes per ottenere tempi di resa e cut-off orari."""
+    if not is_fedex_configured():
+        return []
+    token = await get_fedex_token()
+    ship_date = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    payload = {
+        "requestedShipment": {
+            "shipper": {"address": _addr_obj(sender, False)},
+            "recipients": [{"address": _addr_obj(recipient, False)}],
+            "shipDatestamp": ship_date,
+            "pickupType": "DROPOFF_AT_FEDEX_LOCATION",
+            "packagingType": "YOUR_PACKAGING",
+            "requestedPackageLineItems": _build_package_items(parcels, 0.0),
+        },
+        "carrierCodes": ["FDXE"],
+    }
+    try:
+        async with httpx.AsyncClient(timeout=15.0) as client:
+            resp = await client.post(
+                f"{FEDEX_BASE_URL}/availability/v1/transittimes",
+                json=payload,
+                headers=_headers(token),
+            )
+            if resp.status_code != 200:
+                return []
+            tt_list = ((resp.json().get("output") or {}).get("transitTimes")) or []
+            out = []
+            for block in tt_list:
+                for d in block.get("transitTimeDetails") or []:
+                    commit = d.get("commit") or {}
+                    td = commit.get("transitDays") or {}
+                    dd = commit.get("dateDetail") or {}
+                    out.append({
+                        "service_type": d.get("serviceType", ""),
+                        "service_name": d.get("serviceName", ""),
+                        "transit_days": TRANSIT_MAP.get(td.get("minimumTransitTime", ""), 2),
+                        "delivery_day": dd.get("day", ""),
+                        "delivery_time": dd.get("time", ""),
+                        "cutoff_time": commit.get("cutOffTime", ""),
+                    })
+            return out
+    except Exception as e:
+        logger.warning("FedEx TransitTimes error: %s", e)
+        return []
 
 
 async def upload_fedex_etd_documents(
@@ -279,7 +328,7 @@ def _extract_net_charge(rated_details: List[Dict[str, Any]]) -> Dict[str, Any]:
         return {"net_charge": 0.0, "base_charge": 0.0, "surcharges": 0.0, "currency": "EUR", "surcharge_list": []}
 
     srd = chosen.get("shipmentRateDetail") or {}
-    base = float(chosen.get("totalBaseCharge") or 0.0)
+    base = float(chosen.get("totalBaseCharge") or srd.get("totalBaseCharge") or 0.0)
     surcharges = float(srd.get("totalSurcharges") or 0.0)
     net = float(chosen.get("totalNetFedExCharge") or chosen.get("totalNetCharge") or (base + surcharges))
     currency = chosen.get("currency") or srd.get("currency") or "EUR"
@@ -293,21 +342,49 @@ def _extract_net_charge(rated_details: List[Dict[str, Any]]) -> Dict[str, Any]:
         surcharges = round(surcharges * rate, 2)
         currency = "EUR"
 
-    raw_surcharges = srd.get("surCharges") or []
-    clean_surcharges = []
-    for sc in raw_surcharges:
-        amt = round(float(sc.get("amount") or 0.0) * rate, 2)
-        if amt > 0:
-            clean_surcharges.append({
-                "type": sc.get("type") or sc.get("surchargeType") or "SURCHARGE",
-                "label": sc.get("description") or sc.get("name") or sc.get("type") or "Supplemento",
-                "amount": amt,
-            })
+    # Raccoglie TUTTI i supplementi sia a livello spedizione (shipmentRateDetail.surCharges)
+    # sia a livello di singolo collo (ratedPackageDetails[].packageRateDetail.surCharges)
+    agg_surcharges: Dict[str, Dict[str, Any]] = {}
+
+    def _collect(sc_list: List[Dict[str, Any]]):
+        for sc in sc_list or []:
+            amt = round(float(sc.get("amount") or 0.0) * rate, 2)
+            if amt <= 0:
+                continue
+            sc_type = sc.get("type") or sc.get("surchargeType") or "SURCHARGE"
+            sc_label = sc.get("description") or sc.get("name") or sc_type
+            key = f"{sc_type}:{sc_label}"
+            if key in agg_surcharges:
+                agg_surcharges[key]["amount"] = round(agg_surcharges[key]["amount"] + amt, 2)
+            else:
+                agg_surcharges[key] = {"type": sc_type, "label": sc_label, "amount": amt}
+
+    _collect(srd.get("surCharges") or [])
+    for rpd in chosen.get("ratedPackageDetails") or []:
+        prd = rpd.get("packageRateDetail") or {}
+        _collect(prd.get("surCharges") or [])
+
+    clean_surcharges = list(agg_surcharges.values())
+    sum_items = round(sum(x["amount"] for x in clean_surcharges), 2)
+
+    # Quadratura: se FedEx riporta un totale supplementi diverso dalla somma delle singole voci
+    # (o se base + supplementi differisce dal netto), allinea le voci in modo trasparente
+    implied_surcharges = round(max(surcharges, net - base), 2)
+    diff = round(implied_surcharges - sum_items, 2)
+    if diff > 0.01:
+        clean_surcharges.append({
+            "type": "OTHER_SURCHARGES",
+            "label": "Altri supplementi / Area remota / Diritti",
+            "amount": diff,
+        })
+        sum_items = round(sum_items + diff, 2)
+
+    final_base = round(max(0.0, net - sum_items), 2) if sum_items > 0 else round(net, 2)
 
     return {
         "net_charge": round(net, 2),
-        "base_charge": round(base, 2),
-        "surcharges": round(surcharges, 2),
+        "base_charge": final_base,
+        "surcharges": sum_items,
         "currency": currency,
         "surcharge_list": clean_surcharges,
     }
