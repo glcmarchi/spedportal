@@ -168,7 +168,9 @@ class CustomsDocs(BaseModel):
     dae_name: Optional[str] = ""
     dae_base64: Optional[str] = ""
     eori_number: Optional[str] = ""
+    hs_code: Optional[str] = ""
     customs_value: float = 0
+    customs_currency: str = "EUR"
 
 class QuoteRequest(BaseModel):
     sender: Address
@@ -602,6 +604,9 @@ async def _compute_quotes_internal(q: QuoteRequest, user: dict) -> dict:
                     parcel_type=q.parcel_type,
                     customs_required=zone_info["is_extra_eu"] or q.customs.required,
                     incoterms=q.customs.incoterms,
+                    customs_value=q.customs.customs_value,
+                    customs_currency=q.customs.customs_currency,
+                    hs_code=q.customs.hs_code or "",
                     goods_description=q.goods_description,
                     insured_value=q.services.insurance_value if q.services.insurance else 0.0,
                     saturday_delivery=q.services.saturday_delivery,
@@ -702,7 +707,6 @@ async def quote_shipment(q: QuoteRequest, user=Depends(require_approved)):
 
 @api_router.post("/shipments/validate-address")
 async def validate_shipment_address(inp: ValidateAddressInput, _=Depends(require_approved)):
-    """Esegue la validazione indirizzo FedEx SOLO dopo la scelta del corriere FedEx."""
     if inp.carrier_id != "tnt" or not is_fedex_configured():
         return {"supported": False}
     return await validate_fedex_address(inp.address.model_dump())
@@ -782,6 +786,8 @@ async def create_shipment(inp: CreateShipmentInput, user=Depends(require_approve
                 customs_required=full_quotes["is_extra_eu"] or inp.quote.customs.required,
                 incoterms=inp.quote.customs.incoterms,
                 customs_value=inp.quote.customs.customs_value,
+                customs_currency=inp.quote.customs.customs_currency,
+                hs_code=inp.quote.customs.hs_code or "",
                 etd_docs=etd_docs,
                 insured_value=inp.quote.services.insurance_value if inp.quote.services.insurance else 0.0,
                 saturday_delivery=inp.quote.services.saturday_delivery,
@@ -826,6 +832,9 @@ async def create_shipment(inp: CreateShipmentInput, user=Depends(require_approve
         "zone": chosen["zone"],
         "carrier_cost": carrier_cost,
         "admin_markup_percent": chosen["admin_markup_percent"],
+        "reseller_base_freight": chosen["reseller_base_freight"],
+        "reseller_surcharges_total": chosen["reseller_surcharges_total"],
+        "reseller_surcharge_items": chosen["reseller_surcharge_items"],
         "reseller_cost": reseller_cost,
         "reseller_markup_percent": chosen["reseller_markup_percent"],
         "cost": reseller_cost,
@@ -856,15 +865,16 @@ async def create_shipment(inp: CreateShipmentInput, user=Depends(require_approve
 
     shipment.pop("_id", None)
     shipment.pop("label_pdf_base64", None)
-    if user.get("role") == "user":
-        for secret_k in ("cost", "carrier_cost", "reseller_cost", "admin_markup_percent", "reseller_markup_percent"):
-            shipment.pop(secret_k, None)
-    return shipment
+    return _sanitize_shipment_for_role(shipment, user.get("role", "user"))
 
 
 def _sanitize_shipment_for_role(s: dict, role: str) -> dict:
     if role == "user":
-        for secret_k in ("cost", "carrier_cost", "reseller_cost", "admin_markup_percent", "reseller_markup_percent"):
+        for secret_k in (
+            "cost", "carrier_cost", "reseller_cost",
+            "reseller_base_freight", "reseller_surcharges_total", "reseller_surcharge_items",
+            "admin_markup_percent", "reseller_markup_percent",
+        ):
             s.pop(secret_k, None)
     return s
 
@@ -902,7 +912,11 @@ async def list_shipments(user=Depends(require_approved)):
     q = tenant_filter(user)
     proj = {"_id": 0, "label_pdf_base64": 0}
     if user.get("role") == "user":
-        proj.update({"cost": 0, "carrier_cost": 0, "reseller_cost": 0, "admin_markup_percent": 0, "reseller_markup_percent": 0})
+        proj.update({
+            "cost": 0, "carrier_cost": 0, "reseller_cost": 0,
+            "reseller_base_freight": 0, "reseller_surcharges_total": 0, "reseller_surcharge_items": 0,
+            "admin_markup_percent": 0, "reseller_markup_percent": 0,
+        })
     ships = await db.shipments.find(q, proj).sort("created_at", -1).to_list(1000)
     for s in ships:
         if s.get("status") != "cancelled" and not s.get("is_live"):
@@ -1349,91 +1363,4 @@ async def generate_invoice(user_id: str, admin=Depends(require_admin)):
 
 @api_router.get("/invoices/{iid}/pdf")
 async def invoice_pdf(iid: str, user=Depends(require_approved)):
-    inv = await db.invoices.find_one(tenant_filter(user, {"id": iid}), {"_id": 0})
-    if not inv:
-        raise HTTPException(404, "Fattura non trovata")
-    ships = await db.shipments.find({"id": {"$in": inv["shipment_ids"]}}, {"_id": 0, "label_pdf_base64": 0}).to_list(1000)
-    u = await db.users.find_one({"id": inv["user_id"]}, {"_id": 0, "password": 0})
-    buf = io.BytesIO()
-    c = canvas.Canvas(buf, pagesize=A4)
-    W, H = A4
-    c.setFillColor(rl_colors.HexColor("#0F172A")); c.rect(0, H - 30 * mm, W, 30 * mm, fill=1, stroke=0)
-    c.setFillColor(rl_colors.HexColor("#EA580C")); c.rect(0, H - 30 * mm, 4 * mm, 30 * mm, fill=1, stroke=0)
-    c.setFillColor(rl_colors.white); c.setFont("Helvetica-Bold", 20); c.drawString(15 * mm, H - 15 * mm, "FATTURA")
-    c.setFont("Helvetica", 11); c.drawString(15 * mm, H - 22 * mm, f"N. {inv['invoice_number']}")
-    c.drawRightString(W - 15 * mm, H - 15 * mm, "SpedPortal S.r.l.")
-    c.setFont("Helvetica", 9); c.drawRightString(W - 15 * mm, H - 22 * mm, f"Data: {inv['created_at'][:10]}")
-    c.setFillColor(rl_colors.black); y = H - 45 * mm
-    c.setFont("Helvetica-Bold", 10); c.drawString(15 * mm, y, "Cliente:"); y -= 5 * mm
-    c.setFont("Helvetica", 10); c.drawString(15 * mm, y, (u or {}).get("company_name", "")); y -= 4 * mm
-    c.drawString(15 * mm, y, (u or {}).get("email", "")); y -= 10 * mm
-    c.setFont("Helvetica-Bold", 9); c.setFillColor(rl_colors.HexColor("#F1F5F9"))
-    c.rect(15 * mm, y - 2, W - 30 * mm, 6 * mm, fill=1, stroke=0); c.setFillColor(rl_colors.black)
-    c.drawString(17 * mm, y, "Data"); c.drawString(38 * mm, y, "Tracking"); c.drawString(72 * mm, y, "Corriere")
-    c.drawString(100 * mm, y, "Destinatario"); c.drawRightString(W - 17 * mm, y, "Prezzo €"); y -= 6 * mm
-    c.setFont("Helvetica", 8)
-    for s in ships:
-        if y < 40 * mm:
-            c.showPage(); y = H - 20 * mm
-        c.drawString(17 * mm, y, s.get("created_at", "")[:10])
-        c.drawString(38 * mm, y, s.get("tracking_number", ""))
-        c.drawString(72 * mm, y, s.get("carrier_name", "")[:14])
-        c.drawString(100 * mm, y, s.get("recipient", {}).get("company_name", "")[:28])
-        c.drawRightString(W - 17 * mm, y, f"{s.get('price', 0):.2f}"); y -= 5 * mm
-    y -= 4 * mm; c.setFont("Helvetica-Bold", 10)
-    c.drawRightString(W - 40 * mm, y, "Imponibile:"); c.drawRightString(W - 17 * mm, y, f"€ {inv['total']:.2f}"); y -= 5 * mm
-    c.drawRightString(W - 40 * mm, y, "IVA 22%:"); c.drawRightString(W - 17 * mm, y, f"€ {inv['vat']:.2f}"); y -= 5 * mm
-    c.setFont("Helvetica-Bold", 12); c.setFillColor(rl_colors.HexColor("#EA580C"))
-    c.drawRightString(W - 40 * mm, y, "TOTALE:"); c.drawRightString(W - 17 * mm, y, f"€ {inv['grand_total']:.2f}")
-    c.showPage(); c.save(); buf.seek(0)
-    return StreamingResponse(buf, media_type="application/pdf",
-        headers={"Content-Disposition": f"attachment; filename={inv['invoice_number']}.pdf"})
-
-@app.on_event("startup")
-async def bootstrap():
-    admin = await db.users.find_one({"email": "admin@spedportal.it"})
-    if not admin:
-        await db.users.insert_one({
-            "id": new_id(), "email": "admin@spedportal.it", "password": hash_pw("Admin@2026"),
-            "company_name": "SpedPortal Admin", "phone": "", "role": "super_admin",
-            "reseller_id": None, "status": "approved", "billing_type": "postpaid",
-            "rate_table_id": None, "credit_balance": 0.0, "created_at": now_iso(),
-        })
-        logger.info("Super Admin seeded: admin@spedportal.it / Admin@2026")
-    await bootstrap_multitenant()
-    if await db.rate_tables.count_documents({}) == 0:
-        demo = await db.resellers.find_one({"company_name": "SpedPortal Demo"})
-        await db.rate_tables.insert_one({
-            "id": new_id(), "reseller_id": demo["id"] if demo else None, "name": "Listino Clienti Standard",
-            "bands": [
-                {"zone": "NAZ", "min_weight": 0, "max_weight": 999, "markup_percent": 20},
-                {"zone": "UE", "min_weight": 0, "max_weight": 999, "markup_percent": 35},
-                {"zone": "EUR-EXTRA", "min_weight": 0, "max_weight": 999, "markup_percent": 45},
-                {"zone": "USA-CA", "min_weight": 0, "max_weight": 999, "markup_percent": 50},
-                {"zone": "WORLD", "min_weight": 0, "max_weight": 999, "markup_percent": 60},
-            ],
-            "created_at": now_iso(),
-        })
-
-@api_router.get("/")
-async def root():
-    return {"service": "SpedPortal API", "status": "ok", "fedex_live": is_fedex_configured()}
-
-app.include_router(api_router)
-from extras import extra_router
-from mail import mail_router, send_email, tpl_registration, tpl_approved, FRONTEND_URL
-from tenancy import super_router, reseller_router, bootstrap_multitenant
-app.include_router(extra_router)
-app.include_router(mail_router)
-app.include_router(super_router)
-app.include_router(reseller_router)
-
-app.add_middleware(
-    CORSMiddleware, allow_credentials=True,
-    allow_origins=os.environ.get('CORS_ORIGINS', '*').split(','),
-    allow_methods=["*"], allow_headers=["*"],
-)
-
-@app.on_event("shutdown")
-async def shutdown_db_client():
-    client.close()
+    inv = await db.invoices.find_one(tenant_
