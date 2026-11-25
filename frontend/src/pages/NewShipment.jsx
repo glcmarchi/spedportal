@@ -634,7 +634,6 @@ export default function NewShipment() {
                       </div>
                       <div className="text-xs text-slate-500">
                         Consegna stimata: {q.transit_days} {q.transit_days === 1 ? "giorno" : "giorni"} lav.
-                        {q.service_type && <span className="ml-2 font-mono text-[10px] text-slate-400">({q.service_type})</span>}
                       </div>
                       {i === 0 && <div className="mt-1 label-caps text-orange-600">Miglior prezzo</div>}
                     </div>
