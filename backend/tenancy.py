@@ -156,6 +156,7 @@ class ResellerInput(BaseModel):
     phone: Optional[str] = ""
     plan: str = "basic"
     billing_type: str = "prepaid"
+    allow_ddp: bool = False  # Disabilitato di default per evitare rischi dazi su codice Admin
     features: Optional[Dict[str, bool]] = None
     enabled_surcharges: Optional[Dict[str, bool]] = None
     carrier_policies: Optional[Dict[str, str]] = None
@@ -263,6 +264,7 @@ async def create_reseller(inp: ResellerInput, _=Depends(require_super_admin)):
         "phone": inp.phone or "",
         "plan": inp.plan,
         "billing_type": inp.billing_type if inp.billing_type in ("prepaid", "postpaid") else "prepaid",
+        "allow_ddp": bool(inp.allow_ddp),
         "credit_balance": 0.0,
         "features": features,
         "enabled_surcharges": surcharges,
@@ -292,6 +294,7 @@ async def list_resellers(_=Depends(require_super_admin)):
         r["admin_carrier_markups"] = r.get("admin_carrier_markups") or {}
         r["enabled_surcharges"] = {**DEFAULT_SURCHARGES, **(r.get("enabled_surcharges") or {})}
         r["billing_type"] = r.get("billing_type") or "prepaid"
+        r["allow_ddp"] = bool(r.get("allow_ddp", False))
         r["credit_balance"] = float(r.get("credit_balance") or 0.0)
         r["user_count"] = await db.users.count_documents({"reseller_id": r["id"], "role": "user"})
         r["shipment_count"] = await db.shipments.count_documents({"reseller_id": r["id"]})
@@ -403,10 +406,10 @@ async def reseller_billing(rid: str, _=Depends(require_super_admin)):
 async def my_features(user=Depends(get_current_user)):
     if user.get("role") == "super_admin":
         all_true = {k: True for k in DEFAULT_FEATURES}
-        return {"features": all_true, "enabled_surcharges": DEFAULT_SURCHARGES, "role": "super_admin"}
+        return {"features": all_true, "enabled_surcharges": DEFAULT_SURCHARGES, "allow_ddp": True, "role": "super_admin"}
     rid = user.get("reseller_id")
     if not rid:
-        return {"features": DEFAULT_FEATURES, "enabled_surcharges": DEFAULT_SURCHARGES, "role": user.get("role")}
+        return {"features": DEFAULT_FEATURES, "enabled_surcharges": DEFAULT_SURCHARGES, "allow_ddp": False, "role": user.get("role")}
     res = await db.resellers.find_one({"id": rid}, {"_id": 0})
     features = {**DEFAULT_FEATURES, **((res or {}).get("features") or {})}
     surcharges = {**DEFAULT_SURCHARGES, **((res or {}).get("enabled_surcharges") or {})}
@@ -415,6 +418,7 @@ async def my_features(user=Depends(get_current_user)):
     return {
         "features": features,
         "enabled_surcharges": surcharges,
+        "allow_ddp": bool((res or {}).get("allow_ddp", False)),
         "can_manage_own_carriers": can_manage_own,
         "role": user.get("role"),
         "reseller": {
@@ -529,7 +533,7 @@ async def bootstrap_multitenant():
             "admin_email": "reseller@spedportal.it",
             "address": "Via Monte Napoleone 10", "postal_code": "20121", "city": "Milano", "province": "MI", "country": "IT", "phone": "0212345678",
             "plan": "premium",
-            "billing_type": "prepaid", "credit_balance": 500.0,
+            "billing_type": "prepaid", "allow_ddp": False, "credit_balance": 500.0,
             "features": {**PLAN_PRESETS["premium"]},
             "enabled_surcharges": {**DEFAULT_SURCHARGES},
             "carrier_policies": {
