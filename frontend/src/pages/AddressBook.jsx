@@ -3,7 +3,9 @@ import { api } from "@/lib/api";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
+import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
 import { Dialog, DialogContent, DialogHeader, DialogTitle } from "@/components/ui/dialog";
+import { COUNTRIES, PROVINCE_COUNTRIES, FieldTooltip } from "@/pages/NewShipment";
 import { toast } from "sonner";
 import { AddressBook, Plus, PencilSimple, Trash, DownloadSimple, UploadSimple } from "@phosphor-icons/react";
 
@@ -17,15 +19,28 @@ export default function AddressBookPage() {
   const load = () => { api.get("/addressbook").then(r => setItems(r.data)); };
   useEffect(() => { load(); }, []);
 
+  const cc = (form.country || "IT").toUpperCase();
+  const showProvince = PROVINCE_COUNTRIES.has(cc);
+
+  const handleCountryChange = (newCountry) => {
+    const up = newCountry.toUpperCase();
+    setForm(f => ({
+      ...f,
+      country: up,
+      province: PROVINCE_COUNTRIES.has(up) ? f.province : "",
+    }));
+  };
+
   const lookupCap = async (cap) => {
     if (!cap) return;
     try {
-      const r = await api.get(`/geo/lookup?country=${form.country || "IT"}&cap=${encodeURIComponent(cap)}`);
+      const r = await api.get(`/geo/lookup?country=${cc}&cap=${encodeURIComponent(cap)}`);
       if (r.data.city || r.data.province) {
         setForm(f => ({
           ...f,
+          postal_code: r.data.cap || f.postal_code,
           city: r.data.city || f.city,
-          province: r.data.province || f.province,
+          province: PROVINCE_COUNTRIES.has(cc) ? (r.data.province || f.province) : "",
         }));
       }
     } catch {}
@@ -79,9 +94,9 @@ export default function AddressBookPage() {
                 <th className="px-4 py-3">Sede / Etichetta</th>
                 <th className="px-4 py-3">Ragione Sociale</th>
                 <th className="px-4 py-3">Indirizzo</th>
-                <th className="px-4 py-3">CAP</th>
+                <th className="px-4 py-3">CAP / ZIP</th>
                 <th className="px-4 py-3">Città</th>
-                <th className="px-4 py-3">Prov.</th>
+                <th className="px-4 py-3">Prov. / Stato</th>
                 <th className="px-4 py-3">Naz.</th>
                 <th className="px-4 py-3"></th>
               </tr>
@@ -114,10 +129,34 @@ export default function AddressBookPage() {
             <div><Label className="label-caps">Nome sede / Etichetta (es. Magazzino)</Label><Input value={form.label || ""} onChange={(e) => setForm({ ...form, label: e.target.value })} className="mt-1 rounded-sm h-10" /></div>
             <div><Label className="label-caps">Ragione Sociale*</Label><Input value={form.company_name || ""} onChange={(e) => setForm({ ...form, company_name: e.target.value })} className="mt-1 rounded-sm h-10" /></div>
             <div className="sm:col-span-2"><Label className="label-caps">Indirizzo*</Label><Input value={form.address || ""} onChange={(e) => setForm({ ...form, address: e.target.value })} className="mt-1 rounded-sm h-10" /></div>
-            <div><Label className="label-caps">Nazione (es. IT)</Label><Input maxLength={2} value={form.country || ""} onChange={(e) => setForm({ ...form, country: e.target.value.toUpperCase() })} className="mt-1 rounded-sm h-10" /></div>
-            <div><Label className="label-caps">CAP*</Label><Input value={form.postal_code || ""} onChange={(e) => setForm({ ...form, postal_code: e.target.value })} onBlur={(e) => lookupCap(e.target.value)} className="mt-1 rounded-sm h-10" /></div>
-            <div><Label className="label-caps">Città*</Label><Input value={form.city || ""} onChange={(e) => setForm({ ...form, city: e.target.value })} className="mt-1 rounded-sm h-10" /></div>
-            <div><Label className="label-caps">Provincia (sigla, es. MI)</Label><Input maxLength={2} value={form.province || ""} onChange={(e) => setForm({ ...form, province: e.target.value.toUpperCase() })} className="mt-1 rounded-sm h-10" /></div>
+            <div>
+              <Label className="label-caps">Nazione*</Label>
+              <Select value={cc} onValueChange={handleCountryChange}>
+                <SelectTrigger className="mt-1 rounded-sm h-10 bg-white"><SelectValue /></SelectTrigger>
+                <SelectContent className="max-h-64">
+                  {COUNTRIES.map(c => (
+                    <SelectItem key={c.code} value={c.code}>{c.name} ({c.code})</SelectItem>
+                  ))}
+                </SelectContent>
+              </Select>
+            </div>
+            <div>
+              <Label className="label-caps">
+                CAP / ZIP Code*
+                <FieldTooltip text="Inserisci il codice postale della località (es. 20121 per Italia, 98052 per USA, D02 XY45 per Irlanda)." />
+              </Label>
+              <Input value={form.postal_code || ""} onChange={(e) => setForm({ ...form, postal_code: e.target.value })} onBlur={(e) => lookupCap(e.target.value)} className="mt-1 rounded-sm h-10" />
+            </div>
+            <div className={showProvince ? "" : "sm:col-span-2"}><Label className="label-caps">Città*</Label><Input value={form.city || ""} onChange={(e) => setForm({ ...form, city: e.target.value })} className="mt-1 rounded-sm h-10" /></div>
+            {showProvince && (
+              <div>
+                <Label className="label-caps">
+                  Stato / Provincia (2 lettere)
+                  <FieldTooltip text="Obbligatorio per USA (es. WA, NY, CA), Canada (es. ON), Australia (es. NSW) e consigliato per Italia (es. MI)." />
+                </Label>
+                <Input maxLength={2} value={form.province || ""} onChange={(e) => setForm({ ...form, province: e.target.value.toUpperCase() })} className="mt-1 rounded-sm h-10" placeholder={cc === "IT" ? "MI" : "WA"} />
+              </div>
+            )}
             <div><Label className="label-caps">Referente</Label><Input value={form.reference || ""} onChange={(e) => setForm({ ...form, reference: e.target.value })} className="mt-1 rounded-sm h-10" /></div>
             <div><Label className="label-caps">Email</Label><Input value={form.email || ""} onChange={(e) => setForm({ ...form, email: e.target.value })} className="mt-1 rounded-sm h-10" /></div>
             <div className="sm:col-span-2"><Label className="label-caps">Telefono</Label><Input value={form.phone || ""} onChange={(e) => setForm({ ...form, phone: e.target.value })} className="mt-1 rounded-sm h-10" /></div>
