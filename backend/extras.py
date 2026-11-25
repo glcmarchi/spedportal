@@ -11,6 +11,7 @@ from reportlab.pdfgen import canvas
 from reportlab.lib.units import mm
 from reportlab.lib import colors as rl_colors
 from server import db, require_admin, require_approved, now_iso, new_id, tenant_filter
+from carriers.fedex import validate_fedex_postal
 
 extra_router = APIRouter(prefix="/api")
 
@@ -207,7 +208,6 @@ async def manifest_pdf(mid: str, user=Depends(require_approved)):
     c.showPage(); c.save(); buf.seek(0)
     return StreamingResponse(buf, media_type="application/pdf", headers={"Content-Disposition": f"attachment; filename={m['number']}.pdf"})
 
-# Mappa prefissi CAP -> Sigla Provincia italiana (2 lettere)
 IT_PROV_PREFIX = {
     "00": "RM", "01": "VT", "02": "RI", "03": "FR", "04": "LT", "05": "TR", "06": "PG",
     "07": "SS", "08": "NU", "09": "CA", "10": "TO", "11": "AO", "12": "CN", "13": "VC",
@@ -223,6 +223,16 @@ IT_PROV_PREFIX = {
     "83": "AV", "84": "SA", "85": "PZ", "86": "CB", "87": "CS", "88": "CZ", "89": "RC",
     "90": "PA", "91": "TP", "92": "AG", "93": "CL", "94": "EN", "95": "CT", "96": "SR",
     "97": "RG", "98": "ME",
+}
+
+IE_EIRCODE_AREAS = {
+    "D01": "Dublin 1", "D02": "Dublin 2", "D03": "Dublin 3", "D04": "Dublin 4",
+    "D05": "Dublin 5", "D06": "Dublin 6", "D07": "Dublin 7", "D08": "Dublin 8",
+    "D09": "Dublin 9", "D10": "Dublin 10", "D11": "Dublin 11", "D12": "Dublin 12",
+    "D13": "Dublin 13", "D14": "Dublin 14", "D15": "Dublin 15", "D16": "Dublin 16",
+    "D17": "Dublin 17", "D18": "Dublin 18", "D20": "Dublin 20", "D22": "Dublin 22",
+    "D24": "Dublin 24", "A94": "Blackrock", "A96": "Dun Laoghaire", "A98": "Bray",
+    "T12": "Cork", "T23": "Cork", "V94": "Limerick", "H91": "Galway", "X91": "Waterford",
 }
 
 def _it_province_from_cap(cap: str) -> str:
@@ -246,27 +256,51 @@ async def geo_lookup(country: str = "IT", cap: str = ""):
     country = (country or "IT").upper().strip()
     cap = (cap or "").strip().upper()
     if not cap:
-        return {"country": country, "cap": cap, "city": None, "province": None}
+        return {"country": country, "cap": cap, "city": None, "province": None, "valid": True}
 
     it_prov = _it_province_from_cap(cap) if country == "IT" else ""
     city = None
     ext_prov = ""
+    valid = True
 
-    try:
-        zippo_cc = "gb" if country == "UK" else country.lower()
-        async with httpx.AsyncClient(timeout=4.0) as client:
-            r = await client.get(f"https://api.zippopotam.us/{zippo_cc}/{cap}")
-            if r.status_code == 200:
-                places = r.json().get("places") or []
-                if places:
-                    p0 = places[0]
-                    city = p0.get("place name")
-                    ext_prov = (p0.get("state abbreviation") or "")[:2].upper()
-    except Exception:
-        pass
+    # 1. Validazione CAP ufficiale tramite FedEx Postal Code Validation API
+    fx_postal = await validate_fedex_postal(country, cap, it_prov)
+    if fx_postal is not None:
+        valid = fx_postal.get("valid", True)
+        if fx_postal.get("cleaned_postal_code"):
+            cap = fx_postal["cleaned_postal_code"]
+        if fx_postal.get("province") and country in ("IT", "US", "CA", "AU"):
+            ext_prov = fx_postal["province"]
 
-    final_prov = it_prov or (ext_prov if country != "IT" else "")
-    return {"country": country, "cap": cap, "city": city, "province": final_prov or None}
+    # 2. Risoluzione nome città (Eircode irlandese, Zippopotam internazionale)
+    if country == "IE":
+        routing_key = cap.replace(" ", "")[:3]
+        if routing_key in IE_EIRCODE_AREAS:
+            city = IE_EIRCODE_AREAS[routing_key]
+    if not city:
+        try:
+            zippo_cc = "gb" if country == "UK" else country.lower()
+            query_cap = cap.split("-")[0].strip() if country in ("US", "PL") else cap
+            async with httpx.AsyncClient(timeout=4.0) as client:
+                r = await client.get(f"https://api.zippopotam.us/{zippo_cc}/{query_cap}")
+                if r.status_code == 200:
+                    places = r.json().get("places") or []
+                    if places:
+                        p0 = places[0]
+                        city = p0.get("place name")
+                        if not ext_prov and country in ("US", "CA", "AU"):
+                            ext_prov = (p0.get("state abbreviation") or "")[:2].upper()
+        except Exception:
+            pass
+
+    final_prov = (it_prov or ext_prov) if country in ("IT", "US", "CA", "AU") else ""
+    return {
+        "country": country,
+        "cap": cap,
+        "city": city,
+        "province": final_prov or None,
+        "valid": valid,
+    }
 
 class CustomTopUpInput(BaseModel):
     amount: float = Field(gt=0, le=100000); method: str; origin_url: str
