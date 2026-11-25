@@ -12,7 +12,9 @@ import { ArrowLeft, Printer, ArrowsClockwise, MapPin, Clock, XCircle, Truck, Che
 
 export default function ShipmentDetail() {
   const { id } = useParams();
-  const { refresh } = useAuth();
+  const { user, refresh } = useAuth();
+  const isResellerOrAdmin = ["reseller_admin", "super_admin", "admin"].includes(user?.role);
+
   const [s, setS] = useState(null);
   const [syncing, setSyncing] = useState(false);
   const [cancelling, setCancelling] = useState(false);
@@ -213,13 +215,31 @@ export default function ShipmentDetail() {
       </div>
 
       <div className="bg-white border border-slate-200 rounded-sm p-6">
-        <h3 className="text-lg font-bold tracking-tight mb-4" style={{ fontFamily: "Chivo" }}>Colli & Dettagli</h3>
+        <h3 className="text-lg font-bold tracking-tight mb-4" style={{ fontFamily: "Chivo" }}>Colli & Dettaglio Costi</h3>
         <div className="grid grid-cols-2 sm:grid-cols-4 gap-4 text-sm">
           <Kv k="Tipo" v={s.parcel_type} />
           <Kv k="Peso tassato" v={`${s.billed_weight} kg`} />
           <Kv k="Zona" v={s.zone} />
-          <Kv k="Prezzo" v={`€ ${s.price.toFixed(2)}`} />
+          <Kv k="Prezzo Totale" v={`€ ${s.price.toFixed(2)}`} />
         </div>
+
+        {isResellerOrAdmin && s.reseller_base_freight !== undefined && (
+          <div className="mt-4 bg-slate-50 border border-slate-200 rounded-sm p-3.5 text-xs space-y-1.5">
+            <div className="flex flex-wrap gap-x-6 gap-y-1 text-sm">
+              <span>Nolo base: <b className="text-slate-900">€ {Number(s.reseller_base_freight).toFixed(2)}</b></span>
+              <span>Supplementi totali: <b className="text-slate-900">€ {Number(s.reseller_surcharges_total || 0).toFixed(2)}</b></span>
+              <span>Totale spedizione: <b className="text-orange-600">€ {Number(s.price).toFixed(2)}</b></span>
+            </div>
+            {s.reseller_surcharge_items?.length > 0 && (
+              <div className="flex flex-wrap gap-x-4 gap-y-1 text-slate-500 pt-1 border-t border-slate-200">
+                {s.reseller_surcharge_items.map((sc, idx) => (
+                  <span key={idx}>• {sc.label}: € {Number(sc.amount).toFixed(2)}</span>
+                ))}
+              </div>
+            )}
+          </div>
+        )}
+
         <div className="mt-4 border-t border-slate-100 pt-4">
           <table className="w-full text-sm">
             <thead className="text-left label-caps">
@@ -296,7 +316,7 @@ function Card({ title, data }) {
       <div className="label-caps mb-3">{title}</div>
       <div className="font-bold text-slate-900">{data.company_name}</div>
       <div className="text-sm text-slate-700 mt-1">{data.address}</div>
-      <div className="text-sm text-slate-700">{data.postal_code} {data.city} · {data.country}</div>
+      <div className="text-sm text-slate-700">{data.postal_code} {data.city} {data.province ? `(${data.province})` : ""} · {data.country}</div>
     </div>
   );
 }
