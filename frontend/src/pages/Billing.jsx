@@ -7,20 +7,30 @@ import { DownloadSimple, Wallet, Receipt } from "@phosphor-icons/react";
 
 export default function Billing() {
   const { user } = useAuth();
+  const isSubClient = user?.role === "user";
   const [invs, setInvs] = useState([]);
   const [bal, setBal] = useState(null);
 
   useEffect(() => {
     api.get("/invoices").then(r => setInvs(r.data)).catch(() => {});
-    if (user?.billing_type === "prepaid") {
+    if (isSubClient && user?.billing_type === "prepaid") {
       api.get("/wallet/balance").then(r => setBal(r.data)).catch(() => {});
     }
-  }, [user]);
+  }, [user, isSubClient]);
 
   const downloadPdf = async (inv) => {
     const r = await api.get(`/invoices/${inv.id}/pdf`, { responseType: "blob" });
     const url = URL.createObjectURL(r.data);
     const a = document.createElement("a"); a.href = url; a.download = `${inv.invoice_number}.pdf`; a.click(); URL.revokeObjectURL(url);
+  };
+
+  const ledgerLabel = (l) => {
+    if (l.note) return l.note;
+    if (l.type === "reseller_topup") return "Accredito da Agenzia";
+    if (l.type === "reseller_adjustment") return "Rettifica da Agenzia";
+    if (l.type === "topup") return "Ricarica Online";
+    if (l.type === "shipment_refund") return "Rimborso Annullamento";
+    return "Addebito Spedizione";
   };
 
   return (
@@ -30,7 +40,7 @@ export default function Billing() {
         <h1 className="text-4xl font-black tracking-tighter text-slate-900" style={{ fontFamily: "Chivo" }}>Fatturazione</h1>
       </div>
 
-      {user?.billing_type === "prepaid" && (
+      {isSubClient && user?.billing_type === "prepaid" && (
         <div className="bg-slate-900 text-white rounded-sm p-6 flex flex-col sm:flex-row items-start sm:items-center justify-between gap-4">
           <div>
             <div className="label-caps text-slate-400 mb-1">Modalità Prepagato · Credito residuo</div>
@@ -44,21 +54,21 @@ export default function Billing() {
         </div>
       )}
 
-      {user?.billing_type === "prepaid" && bal?.ledger?.length > 0 && (
+      {isSubClient && user?.billing_type === "prepaid" && bal?.ledger?.length > 0 && (
         <div className="bg-white border border-slate-200 rounded-sm">
-          <div className="px-5 py-4 border-b border-slate-200"><h2 className="text-lg font-bold tracking-tight" style={{ fontFamily: "Chivo" }}>Movimenti Credito</h2></div>
+          <div className="px-5 py-4 border-b border-slate-200"><h2 className="text-lg font-bold tracking-tight" style={{ fontFamily: "Chivo" }}>Storico Movimenti Credito</h2></div>
           <div className="overflow-x-auto">
             <table className="w-full text-sm">
               <thead className="bg-slate-50 border-b border-slate-200">
-                <tr className="text-left label-caps"><th className="px-5 py-3">Data</th><th className="px-5 py-3">Tipo</th><th className="px-5 py-3 text-right">Importo</th></tr>
+                <tr className="text-left label-caps"><th className="px-5 py-3">Data</th><th className="px-5 py-3">Causale / Dettaglio</th><th className="px-5 py-3 text-right">Importo</th></tr>
               </thead>
               <tbody>
                 {bal.ledger.map(l => (
                   <tr key={l.id} className="border-b border-slate-100">
-                    <td className="px-5 py-2.5 text-xs">{l.created_at?.slice(0, 19).replace("T", " ")}</td>
-                    <td className="px-5 py-2.5 font-semibold">{l.type === "topup" ? "Ricarica" : "Spedizione"}</td>
+                    <td className="px-5 py-2.5 text-xs font-mono text-slate-500">{l.created_at?.slice(0, 19).replace("T", " ")}</td>
+                    <td className="px-5 py-2.5 font-semibold">{ledgerLabel(l)}</td>
                     <td className={`px-5 py-2.5 text-right font-mono font-bold ${l.amount > 0 ? "text-green-600" : "text-slate-900"}`}>
-                      {l.amount > 0 ? "+" : ""}€ {l.amount.toFixed(2)}
+                      {l.amount > 0 ? "+" : ""}€ {Number(l.amount || 0).toFixed(2)}
                     </td>
                   </tr>
                 ))}
