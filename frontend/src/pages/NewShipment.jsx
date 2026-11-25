@@ -1,4 +1,4 @@
-import React, { useState, useEffect } from "react";
+import React, { useState, useEffect, useMemo } from "react";
 import { useNavigate } from "react-router-dom";
 import { api } from "@/lib/api";
 import { useAuth } from "@/lib/auth";
@@ -13,6 +13,7 @@ import { toast } from "sonner";
 import {
   ArrowLeft, ArrowRight, Package, Plus, X, Printer, CheckCircle,
   User, AddressBook, Question, UploadSimple, Warning, FloppyDisk, Eraser,
+  MagnifyingGlass, Clock,
 } from "@phosphor-icons/react";
 
 export const COUNTRIES = [
@@ -116,6 +117,8 @@ export default function NewShipment() {
   const [chosen, setChosen] = useState(null);
   const [addrCheck, setAddrCheck] = useState(null);
   const [checkingAddr, setCheckingAddr] = useState(false);
+  const [transitInfo, setTransitInfo] = useState(null);
+  const [loadingTransit, setLoadingTransit] = useState(false);
   const [loading, setLoading] = useState(false);
   const [created, setCreated] = useState(null);
   const [addressbook, setAddressbook] = useState([]);
@@ -184,6 +187,22 @@ export default function NewShipment() {
     }
   };
 
+  const handleCheckTransit = async () => {
+    setLoadingTransit(true);
+    try {
+      const r = await api.post("/shipments/transit-times", buildBody());
+      const list = r.data?.services || [];
+      setTransitInfo(list);
+      if (list.length === 0) {
+        toast.info("Nessun dettaglio cut-off aggiuntivo restituito per questa tratta.");
+      }
+    } catch {
+      toast.error("Errore verifica tempi di resa");
+    } finally {
+      setLoadingTransit(false);
+    }
+  };
+
   const handlePdfUpload = async (fieldPrefix, file) => {
     if (!file) return;
     if (file.size > 5 * 1024 * 1024) {
@@ -223,7 +242,7 @@ export default function NewShipment() {
       toast.error("Inserisci un valore doganale dichiarato maggiore di 0");
       return;
     }
-    setLoading(true); setChosen(null); setAddrCheck(null);
+    setLoading(true); setChosen(null); setAddrCheck(null); setTransitInfo(null);
     try {
       const r = await api.post("/shipments/quote", buildBody());
       setQuotes(r.data); setStep(4);
@@ -446,390 +465,13 @@ export default function NewShipment() {
                   <Popover>
                     <PopoverTrigger asChild>
                       <button type="button" className="inline-flex items-center gap-1 text-xs font-bold bg-amber-100 hover:bg-amber-200 text-amber-900 px-3 py-1.5 rounded-sm shrink-0">
-                        <Question size={16} weight="fill" /> Guida Dogana & DAP/DDP
+                        <Question size={16} weight="fill" /> Guida Dogana, HS & EORI
                       </button>
                     </PopoverTrigger>
-                    <PopoverContent align="end" className="w-96 text-xs space-y-2 p-4 rounded-sm">
-                      <div className="font-bold text-slate-900 text-sm">Documenti & Termini di Resa Extra-UE</div>
+                    <PopoverContent align="end" className="w-[26rem] text-xs space-y-2 p-4 rounded-sm leading-relaxed">
+                      <div className="font-bold text-slate-900 text-sm">Guida Documenti & Dati Doganali Extra-UE</div>
                       <p><b>• DAP (Delivered At Place):</b> dazi e IVA d'importazione sono pagati dal <b>destinatario</b> alla consegna.</p>
                       <p><b>• DDP (Delivered Duty Paid):</b> dazi e IVA d'importazione sono addebitati al <b>mittente</b> (richiede abilitazione espressa).</p>
-                      <p><b>• Fattura Commerciale o Proforma (Obbligatoria):</b> indica valore della merce, valuta, codice doganale (HS Code), paese d'origine e causale.</p>
-                      <p><b>• DAE:</b> obbligatorio se il valore esportato supera i <b>1.000 €</b>.</p>
-                    </PopoverContent>
-                  </Popover>
-                </div>
-
-                <div className="grid gap-3 sm:grid-cols-2">
-                  <div className="sm:col-span-2">
-                    <Label className="label-caps">Termini di Resa Doganale (Incoterms)*</Label>
-                    <Select value={customs.incoterms} onValueChange={(v) => setCustoms({ ...customs, incoterms: v })}>
-                      <SelectTrigger className="mt-1 rounded-sm h-10 bg-white"><SelectValue /></SelectTrigger>
-                      <SelectContent>
-                        <SelectItem value="DAP">DAP — Dazi e oneri doganali a carico del Destinatario</SelectItem>
-                        {allowDdp && <SelectItem value="DDP">DDP — Dazi e oneri doganali a carico del Mittente</SelectItem>}
-                      </SelectContent>
-                    </Select>
-                    {!allowDdp && (
-                      <div className="text-[11px] text-slate-500 mt-1">Resa DDP disabilitata di default: per spedire in DDP richiedi l'abilitazione all'amministratore.</div>
-                    )}
-                  </div>
-
-                  <div>
-                    <Label className="label-caps">Fattura Proforma / Commerciale (PDF)*</Label>
-                    <label className="mt-1 flex items-center justify-between gap-2 border border-slate-300 bg-white hover:bg-slate-50 rounded-sm h-10 px-3 cursor-pointer text-xs">
-                      <span className="truncate font-medium text-slate-700">
-                        {customs.proforma_name || "Carica PDF Proforma / Commerciale…"}
-                      </span>
-                      <UploadSimple size={16} className="text-orange-600 shrink-0" />
-                      <input type="file" accept=".pdf,application/pdf" onChange={(e) => handlePdfUpload("proforma", e.target.files?.[0])} className="hidden" />
-                    </label>
-                  </div>
-
-                  <div>
-                    <Label className="label-caps">DAE (PDF — Obbligatorio oltre € 1.000)</Label>
-                    <label className="mt-1 flex items-center justify-between gap-2 border border-slate-300 bg-white hover:bg-slate-50 rounded-sm h-10 px-3 cursor-pointer text-xs">
-                      <span className="truncate font-medium text-slate-700">
-                        {customs.dae_name || "Carica PDF DAE (se previsto)…"}
-                      </span>
-                      <UploadSimple size={16} className="text-orange-600 shrink-0" />
-                      <input type="file" accept=".pdf,application/pdf" onChange={(e) => handlePdfUpload("dae", e.target.files?.[0])} className="hidden" />
-                    </label>
-                  </div>
-
-                  <div>
-                    <Label className="label-caps">Valore Doganale Dichiarato*</Label>
-                    <div className="flex gap-2 mt-1">
-                      <Select value={customs.customs_currency} onValueChange={(v) => setCustoms({ ...customs, customs_currency: v })}>
-                        <SelectTrigger className="w-28 rounded-sm h-10 bg-white text-xs font-bold"><SelectValue /></SelectTrigger>
-                        <SelectContent>
-                          <SelectItem value="EUR">EUR (€)</SelectItem>
-                          <SelectItem value="USD">USD ($)</SelectItem>
-                          <SelectItem value="GBP">GBP (£)</SelectItem>
-                          <SelectItem value="CHF">CHF</SelectItem>
-                        </SelectContent>
-                      </Select>
-                      <Input type="number" min="1" step="0.01" value={customs.customs_value} onChange={(e) => setCustoms({ ...customs, customs_value: Math.max(0, parseFloat(e.target.value) || 0) })} className="rounded-sm h-10 bg-white flex-1" />
-                    </div>
-                  </div>
-
-                  <div>
-                    <Label className="label-caps">Codice Doganale HS Code (6-10 cifre)</Label>
-                    <Input value={customs.hs_code} onChange={(e) => setCustoms({ ...customs, hs_code: e.target.value })} className="mt-1 rounded-sm h-10 bg-white" placeholder="es. 850440 (consigliato per USA/UK)" />
-                  </div>
-
-                  <div className="sm:col-span-2">
-                    <Label className="label-caps">Codice EORI Mittente (opzionale per privati, richiesto per aziende)</Label>
-                    <Input value={customs.eori_number} onChange={(e) => setCustoms({ ...customs, eori_number: e.target.value.toUpperCase() })} className="mt-1 rounded-sm h-10 bg-white" placeholder="es. IT12345678901" />
-                  </div>
-                </div>
-              </div>
-            ) : (
-              <div className="text-xs text-slate-500 bg-slate-50 border border-slate-200 rounded-sm p-3">
-                Destinazione <b>{destCountry}</b> (Italia / Unione Europea): nessun documento doganale richiesto.
-              </div>
-            )}
-          </div>
-        )}
-
-        {step === 4 && quotes && (
-          <div className="space-y-4">
-            <h2 className="text-2xl font-bold tracking-tight" style={{ fontFamily: "Chivo" }}>Preventivo</h2>
-            <div className="text-sm text-slate-600">Macro-Zona: <b>{quotes.zone}</b> · Peso tassato: <b>{quotes.billed_weight} kg</b></div>
-            {quotes.quotes.map((q, i) => {
-              const key = getOptKey(q);
-              const isSelected = chosen && getOptKey(chosen) === key;
-              return (
-                <div key={key} onClick={() => handleSelectCarrier(q)}
-                  className={`bg-white border rounded-sm p-4 cursor-pointer transition-all hover:shadow-md ${isSelected ? "border-l-[3px] border-orange-600 border-y border-r border-slate-200" : "border-slate-200"}`}>
-                  <div className="flex items-center gap-4">
-                    <div className="w-14 h-14 rounded-sm flex items-center justify-center font-black text-white shrink-0" style={{ backgroundColor: q.color, fontFamily: "Chivo" }}>
-                      {q.carrier_name.slice(0, 3).toUpperCase()}
-                    </div>
-                    <div className="flex-1 min-w-0">
-                      <div className="flex items-center gap-2 flex-wrap">
-                        <span className="font-bold text-slate-900">{q.carrier_name}</span>
-                        {isResellerOrAdmin && q.is_live && (
-                          <span className="text-[10px] font-bold bg-green-100 text-green-800 px-1.5 py-0.5 rounded-sm">TARIFFA API REALE</span>
-                        )}
-                        {isResellerOrAdmin && q.contract_owner && (
-                          <span className={`text-[10px] font-bold px-1.5 py-0.5 rounded-sm ${q.contract_owner === "admin" ? "bg-orange-100 text-orange-800" : "bg-blue-100 text-blue-800"}`}>
-                            {q.contract_owner === "admin" ? "Codice Piattaforma" : "Tuo Codice"}
-                          </span>
-                        )}
-                      </div>
-                      <div className="text-xs text-slate-500">
-                        Consegna stimata: {q.transit_days} {q.transit_days === 1 ? "giorno" : "giorni"} lav.
-                        {q.service_type && <span className="ml-2 font-mono text-[10px] text-slate-400">({q.service_type})</span>}
-                      </div>
-                      {i === 0 && <div className="mt-1 label-caps text-orange-600">Miglior prezzo</div>}
-                    </div>
-                    <div className="text-right">
-                      <div className="text-2xl font-black text-slate-900" style={{ fontFamily: "Chivo" }}>€ {q.price.toFixed(2)}</div>
-                      <div className="text-[10px] text-slate-400">IVA esclusa</div>
-                    </div>
-                  </div>
-
-                  {isResellerOrAdmin && q.reseller_base_freight !== undefined && (
-                    <div className="mt-3 pt-3 border-t border-slate-100 text-xs text-slate-600 bg-slate-50/70 px-3 py-2 rounded-sm">
-                      <div className="flex flex-wrap gap-x-4 gap-y-1">
-                        <span>Nolo base: <b className="text-slate-900">€ {q.reseller_base_freight.toFixed(2)}</b></span>
-                        <span>Supplementi totali: <b className="text-slate-900">€ {(q.reseller_surcharges_total ?? 0).toFixed(2)}</b></span>
-                        {q.reseller_surcharge_items?.map((sc, idx) => (
-                          <span key={idx} className="text-slate-500">
-                            • {sc.label}: € {sc.amount.toFixed(2)}
-                          </span>
-                        ))}
-                      </div>
-                    </div>
-                  )}
-                </div>
-              );
-            })}
-
-            {checkingAddr && (
-              <div className="text-xs text-slate-500 bg-slate-50 border border-slate-200 rounded-sm p-3">
-                Verifica indirizzo destinatario su database FedEx in corso…
-              </div>
-            )}
-            {addrCheck && addrCheck.supported && (
-              <div className={`border rounded-sm p-3.5 text-xs space-y-1 ${addrCheck.resolved ? "bg-blue-50/60 border-blue-200 text-blue-900" : "bg-amber-50 border-amber-300 text-amber-900"}`}>
-                <div className="font-bold flex items-center gap-1.5">
-                  <Warning size={15} weight="fill" />
-                  Verifica Indirizzo FedEx: {addrCheck.resolved ? "Indirizzo Riconosciuto" : "Indirizzo da verificare"}
-                </div>
-                {addrCheck.classification && addrCheck.classification !== "UNKNOWN" && (
-                  <div>
-                    Tipologia rilevata: <b>{addrCheck.classification === "RESIDENTIAL" ? "RESIDENZIALE (Privato)" : "AZIENDA / COMMERCIALE"}</b>
-                    {addrCheck.is_residential && !services.residential_delivery && (
-                      <span className="text-amber-800 font-semibold"> — Nota: FedEx classifica questo civico come residenziale e potrebbe applicare il supplemento consegna privato.</span>
-                    )}
-                  </div>
-                )}
-                {addrCheck.messages?.map((m, idx) => <div key={idx}>• {m}</div>)}
-              </div>
-            )}
-          </div>
-        )}
-
-        {step === 5 && created && (
-          <div className="space-y-6 text-center py-6">
-            <div className="w-16 h-16 mx-auto rounded-sm bg-green-100 flex items-center justify-center"><CheckCircle size={32} weight="fill" className="text-green-600" /></div>
-            <div>
-              <h2 className="text-3xl font-black tracking-tight" style={{ fontFamily: "Chivo" }}>Spedizione creata!</h2>
-              <p className="text-slate-600 mt-1">Tracking: <span className="font-mono font-bold">{created.tracking_number}</span></p>
-              <p className="text-slate-600">Corriere: <b>{created.carrier_name}</b> · <b>€ {created.price.toFixed(2)}</b></p>
-            </div>
-
-            {created.customs?.required && (
-              <div className={`max-w-xl mx-auto text-left border rounded-sm p-4 text-xs ${created.customs?.paperless_ok ? "bg-green-50 border-green-200 text-green-900" : "bg-amber-50 border-amber-300 text-amber-900"}`}>
-                {created.customs?.paperless_ok ? (
-                  <div>
-                    <b>Dogana Elettronica (Paperless ETD) attiva:</b> i documenti PDF sono stati trasmessi elettronicamente al corriere.
-                  </div>
-                ) : (
-                  <div>
-                    <b>Attenzione — Documentazione Cartacea Richiesta:</b> per questa destinazione o corriere l'invio doganale elettronico (Paperless) non è disponibile. Nonostante il caricamento dei file, è <b>obbligatorio stampare e allegare fisicamente 3 copie della Fattura Proforma/Commerciale (e DAE se presente)</b> nella busta portadocumenti sul collo.
-                  </div>
-                )}
-              </div>
-            )}
-
-            <div className="flex gap-3 justify-center flex-wrap">
-              <Button onClick={downloadLabel} className="bg-orange-600 hover:bg-orange-700 rounded-sm h-11"><Printer size={16} className="mr-2" /> Stampa Etichetta</Button>
-              <Button variant="outline" onClick={() => nav("/shipments")} className="rounded-sm h-11">Vai a Spedizioni</Button>
-            </div>
-          </div>
-        )}
-      </div>
-
-      {step < 5 && (
-        <div className="flex justify-between">
-          <Button variant="outline" onClick={() => setStep(Math.max(0, step - 1))} disabled={step === 0} className="rounded-sm"><ArrowLeft size={16} className="mr-2" /> Indietro</Button>
-          {step < 3 && <Button disabled={!canNext()} onClick={() => setStep(step + 1)} className="bg-orange-600 hover:bg-orange-700 rounded-sm">Avanti <ArrowRight size={16} className="ml-2" /></Button>}
-          {step === 3 && <Button disabled={loading} onClick={fetchQuotes} className="bg-orange-600 hover:bg-orange-700 rounded-sm">{loading ? "Calcolo…" : "Calcola tariffe"} <ArrowRight size={16} className="ml-2" /></Button>}
-          {step === 4 && <Button disabled={!chosen || loading} onClick={confirm} className="bg-orange-600 hover:bg-orange-700 rounded-sm">{loading ? "Creazione…" : "Conferma & Crea"} <Package size={16} className="ml-2" weight="fill" /></Button>}
-        </div>
-      )}
-    </div>
-  );
-}
-
-export function FieldTooltip({ text }) {
-  return (
-    <Popover>
-      <PopoverTrigger asChild>
-        <button type="button" className="inline-flex items-center text-slate-400 hover:text-orange-600 ml-1 align-middle" title="Info campo">
-          <Question size={14} weight="fill" />
-        </button>
-      </PopoverTrigger>
-      <PopoverContent className="w-72 text-xs p-3 rounded-sm text-slate-700 leading-relaxed">
-        {text}
-      </PopoverContent>
-    </Popover>
-  );
-}
-
-function AddressForm({ title, data, setData, addressbook = [], onClient, onSavedToBook, canSaveToBook }) {
-  const [savingBook, setSavingBook] = useState(false);
-  const set = (k) => (e) => setData({ ...data, [k]: e.target.value });
-  const cc = (data.country || "IT").toUpperCase();
-  const showProvince = PROVINCE_COUNTRIES.has(cc);
-
-  const pickFromBook = (b) => setData({
-    company_name: b.company_name,
-    address: b.address,
-    postal_code: b.postal_code,
-    city: b.city,
-    province: b.province || "",
-    country: b.country,
-    reference: b.reference || "",
-    email: b.email || "",
-    phone: b.phone || "",
-  });
-
-  const saveCurrentToBook = async () => {
-    if (!data.company_name || !data.address || !data.postal_code || !data.city) {
-      toast.error("Compila almeno Ragione Sociale, Indirizzo, CAP e Città prima di salvare in rubrica");
-      return;
-    }
-    setSavingBook(true);
-    try {
-      await api.post("/addressbook", {
-        label: data.city,
-        company_name: data.company_name,
-        address: data.address,
-        postal_code: data.postal_code,
-        city: data.city,
-        province: data.province || "",
-        country: cc,
-        reference: data.reference || "",
-        email: data.email || "",
-        phone: data.phone || "",
-      });
-      toast.success("Indirizzo salvato in rubrica!");
-      if (onSavedToBook) onSavedToBook();
-    } catch (err) {
-      toast.error(err?.response?.data?.detail || "Errore salvataggio in rubrica");
-    } finally {
-      setSavingBook(false);
-    }
-  };
-
-  const clearForm = () => setData({ ...emptyAddr });
-
-  const handleCountryChange = (newCountry) => {
-    const up = newCountry.toUpperCase();
-    setData(d => ({
-      ...d,
-      country: up,
-      province: PROVINCE_COUNTRIES.has(up) ? d.province : "",
-    }));
-  };
-
-  const lookupCap = async (cap) => {
-    if (!cap) return;
-    try {
-      const r = await api.get(`/geo/lookup?country=${cc}&cap=${encodeURIComponent(cap)}`);
-      if (r.data.valid === false) {
-        toast.warning(`Il CAP "${cap}" non risulta valido per ${cc}`);
-      }
-      if (r.data.city || r.data.province) {
-        setData(d => ({
-          ...d,
-          postal_code: r.data.cap || d.postal_code,
-          city: r.data.city || d.city,
-          province: PROVINCE_COUNTRIES.has(cc) ? (r.data.province || d.province) : "",
-        }));
-      }
-    } catch {}
-  };
-
-  return (
-    <div className="space-y-5">
-      <div className="flex items-center justify-between flex-wrap gap-2">
-        <h2 className="text-2xl font-bold tracking-tight" style={{ fontFamily: "Chivo" }}>{title}</h2>
-        <div className="flex gap-2 flex-wrap">
-          {onClient && (
-            <button type="button" onClick={onClient} className="inline-flex items-center gap-1 px-3 h-9 bg-slate-100 hover:bg-slate-200 rounded-sm text-xs font-semibold">
-              <User size={14} weight="fill" /> Il mio indirizzo
-            </button>
-          )}
-          <Popover>
-            <PopoverTrigger asChild>
-              <button type="button" className="inline-flex items-center gap-1 px-3 h-9 bg-slate-100 hover:bg-slate-200 rounded-sm text-xs font-semibold">
-                <AddressBook size={14} weight="fill" /> Rubrica
-              </button>
-            </PopoverTrigger>
-            <PopoverContent className="w-80 p-0 rounded-sm max-h-80 overflow-y-auto">
-              {addressbook.length === 0 && <div className="p-4 text-sm text-slate-500">Rubrica vuota.</div>}
-              {addressbook.map(b => (
-                <button type="button" key={b.id} onClick={() => pickFromBook(b)} className="block w-full text-left p-3 border-b border-slate-100 hover:bg-orange-50 text-sm">
-                  <div className="font-semibold">{b.company_name} {b.label && <span className="text-xs text-slate-400">({b.label})</span>}</div>
-                  <div className="text-xs text-slate-500">{b.address} · {b.postal_code} {b.city} {b.province} {b.country}</div>
-                </button>
-              ))}
-            </PopoverContent>
-          </Popover>
-          {canSaveToBook && (
-            <button type="button" onClick={saveCurrentToBook} disabled={savingBook}
-              className="inline-flex items-center gap-1 px-3 h-9 bg-orange-50 hover:bg-orange-100 text-orange-800 border border-orange-200 rounded-sm text-xs font-semibold">
-              <FloppyDisk size={14} weight="fill" /> {savingBook ? "Salvataggio…" : "Salva in rubrica"}
-            </button>
-          )}
-          <button type="button" onClick={clearForm}
-            className="inline-flex items-center gap-1 px-3 h-9 bg-white hover:bg-red-50 text-slate-600 hover:text-red-700 border border-slate-200 rounded-sm text-xs font-semibold">
-            <Eraser size={14} /> Svuota
-          </button>
-        </div>
-      </div>
-
-      <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
-        <Field label="Ragione Sociale" required><Input value={data.company_name} onChange={set("company_name")} className="rounded-sm h-11" /></Field>
-        <Field label="Riferimento (opzionale)"><Input value={data.reference} onChange={set("reference")} className="rounded-sm h-11" /></Field>
-        <Field label="Indirizzo" required className="sm:col-span-2"><Input value={data.address} onChange={set("address")} className="rounded-sm h-11" /></Field>
-        <Field label="Nazione" required>
-          <Select value={cc} onValueChange={handleCountryChange}>
-            <SelectTrigger className="rounded-sm h-11 bg-white"><SelectValue placeholder="Seleziona nazione" /></SelectTrigger>
-            <SelectContent className="max-h-72">
-              {COUNTRIES.map(c => (
-                <SelectItem key={c.code} value={c.code}>{c.name} ({c.code})</SelectItem>
-              ))}
-            </SelectContent>
-          </Select>
-        </Field>
-        <Field
-          label="CAP / ZIP Code"
-          required
-          tooltip="Inserisci solo il codice postale numerico o alfanumerico della località (es. 20121 per Italia, 98052 per USA, D02 XY45 per Irlanda). Non inserire qui la sigla dello Stato."
-        >
-          <Input value={data.postal_code} onChange={set("postal_code")} onBlur={(e) => lookupCap(e.target.value)} className="rounded-sm h-11" placeholder={cc === "IE" ? "es. D02 XY45" : cc === "US" ? "es. 98052" : "es. 20121"} />
-        </Field>
-        <Field label="Città" required className={showProvince ? "" : "sm:col-span-2"}><Input value={data.city} onChange={set("city")} className="rounded-sm h-11" /></Field>
-        {showProvince && (
-          <Field
-            label={cc === "IT" ? "Provincia (sigla 2 lettere)" : "Stato / Provincia (sigla 2 lettere)"}
-            required={cc !== "IT"}
-            tooltip="Obbligatorio per USA (es. WA per Washington, NY per New York, CA per California), Canada (es. ON), Australia (es. NSW) e consigliato per Italia (es. MI, RM)."
-          >
-            <Input value={data.province || ""} maxLength={2} onChange={(e) => setData({ ...data, province: e.target.value.toUpperCase() })} className="rounded-sm h-11" placeholder={cc === "IT" ? "MI" : "WA"} />
-          </Field>
-        )}
-        <Field label="Email (opzionale)"><Input type="email" value={data.email} onChange={set("email")} className="rounded-sm h-11" /></Field>
-        <Field label="Telefono (opzionale)"><Input value={data.phone} onChange={set("phone")} className="rounded-sm h-11" /></Field>
-      </div>
-    </div>
-  );
-}
-
-function Field({ label, required, tooltip, className = "", children }) {
-  return (
-    <div className={className}>
-      <Label className="label-caps">
-        {label}
-        {required && <span className="text-orange-600">*</span>}
-        {tooltip && <FieldTooltip text={tooltip} />}
-      </Label>
-      <div className="mt-1.5">{children}</div>
-    </div>
-  );
-}
+                      <p><b>• Fattura Commerciale o Proforma (Obbligatoria):</b> documento che descrive la merce, quantità, valore unitario e totale, valuta e paese d'origine.</p>
+                      <p><b>• Codice Doganale HS Code (6-10 cifre):</b> codice tariffario internazionale (Harmonized System, es. <i>850440</i> o <i>620342</i>) che identifica la categoria merceologica per calcolare i dazi. Non sempre bloccante in fase di etichetta, ma fondamentale verso USA, UK e Svizzera per evitare fermi in dogana.</p>
+                      <p><b>• Codice EORI:</b> codice identificativo dog
