@@ -12,6 +12,7 @@ from datetime import datetime, timezone, timedelta
 import bcrypt
 import jwt as pyjwt
 import stripe
+import httpx
 from reportlab.lib.pagesizes import A4, A6
 from reportlab.pdfgen import canvas
 from reportlab.lib.units import mm
@@ -147,6 +148,25 @@ def _eval_markup_rule(rule: Dict[str, Any], zone_macro: str) -> float:
     return norm["world"]
 
 
+async def ensure_reseller_standard_rate_table(reseller_id: Optional[str]) -> Optional[Dict[str, Any]]:
+    if not reseller_id:
+        return None
+    existing = await db.rate_tables.find_one({"reseller_id": reseller_id}, {"_id": 0})
+    if existing:
+        return existing
+    doc = {
+        "id": new_id(),
+        "reseller_id": reseller_id,
+        "name": "Listino Standard",
+        "is_default": True,
+        "carrier_markups": {cid: _normalize_rule(20.0) for cid in ALL_CARRIER_IDS},
+        "created_at": now_iso(),
+    }
+    await db.rate_tables.insert_one(doc)
+    doc.pop("_id", None)
+    return doc
+
+
 class RegisterInput(BaseModel):
     email: EmailStr
     password: str
@@ -261,6 +281,9 @@ class TopUpRequest(BaseModel):
     package_id: str
     origin_url: str
 
+class TestEmailInput(BaseModel):
+    to: EmailStr
+
 CREDIT_PACKAGES = {
     "credit_100": {"name": "Ricarica €100", "amount": 100.0},
     "credit_500": {"name": "Ricarica €500", "amount": 500.0},
@@ -279,6 +302,7 @@ async def register(inp: RegisterInput):
     if not reseller:
         reseller = await db.resellers.find_one({"active": True})
     reseller_id = reseller["id"] if reseller else None
+    std_rt = await ensure_reseller_standard_rate_table(reseller_id)
     user = {
         "id": new_id(),
         "email": inp.email.lower(),
@@ -294,7 +318,7 @@ async def register(inp: RegisterInput):
         "reseller_id": reseller_id,
         "status": "pending",
         "billing_type": "postpaid",
-        "rate_table_id": None,
+        "rate_table_id": std_rt["id"] if std_rt else None,
         "allowed_carriers": list(ALL_CARRIER_IDS),
         "credit_balance": 0.0,
         "created_at": now_iso(),
@@ -359,7 +383,6 @@ async def me(user=Depends(get_current_user)):
         user["reseller_slug"] = (res or {}).get("slug", "")
         user["reseller_plan"] = (res or {}).get("plan", "basic")
 
-        # Per i sub-clienti ("user"), "Il mio indirizzo" usa l'indirizzo sede del sub-cliente se compilato
         if user.get("role") == "user":
             user["reseller_address"] = {
                 "company_name": user.get("company_name", ""),
@@ -389,15 +412,45 @@ async def me(user=Depends(get_current_user)):
         user["can_manage_own_carriers"] = any(p in ("reseller_only", "hybrid") for p in policies.values())
     return user
 
+@api_router.post("/super/test-email")
+async def super_test_email(inp: TestEmailInput, user=Depends(get_current_user)):
+    if user.get("role") != "super_admin":
+        raise HTTPException(403, "Super admin only")
+    api_key = os.environ.get("RESEND_API_KEY", "")
+    from_addr = os.environ.get("EMAIL_FROM", "SpedPortal <onboarding@resend.dev>")
+    if not api_key:
+        return {"ok": False, "error": "RESEND_API_KEY non impostata su Render"}
+    try:
+        async with httpx.AsyncClient(timeout=20) as c:
+            r = await c.post(
+                "https://api.resend.com/emails",
+                headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
+                json={
+                    "from": from_addr,
+                    "to": [inp.to],
+                    "subject": "SpedPortal · Test Invio Email",
+                    "html": "<p>Test invio email da SpedPortal riuscito correttamente.</p>",
+                },
+            )
+            if r.status_code not in (200, 201):
+                return {"ok": False, "status_code": r.status_code, "error": r.text}
+            return {"ok": True, "id": r.json().get("id")}
+    except Exception as e:
+        return {"ok": False, "error": str(e)}
+
 @api_router.get("/admin/users")
 async def list_users(user=Depends(require_admin)):
     q = {"role": "user"}
+    rid = user.get("reseller_id")
     if user.get("role") == "reseller_admin":
-        q["reseller_id"] = user["reseller_id"]
+        q["reseller_id"] = rid
+    std_rt = await ensure_reseller_standard_rate_table(rid)
     items = await db.users.find(q, {"_id": 0, "password": 0}).to_list(1000)
     for it in items:
         if "allowed_carriers" not in it or it["allowed_carriers"] is None:
             it["allowed_carriers"] = list(ALL_CARRIER_IDS)
+        if not it.get("rate_table_id") and std_rt:
+            it["rate_table_id"] = std_rt["id"]
     return items
 
 @api_router.post("/admin/users")
@@ -408,6 +461,8 @@ async def create_client_user(inp: CreateClientInput, admin=Depends(require_admin
     if not rid:
         demo = await db.resellers.find_one({"active": True})
         rid = demo["id"] if demo else None
+    std_rt = await ensure_reseller_standard_rate_table(rid)
+    rt_id = inp.rate_table_id if inp.rate_table_id else (std_rt["id"] if std_rt else None)
     doc = {
         "id": new_id(),
         "email": inp.email.lower(),
@@ -423,7 +478,7 @@ async def create_client_user(inp: CreateClientInput, admin=Depends(require_admin
         "reseller_id": rid,
         "status": "approved",
         "billing_type": inp.billing_type if inp.billing_type in ("prepaid", "postpaid") else "postpaid",
-        "rate_table_id": inp.rate_table_id,
+        "rate_table_id": rt_id,
         "allowed_carriers": inp.allowed_carriers if inp.allowed_carriers is not None else list(ALL_CARRIER_IDS),
         "credit_balance": 0.0,
         "created_at": now_iso(),
@@ -511,7 +566,6 @@ def _normalize_rate_table_doc(doc: Dict[str, Any]) -> Dict[str, Any]:
         if cid in raw_cm and raw_cm[cid] is not None:
             norm_cm[cid] = _normalize_rule(raw_cm[cid], 20.0)
         else:
-            # Migrazione silenziosa da vecchie fasce zone se presenti
             bands = doc.get("bands") or []
             if bands:
                 by_z = {b.get("zone"): float(b.get("markup_percent", 20.0)) for b in bands}
@@ -530,7 +584,10 @@ def _normalize_rate_table_doc(doc: Dict[str, Any]) -> Dict[str, Any]:
 
 @api_router.get("/admin/rate-tables")
 async def list_rate_tables(user=Depends(require_admin)):
-    q = {} if user.get("role") == "super_admin" else {"reseller_id": user.get("reseller_id")}
+    rid = user.get("reseller_id")
+    if rid:
+        await ensure_reseller_standard_rate_table(rid)
+    q = {} if user.get("role") == "super_admin" else {"reseller_id": rid}
     rows = await db.rate_tables.find(q, {"_id": 0}).to_list(500)
     return [_normalize_rate_table_doc(r) for r in rows]
 
@@ -560,6 +617,9 @@ async def update_rate_table(tid: str, inp: RateTableInput, user=Depends(require_
 @api_router.delete("/admin/rate-tables/{tid}")
 async def delete_rate_table(tid: str, user=Depends(require_admin)):
     q = {"id": tid} if user.get("role") == "super_admin" else {"id": tid, "reseller_id": user.get("reseller_id")}
+    count = await db.rate_tables.count_documents({"reseller_id": user.get("reseller_id")}) if user.get("reseller_id") else 2
+    if count <= 1:
+        raise HTTPException(400, "Deve rimanere almeno un profilo margini per l'agenzia")
     await db.rate_tables.delete_one(q)
     return {"ok": True}
 
@@ -643,19 +703,19 @@ async def _reseller_markup_for_carrier(user: dict, carrier_id: str, zone_macro: 
     if user.get("role") in ("reseller_admin", "super_admin", "admin"):
         return 0.0
 
-    default_markup = 20.0
+    rid = user.get("reseller_id")
     rate_table_id = user.get("rate_table_id")
     table = None
     if rate_table_id:
         table = await db.rate_tables.find_one({"id": rate_table_id}, {"_id": 0})
-    if not table and user.get("reseller_id"):
-        table = await db.rate_tables.find_one({"reseller_id": user.get("reseller_id")}, {"_id": 0})
+    if not table and rid:
+        table = await ensure_reseller_standard_rate_table(rid)
     if table:
         norm = _normalize_rate_table_doc(table)
         rule = (norm.get("carrier_markups") or {}).get(carrier_id)
         if rule:
             return _eval_markup_rule(rule, zone_macro)
-    return default_markup
+    return 20.0
 
 
 async def _resolve_tenant_carrier_options(user: dict, zone_macro: str = "NAZ") -> dict:
@@ -663,7 +723,6 @@ async def _resolve_tenant_carrier_options(user: dict, zone_macro: str = "NAZ") -
     master_doc = await db.system_settings.find_one({"id": "master_carriers"}, {"_id": 0})
     master_carriers = (master_doc or {}).get("carriers") or {}
 
-    # Filtro corrieri abilitati per singolo sub-cliente
     user_allowed = None
     if user.get("role") == "user" and user.get("allowed_carriers") is not None:
         user_allowed = set(user.get("allowed_carriers") or [])
@@ -748,6 +807,7 @@ def _build_quote_option(
     raw_freight: float,
     raw_surcharge_items: List[Dict[str, Any]],
     transit: int,
+    commit_hint: str,
     billed_weight: float,
     zone_macro: str,
     opt: dict,
@@ -782,6 +842,7 @@ def _build_quote_option(
         "cost": reseller_cost,
         "price": client_price,
         "transit_days": transit,
+        "commit_hint": commit_hint,
         "billed_weight": round(billed_weight, 2),
         "zone": zone_macro,
         "contract_owner": opt["owner"],
@@ -855,6 +916,7 @@ async def _compute_quotes_internal(q: QuoteRequest, user: dict) -> dict:
                         raw_freight=raw_freight,
                         raw_surcharge_items=raw_surcharge_items,
                         transit=fx["transit_days"],
+                        commit_hint=fx.get("commit_hint", ""),
                         billed_weight=billed_weight,
                         zone_macro=zone_info["macro"],
                         opt=opt,
@@ -876,6 +938,7 @@ async def _compute_quotes_internal(q: QuoteRequest, user: dict) -> dict:
                     raw_freight=bk["base_freight"],
                     raw_surcharge_items=bk["surcharge_items"],
                     transit=transit,
+                    commit_hint="",
                     billed_weight=billed_weight,
                     zone_macro=zone_info["macro"],
                     opt=opt,
@@ -907,6 +970,7 @@ async def quote_shipment(q: QuoteRequest, user=Depends(require_approved)):
                 "color": item["color"],
                 "price": item["price"],
                 "transit_days": item["transit_days"],
+                "commit_hint": item.get("commit_hint", ""),
                 "billed_weight": item["billed_weight"],
                 "zone": item["zone"],
             }
@@ -1042,10 +1106,14 @@ async def create_shipment(inp: CreateShipmentInput, user=Depends(require_approve
     customs_saved["paperless_ok"] = paperless_ok
     customs_saved["fallback_paper"] = fallback_paper
 
+    creator_role = user.get("role", "user")
+    creator_name = user.get("company_name", "")
+
     shipment = {
         "id": new_id(),
         "user_id": user["id"],
-        "user_company_name": user.get("company_name", ""),
+        "user_company_name": creator_name,
+        "created_by_role": creator_role,
         "reseller_id": rid,
         "on_master_codes": (source == "admin"),
         "contract_owner": source,
@@ -1081,7 +1149,7 @@ async def create_shipment(inp: CreateShipmentInput, user=Depends(require_approve
     }
     await db.shipments.insert_one(shipment)
 
-    if user.get("role") == "user" and user.get("billing_type") == "prepaid":
+    if creator_role == "user" and user.get("billing_type") == "prepaid":
         await db.users.update_one({"id": user["id"]}, {"$inc": {"credit_balance": -price}})
         await db.ledger.insert_one({
             "id": new_id(), "user_id": user["id"], "reseller_id": rid,
@@ -1091,19 +1159,22 @@ async def create_shipment(inp: CreateShipmentInput, user=Depends(require_approve
         })
 
     if reseller_doc and reseller_doc.get("billing_type", "prepaid") == "prepaid" and admin_charge_to_reseller > 0:
+        origin_tag = f"Sub-cliente {creator_name}" if creator_role == "user" else "Spedizione diretta Reseller"
         await db.resellers.update_one({"id": rid}, {"$inc": {"credit_balance": -admin_charge_to_reseller}})
         await db.users.update_many({"reseller_id": rid, "role": "reseller_admin"}, {"$inc": {"credit_balance": -admin_charge_to_reseller}})
         await db.reseller_ledger.insert_one({
             "id": new_id(), "reseller_id": rid, "shipment_id": shipment["id"],
+            "created_by_role": creator_role,
+            "client_company_name": creator_name if creator_role == "user" else "",
             "type": "shipment_charge" if source == "admin" else "label_fee",
             "amount": -admin_charge_to_reseller,
-            "note": f"Spedizione {tracking_num} ({chosen['carrier_name']})",
+            "note": f"{origin_tag} · {tracking_num} ({chosen['carrier_name']})",
             "created_at": now_iso(),
         })
 
     shipment.pop("_id", None)
     shipment.pop("label_pdf_base64", None)
-    return _sanitize_shipment_for_role(shipment, user.get("role", "user"))
+    return _sanitize_shipment_for_role(shipment, creator_role)
 
 
 def _sanitize_shipment_for_role(s: dict, role: str) -> dict:
@@ -1316,16 +1387,28 @@ async def cancel_shipment(sid: str, user=Depends(require_approved)):
         except Exception as e:
             raise HTTPException(502, str(e))
 
+    actor_role = user.get("role", "user")
+    actor_label = (
+        "Annullata dall'Agenzia (Reseller)"
+        if actor_role == "reseller_admin"
+        else ("Annullata dall'Amministratore" if actor_role == "super_admin" else "Annullata dal Cliente")
+    )
+
     cancel_event = {
         "ts": now_iso(),
         "code": "cancelled",
-        "label": "Spedizione annullata prima del ritiro",
+        "label": f"Spedizione annullata prima del ritiro · {actor_label}",
         "location": (s.get("sender") or {}).get("city", ""),
     }
     await db.shipments.update_one(
         {"id": sid},
         {
-            "$set": {"status": "cancelled", "cancelled_at": now_iso()},
+            "$set": {
+                "status": "cancelled",
+                "cancelled_at": now_iso(),
+                "cancelled_by_role": actor_role,
+                "cancelled_by_name": user.get("company_name", ""),
+            },
             "$push": {"tracking_events": cancel_event},
         },
     )
@@ -1338,7 +1421,7 @@ async def cancel_shipment(sid: str, user=Depends(require_approved)):
             await db.ledger.insert_one({
                 "id": new_id(), "user_id": s["user_id"], "reseller_id": s.get("reseller_id"),
                 "type": "shipment_refund", "amount": refund_amount,
-                "note": f"Rimborso annullamento {s.get('tracking_number', '')}",
+                "note": f"Rimborso annullamento {s.get('tracking_number', '')} ({actor_label})",
                 "shipment_id": sid, "created_at": now_iso(),
             })
 
@@ -1352,6 +1435,8 @@ async def cancel_shipment(sid: str, user=Depends(require_approved)):
             await db.users.update_many({"reseller_id": rid, "role": "reseller_admin"}, {"$inc": {"credit_balance": res_refund}})
             await db.reseller_ledger.insert_one({
                 "id": new_id(), "reseller_id": rid, "shipment_id": sid,
+                "created_by_role": s.get("created_by_role", "user"),
+                "client_company_name": s.get("user_company_name", "") if s.get("created_by_role") == "user" else "",
                 "type": "shipment_refund", "amount": res_refund,
                 "note": f"Rimborso annullamento {s.get('tracking_number', '')}",
                 "created_at": now_iso(),
@@ -1438,7 +1523,7 @@ async def export_shipments(user=Depends(require_approved)):
     wb = openpyxl.Workbook()
     ws = wb.active
     ws.title = "Spedizioni"
-    headers = ["Data", "Tracking", "Corriere", "Contratto", "Codice Usato", "Mittente", "Destinatario", "Città", "Prov.", "Nazione",
+    headers = ["Data", "Tracking", "Corriere", "Origine", "Contratto", "Codice Usato", "Mittente", "Destinatario", "Città", "Prov.", "Nazione",
                "Colli", "Peso (kg)", "Zona", "Prezzo (€)", "Stato"]
     ws.append(headers)
     for cell in ws[1]:
@@ -1447,8 +1532,10 @@ async def export_shipments(user=Depends(require_approved)):
     for s in ships:
         owner = s.get("contract_owner", "admin" if s.get("on_master_codes", True) else "reseller")
         st = s.get("status") if (s.get("is_live") or s.get("status") == "cancelled") else _simulate_status(s)
+        origin = f"Sub-cliente: {s.get('user_company_name', '')}" if s.get("created_by_role") == "user" else "Diretta Reseller"
         ws.append([
             s.get("created_at", ""), s.get("tracking_number", ""), s.get("carrier_name", ""),
+            origin,
             "Piattaforma" if owner == "admin" else "Proprio",
             s.get("carrier_code_used", ""),
             s.get("sender", {}).get("company_name", ""),
@@ -1655,15 +1742,9 @@ async def bootstrap():
         })
         logger.info("Super Admin seeded: admin@spedportal.it / Admin@2026")
     await bootstrap_multitenant()
-    if await db.rate_tables.count_documents({}) == 0:
-        demo = await db.resellers.find_one({"company_name": "SpedPortal Demo"})
-        await db.rate_tables.insert_one({
-            "id": new_id(),
-            "reseller_id": demo["id"] if demo else None,
-            "name": "Profilo Margini Standard (+20%)",
-            "carrier_markups": {cid: _normalize_rule(20.0) for cid in ALL_CARRIER_IDS},
-            "created_at": now_iso(),
-        })
+    all_resellers = await db.resellers.find({}, {"_id": 0, "id": 1}).to_list(1000)
+    for r in all_resellers:
+        await ensure_reseller_standard_rate_table(r["id"])
 
 @api_router.get("/")
 async def root():
