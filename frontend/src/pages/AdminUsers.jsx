@@ -33,7 +33,7 @@ const emptyClientForm = {
   province: "",
   country: "IT",
   billing_type: "postpaid",
-  rate_table_id: "none",
+  rate_table_id: "",
   allowed_carriers: ALL_CARRIERS.map((c) => c.id),
 };
 
@@ -52,6 +52,7 @@ export default function AdminUsers() {
   const [openModal, setOpenModal] = useState(false);
   const [editingUser, setEditingUser] = useState(null);
   const [form, setForm] = useState(emptyClientForm);
+  const [cityOptions, setCityOptions] = useState([]);
 
   // Dialog ricarica saldo sub-cliente
   const [topupTarget, setTopupTarget] = useState(null);
@@ -99,6 +100,7 @@ export default function AdminUsers() {
     loadLedger("all");
   }, [user]);
 
+  const defaultRateId = rates[0]?.id || "";
   const inviteUrl = `${window.location.origin}/register?reseller=${user?.reseller_slug || "demo"}`;
 
   const copyInvite = () => {
@@ -123,6 +125,11 @@ export default function AdminUsers() {
     try {
       const cc = (form.country || "IT").toUpperCase();
       const r = await api.get(`/geo/lookup?country=${cc}&cap=${encodeURIComponent(cap)}`);
+      if (r.data?.valid === false) {
+        toast.warning(`Il CAP "${cap}" non risulta valido per ${cc}`);
+      }
+      const list = r.data?.cities || (r.data?.city ? [r.data.city] : []);
+      setCityOptions(list);
       if (r.data?.city || r.data?.province) {
         setForm((f) => ({
           ...f,
@@ -136,8 +143,10 @@ export default function AdminUsers() {
 
   const openCreateModal = () => {
     setEditingUser(null);
+    setCityOptions([]);
     setForm({
       ...emptyClientForm,
+      rate_table_id: defaultRateId,
       allowed_carriers: availableCarriers.map((c) => c.id),
     });
     setOpenModal(true);
@@ -145,6 +154,7 @@ export default function AdminUsers() {
 
   const openEditModal = (u) => {
     setEditingUser(u);
+    setCityOptions([]);
     setForm({
       company_name: u.company_name || "",
       email: u.email || "",
@@ -156,7 +166,7 @@ export default function AdminUsers() {
       province: u.province || "",
       country: u.country || "IT",
       billing_type: u.billing_type || "postpaid",
-      rate_table_id: u.rate_table_id || "none",
+      rate_table_id: u.rate_table_id || defaultRateId,
       allowed_carriers: u.allowed_carriers || availableCarriers.map((c) => c.id),
     });
     setOpenModal(true);
@@ -177,6 +187,7 @@ export default function AdminUsers() {
       return;
     }
     try {
+      const chosenRt = form.rate_table_id || defaultRateId || null;
       if (editingUser) {
         await api.patch(`/admin/users/${editingUser.id}`, {
           company_name: form.company_name,
@@ -187,7 +198,7 @@ export default function AdminUsers() {
           province: form.province,
           country: form.country,
           billing_type: form.billing_type,
-          rate_table_id: form.rate_table_id === "none" ? null : form.rate_table_id,
+          rate_table_id: chosenRt,
           allowed_carriers: form.allowed_carriers,
         });
         toast.success("Sub-cliente aggiornato!");
@@ -198,7 +209,7 @@ export default function AdminUsers() {
         }
         await api.post("/admin/users", {
           ...form,
-          rate_table_id: form.rate_table_id === "none" ? null : form.rate_table_id,
+          rate_table_id: chosenRt,
         });
         toast.success("Sub-cliente creato e attivo!");
       }
@@ -322,81 +333,83 @@ export default function AdminUsers() {
               </tr>
             </thead>
             <tbody>
-              {users.map((u) => (
-                <tr key={u.id} className="border-b border-slate-100">
-                  <td className="px-4 py-3 font-semibold">{u.company_name}</td>
-                  <td className="px-4 py-3">
-                    <div>{u.email}</div>
-                    {u.city && (
-                      <div className="text-[11px] text-slate-400">
-                        {u.address ? `${u.address}, ` : ""}{u.postal_code} {u.city} ({u.country || "IT"})
+              {users.map((u) => {
+                const effectiveRateId = rates.some((r) => r.id === u.rate_table_id) ? u.rate_table_id : defaultRateId;
+                return (
+                  <tr key={u.id} className="border-b border-slate-100">
+                    <td className="px-4 py-3 font-semibold">{u.company_name}</td>
+                    <td className="px-4 py-3">
+                      <div>{u.email}</div>
+                      {u.city && (
+                        <div className="text-[11px] text-slate-400">
+                          {u.address ? `${u.address}, ` : ""}{u.postal_code} {u.city} ({u.country || "IT"})
+                        </div>
+                      )}
+                    </td>
+                    <td className="px-4 py-3">
+                      <span className={`px-2 py-0.5 text-xs rounded-sm border font-semibold ${
+                        u.status === "approved" ? "bg-green-50 text-green-700 border-green-200" : "bg-amber-50 text-amber-800 border-amber-200"
+                      }`}>
+                        {u.status}
+                      </span>
+                    </td>
+                    <td className="px-4 py-3">
+                      <Select value={u.billing_type} onValueChange={(v) => quickUpdate(u.id, { billing_type: v })}>
+                        <SelectTrigger className="h-8 rounded-sm text-xs w-32"><SelectValue /></SelectTrigger>
+                        <SelectContent>
+                          <SelectItem value="postpaid">Fine mese</SelectItem>
+                          {features.client_prepaid !== false && <SelectItem value="prepaid">Prepagato</SelectItem>}
+                        </SelectContent>
+                      </Select>
+                    </td>
+                    <td className="px-4 py-3">
+                      <Select value={effectiveRateId} onValueChange={(v) => quickUpdate(u.id, { rate_table_id: v })}>
+                        <SelectTrigger className="h-8 rounded-sm text-xs w-48"><SelectValue placeholder="Seleziona listino" /></SelectTrigger>
+                        <SelectContent>
+                          {rates.map((r) => (
+                            <SelectItem key={r.id} value={r.id}>{r.name}</SelectItem>
+                          ))}
+                        </SelectContent>
+                      </Select>
+                    </td>
+                    <td className="px-4 py-3 text-right font-mono font-bold">
+                      € {(u.credit_balance || 0).toFixed(2)}
+                    </td>
+                    <td className="px-4 py-3">
+                      <div className="flex items-center gap-1 flex-wrap">
+                        <Button size="sm" variant="outline" onClick={() => openEditModal(u)} className="rounded-sm h-8" title="Modifica Anagrafica, Sede e Corrieri">
+                          <PencilSimple size={14} />
+                        </Button>
+                        {u.billing_type === "prepaid" && (
+                          <Button
+                            size="sm"
+                            onClick={() => { setTopupTarget(u); setTopupAmount(""); setTopupNote(""); }}
+                            className="bg-orange-600 hover:bg-orange-700 rounded-sm h-8 text-xs px-2.5"
+                            title="Ricarica Saldo Prepagato"
+                          >
+                            <Wallet size={14} className="mr-1" /> Ricarica
+                          </Button>
+                        )}
+                        {u.status !== "approved" && (
+                          <Button size="sm" onClick={() => quickUpdate(u.id, { status: "approved" })} className="bg-green-600 hover:bg-green-700 rounded-sm h-8" title="Approva">
+                            <CheckCircle size={14} weight="fill" />
+                          </Button>
+                        )}
+                        {u.status !== "rejected" && (
+                          <Button size="sm" variant="outline" onClick={() => quickUpdate(u.id, { status: "rejected" })} className="rounded-sm h-8" title="Sospendi">
+                            <Prohibit size={14} />
+                          </Button>
+                        )}
+                        {u.billing_type === "postpaid" && features.client_billing && (
+                          <Button size="sm" variant="outline" onClick={() => generate(u.id)} className="rounded-sm h-8" title="Genera Fattura">
+                            <FileText size={14} />
+                          </Button>
+                        )}
                       </div>
-                    )}
-                  </td>
-                  <td className="px-4 py-3">
-                    <span className={`px-2 py-0.5 text-xs rounded-sm border font-semibold ${
-                      u.status === "approved" ? "bg-green-50 text-green-700 border-green-200" : "bg-amber-50 text-amber-800 border-amber-200"
-                    }`}>
-                      {u.status}
-                    </span>
-                  </td>
-                  <td className="px-4 py-3">
-                    <Select value={u.billing_type} onValueChange={(v) => quickUpdate(u.id, { billing_type: v })}>
-                      <SelectTrigger className="h-8 rounded-sm text-xs w-32"><SelectValue /></SelectTrigger>
-                      <SelectContent>
-                        <SelectItem value="postpaid">Fine mese</SelectItem>
-                        {features.client_prepaid !== false && <SelectItem value="prepaid">Prepagato</SelectItem>}
-                      </SelectContent>
-                    </Select>
-                  </td>
-                  <td className="px-4 py-3">
-                    <Select value={u.rate_table_id || "none"} onValueChange={(v) => quickUpdate(u.id, { rate_table_id: v === "none" ? null : v })}>
-                      <SelectTrigger className="h-8 rounded-sm text-xs w-44"><SelectValue /></SelectTrigger>
-                      <SelectContent>
-                        <SelectItem value="none">Default (+20%)</SelectItem>
-                        {rates.map((r) => (
-                          <SelectItem key={r.id} value={r.id}>{r.name}</SelectItem>
-                        ))}
-                      </SelectContent>
-                    </Select>
-                  </td>
-                  <td className="px-4 py-3 text-right font-mono font-bold">
-                    € {(u.credit_balance || 0).toFixed(2)}
-                  </td>
-                  <td className="px-4 py-3">
-                    <div className="flex items-center gap-1 flex-wrap">
-                      <Button size="sm" variant="outline" onClick={() => openEditModal(u)} className="rounded-sm h-8" title="Modifica Anagrafica, Sede e Corrieri">
-                        <PencilSimple size={14} />
-                      </Button>
-                      {u.billing_type === "prepaid" && (
-                        <Button
-                          size="sm"
-                          onClick={() => { setTopupTarget(u); setTopupAmount(""); setTopupNote(""); }}
-                          className="bg-orange-600 hover:bg-orange-700 rounded-sm h-8 text-xs px-2.5"
-                          title="Ricarica Saldo Prepagato"
-                        >
-                          <Wallet size={14} className="mr-1" /> Ricarica
-                        </Button>
-                      )}
-                      {u.status !== "approved" && (
-                        <Button size="sm" onClick={() => quickUpdate(u.id, { status: "approved" })} className="bg-green-600 hover:bg-green-700 rounded-sm h-8" title="Approva">
-                          <CheckCircle size={14} weight="fill" />
-                        </Button>
-                      )}
-                      {u.status !== "rejected" && (
-                        <Button size="sm" variant="outline" onClick={() => quickUpdate(u.id, { status: "rejected" })} className="rounded-sm h-8" title="Sospendi">
-                          <Prohibit size={14} />
-                        </Button>
-                      )}
-                      {u.billing_type === "postpaid" && features.client_billing && (
-                        <Button size="sm" variant="outline" onClick={() => generate(u.id)} className="rounded-sm h-8" title="Genera Fattura">
-                          <FileText size={14} />
-                        </Button>
-                      )}
-                    </div>
-                  </td>
-                </tr>
-              ))}
+                    </td>
+                  </tr>
+                );
+              })}
               {users.length === 0 && (
                 <tr><td colSpan={7} className="text-center py-10 text-slate-500">Nessun sub-cliente registrato.</td></tr>
               )}
@@ -515,6 +528,25 @@ export default function AdminUsers() {
                 <div className="col-span-2">
                   <Label className="label-caps">Città</Label>
                   <Input value={form.city} onChange={(e) => setForm({ ...form, city: e.target.value })} className="mt-1 rounded-sm h-10" placeholder="Milano" />
+                  {cityOptions.length > 1 && (
+                    <div className="mt-1.5 flex flex-wrap items-center gap-1.5">
+                      <span className="text-[11px] text-slate-500">Località CAP:</span>
+                      {cityOptions.map((cName) => (
+                        <button
+                          type="button"
+                          key={cName}
+                          onClick={() => setForm((f) => ({ ...f, city: cName }))}
+                          className={`text-[11px] px-2 py-0.5 rounded-sm border font-semibold transition-colors ${
+                            (form.city || "").toLowerCase() === cName.toLowerCase()
+                              ? "bg-orange-600 text-white border-orange-600"
+                              : "bg-slate-50 text-slate-700 border-slate-200 hover:bg-orange-50"
+                          }`}
+                        >
+                          {cName}
+                        </button>
+                      ))}
+                    </div>
+                  )}
                 </div>
                 <div>
                   <Label className="label-caps">Prov. / Nazione</Label>
@@ -539,10 +571,9 @@ export default function AdminUsers() {
               </div>
               <div>
                 <Label className="label-caps">Profilo Margini Assegnato</Label>
-                <Select value={form.rate_table_id} onValueChange={(v) => setForm({ ...form, rate_table_id: v })}>
-                  <SelectTrigger className="mt-1 rounded-sm h-10"><SelectValue /></SelectTrigger>
+                <Select value={form.rate_table_id || defaultRateId} onValueChange={(v) => setForm({ ...form, rate_table_id: v })}>
+                  <SelectTrigger className="mt-1 rounded-sm h-10"><SelectValue placeholder="Seleziona listino" /></SelectTrigger>
                   <SelectContent>
-                    <SelectItem value="none">Default (+20%)</SelectItem>
                     {rates.map((r) => (
                       <SelectItem key={r.id} value={r.id}>{r.name}</SelectItem>
                     ))}
