@@ -1,6 +1,7 @@
 import os
 import time
 import uuid
+import asyncio
 import logging
 from datetime import datetime, timezone
 from typing import Dict, Any, List, Optional
@@ -22,6 +23,22 @@ _TOKEN_CACHE: Dict[str, Any] = {"access_token": None, "expires_at": 0.0}
 TRANSIT_MAP = {
     "ONE_DAY": 1, "TWO_DAYS": 2, "THREE_DAYS": 3, "FOUR_DAYS": 4,
     "FIVE_DAYS": 5, "SIX_DAYS": 6, "SEVEN_DAYS": 7, "EIGHT_DAYS": 8,
+}
+
+SERVICE_COMMIT_HINTS = {
+    "FEDEX_FIRST": "Consegna mattutina entro le 10:00",
+    "FEDEX_FIRST_OVERNIGHT": "Consegna mattutina entro le 08:30 / 10:00",
+    "INTERNATIONAL_FIRST": "Consegna mattutina prioritaria entro le 10:00",
+    "FEDEX_PRIORITY_EXPRESS": "Consegna espressa entro le 12:00",
+    "FEDEX_PRIORITY": "Consegna entro fine giornata lavorativa",
+    "PRIORITY_OVERNIGHT": "Consegna entro le 10:30 / 12:00",
+    "STANDARD_OVERNIGHT": "Consegna entro fine giornata",
+    "INTERNATIONAL_PRIORITY": "Consegna espressa prioritaria",
+    "FEDEX_INTERNATIONAL_PRIORITY": "Consegna espressa prioritaria",
+    "FEDEX_INTERNATIONAL_PRIORITY_EXPRESS": "Consegna espressa entro le 12:00",
+    "INTERNATIONAL_ECONOMY": "Consegna economica programmata",
+    "FEDEX_INTERNATIONAL_CONNECT_PLUS": "Consegna e-commerce programmata",
+    "FEDEX_REGIONAL_ECONOMY": "Consegna stradale programmata Europa",
 }
 
 FEDEX_STATUS_MAP = {
@@ -236,7 +253,6 @@ async def get_fedex_transit_times(
                 headers=_headers(token),
             )
             if resp.status_code != 200:
-                logger.warning("FedEx TransitTimes %s: %s", resp.status_code, resp.text[:400])
                 return []
             tt_list = ((resp.json().get("output") or {}).get("transitTimes")) or []
             out = []
@@ -254,8 +270,7 @@ async def get_fedex_transit_times(
                         "cutoff_time": commit.get("cutOffTime", ""),
                     })
             return out
-    except Exception as e:
-        logger.warning("FedEx TransitTimes error: %s", e)
+    except Exception:
         return []
 
 
@@ -503,8 +518,6 @@ async def get_fedex_rates(
         special_block["specialServiceTypes"] = special_types
         requested_shipment["shipmentSpecialServices"] = special_block
 
-    # FedEx Rate API richiede customsClearanceDetail per QUALSIASI spedizione cross-border (is_intl=True, incl. UE)
-    # con paymentType="SENDER" sul preventivo
     if is_intl or customs_required:
         total_w = round(sum(float(p["weight"]) for p in parcels), 2)
         val = round(max(1.0, float(customs_value or insured_value or 50.0)), 2)
@@ -534,14 +547,24 @@ async def get_fedex_rates(
     }
 
     async with httpx.AsyncClient(timeout=25.0) as client:
-        resp = await client.post(
-            f"{FEDEX_BASE_URL}/rate/v1/rates/quotes",
-            json=payload,
-            headers=_headers(token),
-        )
-        if resp.status_code != 200:
-            detail = _extract_fedex_error(resp, "Errore Rate API")
-            logger.warning("FedEx Rate API %s: %s", resp.status_code, resp.text[:700])
+        resp = None
+        for attempt in range(2):
+            resp = await client.post(
+                f"{FEDEX_BASE_URL}/rate/v1/rates/quotes",
+                json=payload,
+                headers=_headers(token),
+            )
+            if resp.status_code == 200:
+                break
+            # Retry silenzioso in caso di errore transitorio Sandbox (500 / SYSTEM.UNEXPECTED.ERROR)
+            if resp.status_code >= 500 and attempt == 0:
+                await asyncio.sleep(1.0)
+                continue
+            break
+
+        if resp is None or resp.status_code != 200:
+            detail = _extract_fedex_error(resp, "Errore Rate API") if resp is not None else "Nessuna risposta da FedEx"
+            logger.warning("FedEx Rate API %s: %s", resp.status_code if resp else "ERR", resp.text[:700] if resp else "")
             raise RuntimeError(detail)
 
         data = resp.json()
@@ -557,21 +580,30 @@ async def get_fedex_rates(
             parsed = _extract_net_charge(rated)
             if parsed["net_charge"] <= 0:
                 continue
+            svc_type = (item.get("serviceType") or "").upper()
             commit = item.get("commit") or {}
             td_obj = commit.get("transitDays") or {}
+            dd_obj = commit.get("dateDetail") or {}
             op_detail = item.get("operationalDetail") or {}
             td_code = td_obj.get("minimumTransitTime") or op_detail.get("transitTime") or ""
             transit_days = TRANSIT_MAP.get(td_code, 2 if not is_intl else 3)
 
+            commit_time = (dd_obj.get("time") or op_detail.get("commitTime") or "").strip()
+            if commit_time and len(commit_time) >= 5:
+                commit_hint = f"Consegna entro le {commit_time[:5]}"
+            else:
+                commit_hint = SERVICE_COMMIT_HINTS.get(svc_type, "")
+
             results.append({
-                "service_type": item.get("serviceType", ""),
-                "service_name": item.get("serviceName") or item.get("serviceType", "FedEx"),
+                "service_type": svc_type,
+                "service_name": item.get("serviceName") or svc_type or "FedEx",
                 "carrier_cost": parsed["net_charge"],
                 "base_charge": parsed["base_charge"],
                 "surcharges": parsed["surcharges"],
                 "surcharge_list": parsed["surcharge_list"],
                 "currency": parsed["currency"],
                 "transit_days": transit_days,
+                "commit_hint": commit_hint,
             })
         if not results:
             raise RuntimeError("FedEx ha restituito servizi senza tariffa associata")
