@@ -163,6 +163,8 @@ export default function NewShipment() {
     }
   };
 
+  const getOptKey = (q) => q.option_key || `${q.carrier_id}:${q.service_type || ""}`;
+
   const handleSelectCarrier = async (q) => {
     setChosen(q);
     setAddrCheck(null);
@@ -233,7 +235,12 @@ export default function NewShipment() {
     if (!chosen) return;
     setLoading(true);
     try {
-      const r = await api.post("/shipments", { quote: buildBody(), carrier_id: chosen.carrier_id });
+      const r = await api.post("/shipments", {
+        quote: buildBody(),
+        carrier_id: chosen.carrier_id,
+        service_type: chosen.service_type || "",
+        expect_live: !!chosen.is_live,
+      });
       setCreated(r.data); await refresh(); setStep(5); toast.success("Spedizione creata!");
     } catch (err) { toast.error(err?.response?.data?.detail || "Errore creazione"); }
     finally { setLoading(false); }
@@ -528,49 +535,56 @@ export default function NewShipment() {
           <div className="space-y-4">
             <h2 className="text-2xl font-bold tracking-tight" style={{ fontFamily: "Chivo" }}>Preventivo</h2>
             <div className="text-sm text-slate-600">Macro-Zona: <b>{quotes.zone}</b> · Peso tassato: <b>{quotes.billed_weight} kg</b></div>
-            {quotes.quotes.map((q, i) => (
-              <div key={q.carrier_id} onClick={() => handleSelectCarrier(q)}
-                className={`bg-white border rounded-sm p-4 cursor-pointer transition-all hover:shadow-md ${chosen?.carrier_id === q.carrier_id ? "border-l-[3px] border-orange-600 border-y border-r border-slate-200" : "border-slate-200"}`}>
-                <div className="flex items-center gap-4">
-                  <div className="w-14 h-14 rounded-sm flex items-center justify-center font-black text-white shrink-0" style={{ backgroundColor: q.color, fontFamily: "Chivo" }}>
-                    {q.carrier_name.slice(0, 3).toUpperCase()}
-                  </div>
-                  <div className="flex-1 min-w-0">
-                    <div className="flex items-center gap-2 flex-wrap">
-                      <span className="font-bold text-slate-900">{q.carrier_name}</span>
-                      {isResellerOrAdmin && q.is_live && (
-                        <span className="text-[10px] font-bold bg-green-100 text-green-800 px-1.5 py-0.5 rounded-sm">TARIFFA API REALE</span>
-                      )}
-                      {isResellerOrAdmin && q.contract_owner && (
-                        <span className={`text-[10px] font-bold px-1.5 py-0.5 rounded-sm ${q.contract_owner === "admin" ? "bg-orange-100 text-orange-800" : "bg-blue-100 text-blue-800"}`}>
-                          {q.contract_owner === "admin" ? "Codice Piattaforma" : "Tuo Codice"}
-                        </span>
-                      )}
+            {quotes.quotes.map((q, i) => {
+              const key = getOptKey(q);
+              const isSelected = chosen && getOptKey(chosen) === key;
+              return (
+                <div key={key} onClick={() => handleSelectCarrier(q)}
+                  className={`bg-white border rounded-sm p-4 cursor-pointer transition-all hover:shadow-md ${isSelected ? "border-l-[3px] border-orange-600 border-y border-r border-slate-200" : "border-slate-200"}`}>
+                  <div className="flex items-center gap-4">
+                    <div className="w-14 h-14 rounded-sm flex items-center justify-center font-black text-white shrink-0" style={{ backgroundColor: q.color, fontFamily: "Chivo" }}>
+                      {q.carrier_name.slice(0, 3).toUpperCase()}
                     </div>
-                    <div className="text-xs text-slate-500">Consegna stimata: {q.transit_days} {q.transit_days === 1 ? "giorno" : "giorni"} lav.</div>
-                    {i === 0 && <div className="mt-1 label-caps text-orange-600">Miglior prezzo</div>}
+                    <div className="flex-1 min-w-0">
+                      <div className="flex items-center gap-2 flex-wrap">
+                        <span className="font-bold text-slate-900">{q.carrier_name}</span>
+                        {isResellerOrAdmin && q.is_live && (
+                          <span className="text-[10px] font-bold bg-green-100 text-green-800 px-1.5 py-0.5 rounded-sm">TARIFFA API REALE</span>
+                        )}
+                        {isResellerOrAdmin && q.contract_owner && (
+                          <span className={`text-[10px] font-bold px-1.5 py-0.5 rounded-sm ${q.contract_owner === "admin" ? "bg-orange-100 text-orange-800" : "bg-blue-100 text-blue-800"}`}>
+                            {q.contract_owner === "admin" ? "Codice Piattaforma" : "Tuo Codice"}
+                          </span>
+                        )}
+                      </div>
+                      <div className="text-xs text-slate-500">
+                        Consegna stimata: {q.transit_days} {q.transit_days === 1 ? "giorno" : "giorni"} lav.
+                        {q.service_type && <span className="ml-2 font-mono text-[10px] text-slate-400">({q.service_type})</span>}
+                      </div>
+                      {i === 0 && <div className="mt-1 label-caps text-orange-600">Miglior prezzo</div>}
+                    </div>
+                    <div className="text-right">
+                      <div className="text-2xl font-black text-slate-900" style={{ fontFamily: "Chivo" }}>€ {q.price.toFixed(2)}</div>
+                      <div className="text-[10px] text-slate-400">IVA esclusa</div>
+                    </div>
                   </div>
-                  <div className="text-right">
-                    <div className="text-2xl font-black text-slate-900" style={{ fontFamily: "Chivo" }}>€ {q.price.toFixed(2)}</div>
-                    <div className="text-[10px] text-slate-400">IVA esclusa</div>
-                  </div>
-                </div>
 
-                {isResellerOrAdmin && q.reseller_base_freight !== undefined && (
-                  <div className="mt-3 pt-3 border-t border-slate-100 text-xs text-slate-600 bg-slate-50/70 px-3 py-2 rounded-sm">
-                    <div className="flex flex-wrap gap-x-4 gap-y-1">
-                      <span>Nolo base: <b className="text-slate-900">€ {q.reseller_base_freight.toFixed(2)}</b></span>
-                      <span>Supplementi totali: <b className="text-slate-900">€ {(q.reseller_surcharges_total ?? 0).toFixed(2)}</b></span>
-                      {q.reseller_surcharge_items?.map((sc, idx) => (
-                        <span key={idx} className="text-slate-500">
-                          • {sc.label}: € {sc.amount.toFixed(2)}
-                        </span>
-                      ))}
+                  {isResellerOrAdmin && q.reseller_base_freight !== undefined && (
+                    <div className="mt-3 pt-3 border-t border-slate-100 text-xs text-slate-600 bg-slate-50/70 px-3 py-2 rounded-sm">
+                      <div className="flex flex-wrap gap-x-4 gap-y-1">
+                        <span>Nolo base: <b className="text-slate-900">€ {q.reseller_base_freight.toFixed(2)}</b></span>
+                        <span>Supplementi totali: <b className="text-slate-900">€ {(q.reseller_surcharges_total ?? 0).toFixed(2)}</b></span>
+                        {q.reseller_surcharge_items?.map((sc, idx) => (
+                          <span key={idx} className="text-slate-500">
+                            • {sc.label}: € {sc.amount.toFixed(2)}
+                          </span>
+                        ))}
+                      </div>
                     </div>
-                  </div>
-                )}
-              </div>
-            ))}
+                  )}
+                </div>
+              );
+            })}
 
             {checkingAddr && (
               <div className="text-xs text-slate-500 bg-slate-50 border border-slate-200 rounded-sm p-3">
