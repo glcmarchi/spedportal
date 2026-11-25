@@ -206,12 +206,12 @@ async def get_fedex_transit_times(
         "requestedShipment": {
             "shipper": {"address": _addr_obj(sender, False)},
             "recipients": [{"address": _addr_obj(recipient, False)}],
-            "shipDatestamp": ship_date,
+            "shipDateStamp": ship_date,
             "pickupType": "DROPOFF_AT_FEDEX_LOCATION",
             "packagingType": "YOUR_PACKAGING",
             "requestedPackageLineItems": _build_package_items(parcels, 0.0),
         },
-        "carrierCodes": ["FDXE"],
+        "carrierCodes": ["FDXE", "FDXG"],
     }
     try:
         async with httpx.AsyncClient(timeout=15.0) as client:
@@ -221,6 +221,7 @@ async def get_fedex_transit_times(
                 headers=_headers(token),
             )
             if resp.status_code != 200:
+                logger.warning("FedEx TransitTimes %s: %s", resp.status_code, resp.text[:400])
                 return []
             tt_list = ((resp.json().get("output") or {}).get("transitTimes")) or []
             out = []
@@ -487,8 +488,6 @@ async def get_fedex_rates(
         special_block["specialServiceTypes"] = special_types
         requested_shipment["shipmentSpecialServices"] = special_block
 
-    # customsClearanceDetail va inviato SOLO per destinazioni Extra-UE (customs_required=True)
-    # e nella Rate API FedEx richiede paymentType="SENDER" sul preventivo
     if customs_required:
         total_w = round(sum(float(p["weight"]) for p in parcels), 2)
         val = round(max(1.0, float(customs_value or insured_value or 50.0)), 2)
