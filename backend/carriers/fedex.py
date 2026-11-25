@@ -92,6 +92,19 @@ def _headers(token: str) -> Dict[str, str]:
     }
 
 
+def _extract_fedex_error(resp: httpx.Response, default_msg: str) -> str:
+    try:
+        data = resp.json()
+        errs = data.get("errors") or []
+        if errs:
+            code = errs[0].get("code", "")
+            msg = errs[0].get("message", default_msg)
+            return f"{msg} [{code}]" if code else msg
+    except Exception:
+        pass
+    return f"{default_msg} (HTTP {resp.status_code})"
+
+
 async def validate_fedex_postal(country_code: str, postal_code: str, state_code: str = "") -> Optional[Dict[str, Any]]:
     if not is_fedex_configured() or not postal_code:
         return None
@@ -185,7 +198,6 @@ async def get_fedex_transit_times(
     recipient: Dict[str, Any],
     parcels: List[Dict[str, Any]],
 ) -> List[Dict[str, Any]]:
-    """Chiama POST /availability/v1/transittimes per ottenere tempi di resa e cut-off orari."""
     if not is_fedex_configured():
         return []
     token = await get_fedex_token()
@@ -342,8 +354,6 @@ def _extract_net_charge(rated_details: List[Dict[str, Any]]) -> Dict[str, Any]:
         surcharges = round(surcharges * rate, 2)
         currency = "EUR"
 
-    # Raccoglie TUTTI i supplementi sia a livello spedizione (shipmentRateDetail.surCharges)
-    # sia a livello di singolo collo (ratedPackageDetails[].packageRateDetail.surCharges)
     agg_surcharges: Dict[str, Dict[str, Any]] = {}
 
     def _collect(sc_list: List[Dict[str, Any]]):
@@ -367,8 +377,6 @@ def _extract_net_charge(rated_details: List[Dict[str, Any]]) -> Dict[str, Any]:
     clean_surcharges = list(agg_surcharges.values())
     sum_items = round(sum(x["amount"] for x in clean_surcharges), 2)
 
-    # Quadratura: se FedEx riporta un totale supplementi diverso dalla somma delle singole voci
-    # (o se base + supplementi differisce dal netto), allinea le voci in modo trasparente
     implied_surcharges = round(max(surcharges, net - base), 2)
     diff = round(implied_surcharges - sum_items, 2)
     if diff > 0.01:
@@ -482,26 +490,28 @@ async def get_fedex_rates(
     if is_intl or customs_required:
         total_w = round(sum(float(p["weight"]) for p in parcels), 2)
         duties_payor = "SENDER" if (incoterms or "DAP").upper() == "DDP" else "RECIPIENT"
+        val = round(max(1.0, float(customs_value or insured_value or 50.0)), 2)
+        curr = (customs_currency or "EUR").upper()
+        comm: Dict[str, Any] = {
+            "description": (goods_description or "Commercial Goods")[:400],
+            "quantity": 1,
+            "quantityUnits": "PCS",
+            "weight": {"units": "KG", "value": max(0.1, total_w)},
+            "customsValue": {"amount": val, "currency": curr},
+        }
+        clean_hs = "".join(ch for ch in (hs_code or "") if ch.isdigit())
+        if len(clean_hs) >= 6:
+            comm["harmonizedCode"] = clean_hs[:10]
+
         requested_shipment["customsClearanceDetail"] = {
             "dutiesPayment": {"paymentType": duties_payor},
-            "commodities": [
-                _build_commodity_item(
-                    goods_description=goods_description,
-                    origin_country=s_country,
-                    total_weight=total_w,
-                    pkg_count=len(parcels),
-                    customs_value=customs_value or insured_value or 50.0,
-                    currency=customs_currency,
-                    hs_code=hs_code,
-                )
-            ],
+            "commodities": [comm],
         }
 
     payload = {
         "accountNumber": {"value": str(account_number).strip()},
         "rateRequestControlParameters": {
             "returnTransitTimes": True,
-            "rateSortOrder": "COMMITASCENDING",
         },
         "requestedShipment": requested_shipment,
     }
@@ -513,11 +523,17 @@ async def get_fedex_rates(
             headers=_headers(token),
         )
         if resp.status_code != 200:
-            logger.warning("FedEx Rate API %s: %s", resp.status_code, resp.text[:500])
-            raise RuntimeError(f"FedEx Rate API error {resp.status_code}")
+            detail = _extract_fedex_error(resp, "Errore Rate API")
+            logger.warning("FedEx Rate API %s: %s", resp.status_code, resp.text[:700])
+            raise RuntimeError(detail)
 
         data = resp.json()
         details = ((data.get("output") or {}).get("rateReplyDetails")) or []
+        if not details:
+            alerts = ((data.get("output") or {}).get("alerts")) or []
+            alert_msg = alerts[0].get("message") if alerts else "Nessun servizio disponibile per la combinazione selezionata"
+            raise RuntimeError(alert_msg)
+
         results = []
         for item in details:
             rated = item.get("ratedShipmentDetails") or []
@@ -540,6 +556,8 @@ async def get_fedex_rates(
                 "currency": parsed["currency"],
                 "transit_days": transit_days,
             })
+        if not results:
+            raise RuntimeError("FedEx ha restituito servizi senza tariffa associata")
         return results
 
 
@@ -689,14 +707,8 @@ async def create_fedex_shipment(
         )
         if resp.status_code != 200:
             logger.error("FedEx Ship API %s: %s", resp.status_code, resp.text[:800])
-            err_msg = "Errore creazione spedizione FedEx"
-            try:
-                errs = resp.json().get("errors") or []
-                if errs:
-                    err_msg = f"FedEx: {errs[0].get('message', err_msg)}"
-            except Exception:
-                pass
-            raise RuntimeError(err_msg)
+            err_msg = _extract_fedex_error(resp, "Errore creazione spedizione FedEx")
+            raise RuntimeError(f"FedEx: {err_msg}")
 
         data = resp.json()
         tx_ships = ((data.get("output") or {}).get("transactionShipments")) or []
@@ -753,14 +765,8 @@ async def cancel_fedex_shipment(
         )
         if resp.status_code != 200:
             logger.error("FedEx Cancel API %s: %s", resp.status_code, resp.text[:600])
-            err_msg = "Errore annullamento spedizione FedEx"
-            try:
-                errs = resp.json().get("errors") or []
-                if errs:
-                    err_msg = f"FedEx: {errs[0].get('message', err_msg)}"
-            except Exception:
-                pass
-            raise RuntimeError(err_msg)
+            err_msg = _extract_fedex_error(resp, "Errore annullamento spedizione FedEx")
+            raise RuntimeError(f"FedEx: {err_msg}")
 
         data = resp.json()
         out = data.get("output") or {}
@@ -839,14 +845,8 @@ async def schedule_fedex_pickup(
         )
         if resp.status_code != 200:
             logger.error("FedEx Pickup API %s: %s", resp.status_code, resp.text[:800])
-            err_msg = "Errore prenotazione ritiro FedEx"
-            try:
-                errs = resp.json().get("errors") or []
-                if errs:
-                    err_msg = f"FedEx: {errs[0].get('message', err_msg)}"
-            except Exception:
-                pass
-            raise RuntimeError(err_msg)
+            err_msg = _extract_fedex_error(resp, "Errore prenotazione ritiro FedEx")
+            raise RuntimeError(f"FedEx: {err_msg}")
 
         data = resp.json()
         out = data.get("output") or {}
@@ -884,14 +884,8 @@ async def cancel_fedex_pickup(
         )
         if resp.status_code != 200:
             logger.error("FedEx Cancel Pickup %s: %s", resp.status_code, resp.text[:600])
-            err_msg = "Errore annullamento ritiro FedEx"
-            try:
-                errs = resp.json().get("errors") or []
-                if errs:
-                    err_msg = f"FedEx: {errs[0].get('message', err_msg)}"
-            except Exception:
-                pass
-            raise RuntimeError(err_msg)
+            err_msg = _extract_fedex_error(resp, "Errore annullamento ritiro FedEx")
+            raise RuntimeError(f"FedEx: {err_msg}")
 
         data = resp.json()
         out = data.get("output") or {}
