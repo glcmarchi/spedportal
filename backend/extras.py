@@ -226,13 +226,15 @@ IT_PROV_PREFIX = {
 }
 
 IE_EIRCODE_AREAS = {
-    "D01": "Dublin 1", "D02": "Dublin 2", "D03": "Dublin 3", "D04": "Dublin 4",
-    "D05": "Dublin 5", "D06": "Dublin 6", "D07": "Dublin 7", "D08": "Dublin 8",
-    "D09": "Dublin 9", "D10": "Dublin 10", "D11": "Dublin 11", "D12": "Dublin 12",
-    "D13": "Dublin 13", "D14": "Dublin 14", "D15": "Dublin 15", "D16": "Dublin 16",
-    "D17": "Dublin 17", "D18": "Dublin 18", "D20": "Dublin 20", "D22": "Dublin 22",
-    "D24": "Dublin 24", "A94": "Blackrock", "A96": "Dun Laoghaire", "A98": "Bray",
-    "T12": "Cork", "T23": "Cork", "V94": "Limerick", "H91": "Galway", "X91": "Waterford",
+    "D01": ["Dublin 1", "Dublin"], "D02": ["Dublin 2", "Dublin"], "D03": ["Dublin 3", "Dublin"],
+    "D04": ["Dublin 4", "Dublin"], "D05": ["Dublin 5", "Dublin"], "D06": ["Dublin 6", "Dublin"],
+    "D07": ["Dublin 7", "Dublin"], "D08": ["Dublin 8", "Dublin"], "D09": ["Dublin 9", "Dublin"],
+    "D10": ["Dublin 10", "Dublin"], "D11": ["Dublin 11", "Dublin"], "D12": ["Dublin 12", "Dublin"],
+    "D13": ["Dublin 13", "Dublin"], "D14": ["Dublin 14", "Dublin"], "D15": ["Dublin 15", "Dublin"],
+    "D16": ["Dublin 16", "Dublin"], "D17": ["Dublin 17", "Dublin"], "D18": ["Dublin 18", "Dublin"],
+    "D20": ["Dublin 20", "Dublin"], "D22": ["Dublin 22", "Dublin"], "D24": ["Dublin 24", "Dublin"],
+    "A94": ["Blackrock", "Dublin"], "A96": ["Dun Laoghaire", "Dublin"], "A98": ["Bray"],
+    "T12": ["Cork"], "T23": ["Cork"], "V94": ["Limerick"], "H91": ["Galway"], "X91": ["Waterford"],
 }
 
 def _it_province_from_cap(cap: str) -> str:
@@ -256,14 +258,13 @@ async def geo_lookup(country: str = "IT", cap: str = ""):
     country = (country or "IT").upper().strip()
     cap = (cap or "").strip().upper()
     if not cap:
-        return {"country": country, "cap": cap, "city": None, "province": None, "valid": True}
+        return {"country": country, "cap": cap, "city": None, "cities": [], "province": None, "valid": True}
 
     it_prov = _it_province_from_cap(cap) if country == "IT" else ""
-    city = None
+    cities_set = []
     ext_prov = ""
     valid = True
 
-    # 1. Validazione CAP ufficiale tramite FedEx Postal Code Validation API
     fx_postal = await validate_fedex_postal(country, cap, it_prov)
     if fx_postal is not None:
         valid = fx_postal.get("valid", True)
@@ -272,32 +273,37 @@ async def geo_lookup(country: str = "IT", cap: str = ""):
         if fx_postal.get("province") and country in ("IT", "US", "CA", "AU"):
             ext_prov = fx_postal["province"]
 
-    # 2. Risoluzione nome città (Eircode irlandese, Zippopotam internazionale)
     if country == "IE":
         routing_key = cap.replace(" ", "")[:3]
         if routing_key in IE_EIRCODE_AREAS:
-            city = IE_EIRCODE_AREAS[routing_key]
-    if not city:
-        try:
-            zippo_cc = "gb" if country == "UK" else country.lower()
-            query_cap = cap.split("-")[0].strip() if country in ("US", "PL") else cap
-            async with httpx.AsyncClient(timeout=4.0) as client:
-                r = await client.get(f"https://api.zippopotam.us/{zippo_cc}/{query_cap}")
-                if r.status_code == 200:
-                    places = r.json().get("places") or []
-                    if places:
-                        p0 = places[0]
-                        city = p0.get("place name")
-                        if not ext_prov and country in ("US", "CA", "AU"):
-                            ext_prov = (p0.get("state abbreviation") or "")[:2].upper()
-        except Exception:
-            pass
+            cities_set.extend(IE_EIRCODE_AREAS[routing_key])
 
+    try:
+        zippo_cc = "gb" if country == "UK" else country.lower()
+        query_cap = cap.split("-")[0].strip() if country in ("US", "PL") else cap
+        async with httpx.AsyncClient(timeout=4.0) as client:
+            r = await client.get(f"https://api.zippopotam.us/{zippo_cc}/{query_cap}")
+            if r.status_code == 200:
+                places = r.json().get("places") or []
+                for p in places:
+                    pname = (p.get("place name") or "").strip()
+                    if pname and pname not in cities_set:
+                        cities_set.append(pname)
+                    if not ext_prov and country in ("US", "CA", "AU"):
+                        ext_prov = (p.get("state abbreviation") or "")[:2].upper()
+    except Exception:
+        pass
+
+    # Ordina alfabeticamente le località trovate per quel CAP
+    cities_sorted = sorted(cities_set, key=lambda x: x.lower())
+    primary_city = cities_sorted[0] if cities_sorted else None
     final_prov = (it_prov or ext_prov) if country in ("IT", "US", "CA", "AU") else ""
+
     return {
         "country": country,
         "cap": cap,
-        "city": city,
+        "city": primary_city,
+        "cities": cities_sorted,
         "province": final_prov or None,
         "valid": valid,
     }
