@@ -28,6 +28,7 @@ from carriers.fedex import (
     cancel_fedex_pickup,
     track_fedex_shipment,
     validate_fedex_address,
+    get_fedex_transit_times,
 )
 
 ROOT_DIR = Path(__file__).parent
@@ -184,6 +185,8 @@ class QuoteRequest(BaseModel):
 class CreateShipmentInput(BaseModel):
     quote: QuoteRequest
     carrier_id: str
+    service_type: Optional[str] = ""
+    expect_live: Optional[bool] = None
 
 class ValidateAddressInput(BaseModel):
     carrier_id: str
@@ -577,7 +580,57 @@ async def _ensure_ddp_allowed(q: QuoteRequest, user: dict):
         raise HTTPException(403, "La resa doganale DDP non è abilitata per questo account. Utilizza DAP oppure contatta l'amministratore.")
 
 
-async def _compute_quotes_internal(q: QuoteRequest, user: dict) -> dict:
+def _build_quote_option(
+    cid: str,
+    carrier_label: str,
+    color: str,
+    service_type: str,
+    is_live: bool,
+    carrier_cost: float,
+    raw_freight: float,
+    raw_surcharge_items: List[Dict[str, Any]],
+    transit: int,
+    billed_weight: float,
+    zone_macro: str,
+    opt: dict,
+    reseller_mk_pct: float,
+) -> dict:
+    admin_mk_pct = opt["admin_markup_percent"] if opt["owner"] == "admin" else 0.0
+    mult_admin = 1 + admin_mk_pct / 100.0
+
+    reseller_base_freight = round(raw_freight * mult_admin, 2)
+    reseller_surcharge_items = [
+        {**item, "amount": round(item["amount"] * mult_admin, 2)}
+        for item in raw_surcharge_items
+    ]
+    reseller_surcharges_total = round(sum(x["amount"] for x in reseller_surcharge_items), 2)
+    reseller_cost = round(reseller_base_freight + reseller_surcharges_total, 2)
+    client_price = round(reseller_cost * (1 + reseller_mk_pct / 100.0), 2)
+
+    return {
+        "option_key": f"{cid}:{service_type}",
+        "carrier_id": cid,
+        "carrier_name": carrier_label,
+        "color": color,
+        "service_type": service_type,
+        "is_live": is_live,
+        "carrier_cost": carrier_cost,
+        "admin_markup_percent": admin_mk_pct,
+        "reseller_base_freight": reseller_base_freight,
+        "reseller_surcharges_total": reseller_surcharges_total,
+        "reseller_surcharge_items": reseller_surcharge_items,
+        "reseller_cost": reseller_cost,
+        "reseller_markup_percent": reseller_mk_pct,
+        "cost": reseller_cost,
+        "price": client_price,
+        "transit_days": transit,
+        "billed_weight": round(billed_weight, 2),
+        "zone": zone_macro,
+        "contract_owner": opt["owner"],
+    }
+
+
+async def _compute_quotes_internal(q: QuoteRequest, user: dict, strict_live: bool = False) -> dict:
     await _ensure_ddp_allowed(q, user)
     total_weight = sum(p.weight for p in q.parcels)
     vol_weight = sum((p.length * p.width * p.height) / 5000.0 for p in q.parcels)
@@ -593,10 +646,10 @@ async def _compute_quotes_internal(q: QuoteRequest, user: dict) -> dict:
         if not opt:
             continue
 
-        live_fedex = None
+        live_fedex_list = []
         if cid == "tnt" and is_fedex_configured() and opt["code"]:
             try:
-                fx_rates = await get_fedex_rates(
+                live_fedex_list = await get_fedex_rates(
                     account_number=opt["code"],
                     sender=q.sender.model_dump(),
                     recipient=q.recipient.model_dump(),
@@ -613,86 +666,79 @@ async def _compute_quotes_internal(q: QuoteRequest, user: dict) -> dict:
                     residential_delivery=q.services.residential_delivery,
                     cod_amount=q.services.cod_amount if q.services.cod else 0.0,
                 )
-                if fx_rates:
-                    fx_rates.sort(key=lambda x: x["carrier_cost"])
-                    live_fedex = fx_rates[0]
             except Exception as e:
-                logger.warning("Fallback tariffa simulata per FedEx: %s", e)
+                logger.warning("Errore tariffa live FedEx: %s", e)
+                if strict_live:
+                    raise HTTPException(502, f"Impossibile riconfermare la tariffa FedEx in tempo reale: {e}")
 
-        if live_fedex:
-            carrier_cost = live_fedex["carrier_cost"]
-            raw_freight = live_fedex["base_charge"]
-            raw_surcharges_total = live_fedex["surcharges"]
-            raw_surcharge_items = list(live_fedex["surcharge_list"])
-            if q.services.neutral_delivery:
-                raw_surcharge_items.append({"type": "NEUTRAL", "label": "Consegna Neutra", "amount": 2.00})
-                raw_surcharges_total = round(raw_surcharges_total + 2.00, 2)
-                carrier_cost = round(carrier_cost + 2.00, 2)
-            if zone_info["is_extra_eu"] and (q.customs.incoterms or "DAP").upper() == "DDP":
-                raw_surcharge_items.append({"type": "DDP", "label": "Gestione Resa DDP (Dazi Mittente)", "amount": 15.00})
-                raw_surcharges_total = round(raw_surcharges_total + 15.00, 2)
-                carrier_cost = round(carrier_cost + 15.00, 2)
-            transit = live_fedex["transit_days"]
-            service_type = live_fedex["service_type"]
-            carrier_label = live_fedex["service_name"]
-            is_live = True
+        if live_fedex_list:
+            for fx in live_fedex_list:
+                carrier_cost = fx["carrier_cost"]
+                raw_freight = fx["base_charge"]
+                raw_surcharge_items = list(fx["surcharge_list"])
+                if q.services.neutral_delivery:
+                    raw_surcharge_items.append({"type": "NEUTRAL", "label": "Consegna Neutra", "amount": 2.00})
+                    carrier_cost = round(carrier_cost + 2.00, 2)
+                if zone_info["is_extra_eu"] and (q.customs.incoterms or "DAP").upper() == "DDP":
+                    raw_surcharge_items.append({"type": "DDP", "label": "Gestione Resa DDP (Dazi Mittente)", "amount": 15.00})
+                    carrier_cost = round(carrier_cost + 15.00, 2)
+
+                quotes.append(
+                    _build_quote_option(
+                        cid=cid,
+                        carrier_label=fx["service_name"],
+                        color=c["color"],
+                        service_type=fx["service_type"],
+                        is_live=True,
+                        carrier_cost=carrier_cost,
+                        raw_freight=raw_freight,
+                        raw_surcharge_items=raw_surcharge_items,
+                        transit=fx["transit_days"],
+                        billed_weight=billed_weight,
+                        zone_macro=zone_info["macro"],
+                        opt=opt,
+                        reseller_mk_pct=reseller_mk_pct,
+                    )
+                )
         else:
+            if strict_live:
+                raise HTTPException(502, "Tariffa corriere in tempo reale temporaneamente non disponibile. Riprova tra qualche secondo.")
             bk = _mock_carrier_breakdown(cid, billed_weight, zone_info, len(q.parcels), q.services, q.customs, zone_info["is_extra_eu"])
-            carrier_cost = bk["total_cost"]
-            raw_freight = bk["base_freight"]
-            raw_surcharges_total = bk["surcharges_total"]
-            raw_surcharge_items = bk["surcharge_items"]
             transit = 1 if zone_info["macro"] == "NAZ" else (3 if cid in ["dhl", "ups", "tnt"] else 5)
             service_type = "INTERNATIONAL_PRIORITY" if zone_info["macro"] != "NAZ" else "FEDEX_PRIORITY"
-            carrier_label = c["name"]
-            is_live = False
+            quotes.append(
+                _build_quote_option(
+                    cid=cid,
+                    carrier_label=c["name"],
+                    color=c["color"],
+                    service_type=service_type,
+                    is_live=False,
+                    carrier_cost=bk["total_cost"],
+                    raw_freight=bk["base_freight"],
+                    raw_surcharge_items=bk["surcharge_items"],
+                    transit=transit,
+                    billed_weight=billed_weight,
+                    zone_macro=zone_info["macro"],
+                    opt=opt,
+                    reseller_mk_pct=reseller_mk_pct,
+                )
+            )
 
-        admin_mk_pct = opt["admin_markup_percent"] if opt["owner"] == "admin" else 0.0
-        mult_admin = 1 + admin_mk_pct / 100.0
-
-        reseller_base_freight = round(raw_freight * mult_admin, 2)
-        reseller_surcharge_items = [
-            {**item, "amount": round(item["amount"] * mult_admin, 2)}
-            for item in raw_surcharge_items
-        ]
-        reseller_surcharges_total = round(sum(x["amount"] for x in reseller_surcharge_items), 2)
-        reseller_cost = round(reseller_base_freight + reseller_surcharges_total, 2)
-
-        client_price = round(reseller_cost * (1 + reseller_mk_pct / 100.0), 2)
-
-        quotes.append({
-            "carrier_id": cid,
-            "carrier_name": carrier_label,
-            "color": c["color"],
-            "service_type": service_type,
-            "is_live": is_live,
-            "carrier_cost": carrier_cost,
-            "admin_markup_percent": admin_mk_pct,
-            "reseller_base_freight": reseller_base_freight,
-            "reseller_surcharges_total": reseller_surcharges_total,
-            "reseller_surcharge_items": reseller_surcharge_items,
-            "reseller_cost": reseller_cost,
-            "reseller_markup_percent": reseller_mk_pct,
-            "cost": reseller_cost,
-            "price": client_price,
-            "transit_days": transit,
-            "billed_weight": round(billed_weight, 2),
-            "zone": zone_info["macro"],
-            "contract_owner": opt["owner"],
-        })
     quotes.sort(key=lambda x: x["price"])
     return {"quotes": quotes, "billed_weight": round(billed_weight, 2), "zone": zone_info["macro"], "is_extra_eu": zone_info["is_extra_eu"]}
 
 
 @api_router.post("/shipments/quote")
 async def quote_shipment(q: QuoteRequest, user=Depends(require_approved)):
-    full = await _compute_quotes_internal(q, user)
+    full = await _compute_quotes_internal(q, user, strict_live=False)
     role = user.get("role")
     if role == "user":
         sanitized = [
             {
+                "option_key": item["option_key"],
                 "carrier_id": item["carrier_id"],
                 "carrier_name": item["carrier_name"],
+                "service_type": item["service_type"],
                 "color": item["color"],
                 "price": item["price"],
                 "transit_days": item["transit_days"],
@@ -703,6 +749,16 @@ async def quote_shipment(q: QuoteRequest, user=Depends(require_approved)):
         ]
         return {"quotes": sanitized, "billed_weight": full["billed_weight"], "zone": full["zone"], "is_extra_eu": full["is_extra_eu"]}
     return full
+
+
+@api_router.post("/shipments/transit-times")
+async def check_transit_times(q: QuoteRequest, _=Depends(require_approved)):
+    items = await get_fedex_transit_times(
+        sender=q.sender.model_dump(),
+        recipient=q.recipient.model_dump(),
+        parcels=[p.model_dump() for p in q.parcels],
+    )
+    return {"services": items}
 
 
 @api_router.post("/shipments/validate-address")
@@ -718,10 +774,15 @@ def _tracking_number(carrier_id: str) -> str:
 
 @api_router.post("/shipments")
 async def create_shipment(inp: CreateShipmentInput, user=Depends(require_approved)):
-    full_quotes = await _compute_quotes_internal(inp.quote, user)
-    chosen = next((q for q in full_quotes["quotes"] if q["carrier_id"] == inp.carrier_id), None)
+    full_quotes = await _compute_quotes_internal(inp.quote, user, strict_live=bool(inp.expect_live))
+    matching = [q for q in full_quotes["quotes"] if q["carrier_id"] == inp.carrier_id]
+    chosen = None
+    if inp.service_type:
+        chosen = next((q for q in matching if q.get("service_type") == inp.service_type), None)
+    if not chosen and matching:
+        chosen = matching[0]
     if not chosen:
-        raise HTTPException(400, "Corriere non valido o non abilitato per questo account")
+        raise HTTPException(400, "Servizio corriere non valido o non più disponibile per questa tratta")
 
     options = await _resolve_tenant_carrier_options(user)
     opt = options.get(inp.carrier_id)
