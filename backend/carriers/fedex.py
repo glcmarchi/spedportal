@@ -487,9 +487,10 @@ async def get_fedex_rates(
         special_block["specialServiceTypes"] = special_types
         requested_shipment["shipmentSpecialServices"] = special_block
 
-    if is_intl or customs_required:
+    # customsClearanceDetail va inviato SOLO per destinazioni Extra-UE (customs_required=True)
+    # e nella Rate API FedEx richiede paymentType="SENDER" sul preventivo
+    if customs_required:
         total_w = round(sum(float(p["weight"]) for p in parcels), 2)
-        duties_payor = "SENDER" if (incoterms or "DAP").upper() == "DDP" else "RECIPIENT"
         val = round(max(1.0, float(customs_value or insured_value or 50.0)), 2)
         curr = (customs_currency or "EUR").upper()
         comm: Dict[str, Any] = {
@@ -504,7 +505,7 @@ async def get_fedex_rates(
             comm["harmonizedCode"] = clean_hs[:10]
 
         requested_shipment["customsClearanceDetail"] = {
-            "dutiesPayment": {"paymentType": duties_payor},
+            "dutiesPayment": {"paymentType": "SENDER"},
             "commodities": [comm],
         }
 
@@ -591,7 +592,6 @@ async def create_fedex_shipment(
     ship_date = datetime.now(timezone.utc).strftime("%Y-%m-%d")
     s_country = (sender.get("country") or "IT").upper()
     r_country = (recipient.get("country") or "IT").upper()
-    is_intl = s_country != r_country
     total_w = round(sum(float(p["weight"]) for p in parcels), 2)
 
     shipper_addr = {
@@ -653,7 +653,7 @@ async def create_fedex_shipment(
         }
 
     etd_result = {"uploaded": [], "paperless_ok": False, "fallback_paper": False}
-    if (is_intl or customs_required) and etd_docs:
+    if customs_required and etd_docs:
         etd_result = await upload_fedex_etd_documents(s_country, r_country, etd_docs)
         if etd_result["paperless_ok"]:
             special_types.append("ELECTRONIC_TRADE_DOCUMENTS")
@@ -671,7 +671,7 @@ async def create_fedex_shipment(
         special_block["specialServiceTypes"] = special_types
         requested_shipment["shipmentSpecialServices"] = special_block
 
-    if is_intl or customs_required:
+    if customs_required:
         duties_payor = "SENDER" if (incoterms or "DAP").upper() == "DDP" else "RECIPIENT"
         duties_block: Dict[str, Any] = {"paymentType": duties_payor}
         if duties_payor == "SENDER":
@@ -740,7 +740,7 @@ async def create_fedex_shipment(
             "service_name": tx.get("serviceName", "FedEx"),
             "label_pdf_base64": label_b64,
             "paperless_ok": etd_result["paperless_ok"],
-            "fallback_paper": (is_intl or customs_required) and not etd_result["paperless_ok"],
+            "fallback_paper": customs_required and not etd_result["paperless_ok"],
         }
 
 
