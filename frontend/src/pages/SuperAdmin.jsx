@@ -534,6 +534,40 @@ export default function SuperAdmin() {
                 <div className="flex justify-between py-2 border-b"><span>Fee lettere di vettura su codici Reseller ({billing.shipments_on_own})</span><b>€ {billing.amount_due_premium.toFixed(2)}</b></div>
                 <div className="flex justify-between py-3 border-t-2 border-slate-900 text-lg"><span className="font-black">Volume complessivo Admin</span><b className="text-orange-600">€ {billing.amount_due_total.toFixed(2)}</b></div>
               </div>
+
+              {billing.ledger?.length > 0 && (
+                <div className="mt-4">
+                  <div className="label-caps mb-2">Cronostoria Movimenti Wallet (Ricariche & Addebiti)</div>
+                  <div className="border rounded-sm overflow-hidden text-xs">
+                    <table className="w-full text-left">
+                      <thead className="bg-slate-100">
+                        <tr>
+                          <th className="p-2">Data</th>
+                          <th className="p-2">Tipo</th>
+                          <th className="p-2">Causale</th>
+                          <th className="p-2 text-right">Importo</th>
+                        </tr>
+                      </thead>
+                      <tbody>
+                        {billing.ledger.map((m, i) => {
+                          const amt = Number(m.amount || 0);
+                          return (
+                            <tr key={m.id || i} className="border-t">
+                              <td className="p-2 font-mono">{(m.created_at || "").replace("T", " ").slice(0, 16)}</td>
+                              <td className="p-2 font-semibold">{m.type}</td>
+                              <td className="p-2 text-slate-600">{m.note || "-"}</td>
+                              <td className={`p-2 text-right font-mono font-bold ${amt >= 0 ? "text-green-700" : "text-red-600"}`}>
+                                {amt >= 0 ? `+ € ${amt.toFixed(2)}` : `- € ${Math.abs(amt).toFixed(2)}`}
+                              </td>
+                            </tr>
+                          );
+                        })}
+                      </tbody>
+                    </table>
+                  </div>
+                </div>
+              )}
+
               {billing.recent_shipments?.length > 0 && (
                 <div className="mt-4">
                   <div className="label-caps mb-2">Dettaglio ultime spedizioni</div>
