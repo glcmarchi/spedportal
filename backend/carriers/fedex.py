@@ -202,16 +202,31 @@ async def get_fedex_transit_times(
         return []
     token = await get_fedex_token()
     ship_date = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    s_country = (sender.get("country") or "IT").upper()
+    r_country = (recipient.get("country") or "IT").upper()
+
+    req_ship: Dict[str, Any] = {
+        "shipper": {"address": _addr_obj(sender, False)},
+        "recipients": [{"address": _addr_obj(recipient, False)}],
+        "shipDatestamp": ship_date,
+        "pickupType": "DROPOFF_AT_FEDEX_LOCATION",
+        "packagingType": "YOUR_PACKAGING",
+        "requestedPackageLineItems": _build_package_items(parcels, 0.0),
+    }
+    if s_country != r_country:
+        total_w = round(sum(float(p["weight"]) for p in parcels), 2)
+        req_ship["customsClearanceDetail"] = {
+            "commodities": [{
+                "description": "Commercial Goods",
+                "numberOfPieces": max(1, len(parcels)),
+                "weight": {"units": "KG", "value": max(0.1, total_w)},
+                "customsValue": {"amount": 50.0, "currency": "EUR"},
+            }]
+        }
+
     payload = {
-        "requestedShipment": {
-            "shipper": {"address": _addr_obj(sender, False)},
-            "recipients": [{"address": _addr_obj(recipient, False)}],
-            "shipDateStamp": ship_date,
-            "pickupType": "DROPOFF_AT_FEDEX_LOCATION",
-            "packagingType": "YOUR_PACKAGING",
-            "requestedPackageLineItems": _build_package_items(parcels, 0.0),
-        },
-        "carrierCodes": ["FDXE", "FDXG"],
+        "requestedShipment": req_ship,
+        "carrierCodes": ["FDXE"],
     }
     try:
         async with httpx.AsyncClient(timeout=15.0) as client:
@@ -488,7 +503,9 @@ async def get_fedex_rates(
         special_block["specialServiceTypes"] = special_types
         requested_shipment["shipmentSpecialServices"] = special_block
 
-    if customs_required:
+    # FedEx Rate API richiede customsClearanceDetail per QUALSIASI spedizione cross-border (is_intl=True, incl. UE)
+    # con paymentType="SENDER" sul preventivo
+    if is_intl or customs_required:
         total_w = round(sum(float(p["weight"]) for p in parcels), 2)
         val = round(max(1.0, float(customs_value or insured_value or 50.0)), 2)
         curr = (customs_currency or "EUR").upper()
