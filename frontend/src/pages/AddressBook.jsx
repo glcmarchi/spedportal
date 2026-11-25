@@ -1,4 +1,4 @@
-import React, { useEffect, useState } from "react";
+import React, { useEffect, useState, useMemo } from "react";
 import { api } from "@/lib/api";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
@@ -7,23 +7,38 @@ import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@
 import { Dialog, DialogContent, DialogHeader, DialogTitle } from "@/components/ui/dialog";
 import { COUNTRIES, PROVINCE_COUNTRIES, FieldTooltip } from "@/pages/NewShipment";
 import { toast } from "sonner";
-import { AddressBook, Plus, PencilSimple, Trash, DownloadSimple, UploadSimple } from "@phosphor-icons/react";
+import { AddressBook, Plus, PencilSimple, Trash, DownloadSimple, UploadSimple, MagnifyingGlass } from "@phosphor-icons/react";
 
 export default function AddressBookPage() {
   const [items, setItems] = useState([]);
+  const [search, setSearch] = useState("");
   const [open, setOpen] = useState(false);
   const [editing, setEditing] = useState(null);
+  const [cityOptions, setCityOptions] = useState([]);
   const empty = { label: "", company_name: "", address: "", postal_code: "", city: "", province: "", country: "IT", reference: "", email: "", phone: "" };
   const [form, setForm] = useState(empty);
 
   const load = () => { api.get("/addressbook").then(r => setItems(r.data)); };
   useEffect(() => { load(); }, []);
 
+  const filteredItems = useMemo(() => {
+    const q = search.trim().toLowerCase();
+    if (!q) return items;
+    return items.filter(it =>
+      (it.company_name || "").toLowerCase().includes(q) ||
+      (it.label || "").toLowerCase().includes(q) ||
+      (it.city || "").toLowerCase().includes(q) ||
+      (it.postal_code || "").toLowerCase().includes(q) ||
+      (it.reference || "").toLowerCase().includes(q)
+    );
+  }, [items, search]);
+
   const cc = (form.country || "IT").toUpperCase();
   const showProvince = PROVINCE_COUNTRIES.has(cc);
 
   const handleCountryChange = (newCountry) => {
     const up = newCountry.toUpperCase();
+    setCityOptions([]);
     setForm(f => ({
       ...f,
       country: up,
@@ -35,6 +50,11 @@ export default function AddressBookPage() {
     if (!cap) return;
     try {
       const r = await api.get(`/geo/lookup?country=${cc}&cap=${encodeURIComponent(cap)}`);
+      if (r.data.valid === false) {
+        toast.warning(`Il CAP "${cap}" non risulta valido per ${cc}`);
+      }
+      const list = r.data.cities || (r.data.city ? [r.data.city] : []);
+      setCityOptions(list);
       if (r.data.city || r.data.province) {
         setForm(f => ({
           ...f,
@@ -54,8 +74,8 @@ export default function AddressBookPage() {
     } catch (err) { toast.error(err?.response?.data?.detail || "Errore"); }
   };
   const remove = async (id) => { if (window.confirm("Eliminare?")) { await api.delete(`/addressbook/${id}`); load(); } };
-  const startNew = () => { setEditing(null); setForm(empty); setOpen(true); };
-  const startEdit = (it) => { setEditing(it); setForm({ ...empty, ...it }); setOpen(true); };
+  const startNew = () => { setEditing(null); setCityOptions([]); setForm(empty); setOpen(true); };
+  const startEdit = (it) => { setEditing(it); setCityOptions([]); setForm({ ...empty, ...it }); setOpen(true); };
 
   const downloadTemplate = async () => {
     const r = await api.get("/addressbook/template", { responseType: "blob" });
@@ -86,6 +106,17 @@ export default function AddressBookPage() {
           <Button onClick={startNew} className="bg-orange-600 hover:bg-orange-700 rounded-sm h-11"><Plus size={16} className="mr-2" /> Nuovo Indirizzo</Button>
         </div>
       </div>
+
+      <div className="bg-white border border-slate-200 rounded-sm p-3 flex items-center gap-2 max-w-md">
+        <MagnifyingGlass size={16} className="text-slate-400 shrink-0" />
+        <Input
+          value={search}
+          onChange={(e) => setSearch(e.target.value)}
+          placeholder="Cerca ragione sociale, sede, città o CAP…"
+          className="border-0 shadow-none focus-visible:ring-0 h-8 px-1 text-sm"
+        />
+      </div>
+
       <div className="bg-white border border-slate-200 rounded-sm overflow-hidden">
         <div className="overflow-x-auto">
           <table className="w-full text-sm">
@@ -102,7 +133,7 @@ export default function AddressBookPage() {
               </tr>
             </thead>
             <tbody>
-              {items.map(it => (
+              {filteredItems.map(it => (
                 <tr key={it.id} className="border-b border-slate-100 hover:bg-slate-50/60">
                   <td className="px-4 py-2.5 text-slate-500">{it.label}</td>
                   <td className="px-4 py-2.5 font-semibold">{it.company_name}</td>
@@ -117,7 +148,7 @@ export default function AddressBookPage() {
                   </td>
                 </tr>
               ))}
-              {items.length === 0 && <tr><td colSpan={8} className="text-center py-10 text-slate-500">Nessun indirizzo salvato.</td></tr>}
+              {filteredItems.length === 0 && <tr><td colSpan={8} className="text-center py-10 text-slate-500">Nessun indirizzo trovato.</td></tr>}
             </tbody>
           </table>
         </div>
@@ -147,7 +178,29 @@ export default function AddressBookPage() {
               </Label>
               <Input value={form.postal_code || ""} onChange={(e) => setForm({ ...form, postal_code: e.target.value })} onBlur={(e) => lookupCap(e.target.value)} className="mt-1 rounded-sm h-10" />
             </div>
-            <div className={showProvince ? "" : "sm:col-span-2"}><Label className="label-caps">Città*</Label><Input value={form.city || ""} onChange={(e) => setForm({ ...form, city: e.target.value })} className="mt-1 rounded-sm h-10" /></div>
+            <div className={showProvince ? "" : "sm:col-span-2"}>
+              <Label className="label-caps">Città*</Label>
+              <Input value={form.city || ""} onChange={(e) => setForm({ ...form, city: e.target.value })} className="mt-1 rounded-sm h-10" />
+              {cityOptions.length > 1 && (
+                <div className="mt-1.5 flex flex-wrap items-center gap-1.5">
+                  <span className="text-[11px] text-slate-500">Località CAP:</span>
+                  {cityOptions.map(cName => (
+                    <button
+                      type="button"
+                      key={cName}
+                      onClick={() => setForm(f => ({ ...f, city: cName }))}
+                      className={`text-[11px] px-2 py-0.5 rounded-sm border font-semibold transition-colors ${
+                        (form.city || "").toLowerCase() === cName.toLowerCase()
+                          ? "bg-orange-600 text-white border-orange-600"
+                          : "bg-slate-50 text-slate-700 border-slate-200 hover:bg-orange-50"
+                      }`}
+                    >
+                      {cName}
+                    </button>
+                  ))}
+                </div>
+              )}
+            </div>
             {showProvince && (
               <div>
                 <Label className="label-caps">
