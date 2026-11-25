@@ -19,37 +19,16 @@ from reportlab.lib import colors as rl_colors
 import openpyxl
 from openpyxl.styles import Font, PatternFill
 
-try:
-    from carriers.fedex import (
-        is_fedex_configured,
-        get_fedex_rates,
-        create_fedex_shipment,
-        cancel_fedex_shipment,
-        schedule_fedex_pickup,
-        cancel_fedex_pickup,
-        track_fedex_shipment,
-    )
-except ImportError:
-    try:
-        from backend.carriers.fedex import (
-            is_fedex_configured,
-            get_fedex_rates,
-            create_fedex_shipment,
-            cancel_fedex_shipment,
-            schedule_fedex_pickup,
-            cancel_fedex_pickup,
-            track_fedex_shipment,
-        )
-    except ImportError:
-        from fedex import (
-            is_fedex_configured,
-            get_fedex_rates,
-            create_fedex_shipment,
-            cancel_fedex_shipment,
-            schedule_fedex_pickup,
-            cancel_fedex_pickup,
-            track_fedex_shipment,
-        )
+from carriers.fedex import (
+    is_fedex_configured,
+    get_fedex_rates,
+    create_fedex_shipment,
+    cancel_fedex_shipment,
+    schedule_fedex_pickup,
+    cancel_fedex_pickup,
+    track_fedex_shipment,
+    validate_fedex_address,
+)
 
 ROOT_DIR = Path(__file__).parent
 load_dotenv(ROOT_DIR / '.env')
@@ -183,9 +162,11 @@ class OptionalServices(BaseModel):
 
 class CustomsDocs(BaseModel):
     required: bool = False
-    incoterms: str = "DAP"  # DAP (dazi a carico destinatario) | DDP (dazi a carico mittente)
+    incoterms: str = "DAP"
     proforma_name: Optional[str] = ""
+    proforma_base64: Optional[str] = ""
     dae_name: Optional[str] = ""
+    dae_base64: Optional[str] = ""
     eori_number: Optional[str] = ""
     customs_value: float = 0
 
@@ -201,6 +182,10 @@ class QuoteRequest(BaseModel):
 class CreateShipmentInput(BaseModel):
     quote: QuoteRequest
     carrier_id: str
+
+class ValidateAddressInput(BaseModel):
+    carrier_id: str
+    address: Address
 
 class PickupRequestInput(BaseModel):
     pickup_date: str
@@ -298,6 +283,7 @@ async def me(user=Depends(get_current_user)):
             "insurance": True, "cod": True, "saturday_delivery": True,
             "neutral_delivery": True, "residential_delivery": True,
         }
+        user["allow_ddp"] = True
         user["can_manage_own_carriers"] = True
     elif rid:
         res = await db.resellers.find_one({"id": rid}, {"_id": 0})
@@ -306,6 +292,7 @@ async def me(user=Depends(get_current_user)):
             "insurance": True, "cod": True, "saturday_delivery": True,
             "neutral_delivery": True, "residential_delivery": True,
         }
+        user["allow_ddp"] = bool((res or {}).get("allow_ddp", False))
         user["reseller_name"] = (res or {}).get("company_name", "")
         user["reseller_slug"] = (res or {}).get("slug", "")
         user["reseller_plan"] = (res or {}).get("plan", "basic")
@@ -501,7 +488,6 @@ def _mock_carrier_breakdown(
     }
 
 async def _reseller_markup_percent(user: dict, weight: float, zone_info: dict) -> float:
-    """Il Reseller o Super Admin vede il suo costo netto (0% auto-ricarico). Solo i sub-clienti ricevono il listino."""
     if user.get("role") in ("reseller_admin", "super_admin", "admin"):
         return 0.0
 
@@ -578,7 +564,19 @@ async def _resolve_tenant_carrier_options(user: dict) -> dict:
     return out
 
 
+async def _ensure_ddp_allowed(q: QuoteRequest, user: dict):
+    if (q.customs.incoterms or "DAP").upper() != "DDP":
+        return
+    if user.get("role") == "super_admin":
+        return
+    rid = user.get("reseller_id")
+    res = await db.resellers.find_one({"id": rid}, {"_id": 0, "allow_ddp": 1}) if rid else None
+    if not (res or {}).get("allow_ddp", False):
+        raise HTTPException(403, "La resa doganale DDP non è abilitata per questo account. Utilizza DAP oppure contatta l'amministratore.")
+
+
 async def _compute_quotes_internal(q: QuoteRequest, user: dict) -> dict:
+    await _ensure_ddp_allowed(q, user)
     total_weight = sum(p.weight for p in q.parcels)
     vol_weight = sum((p.length * p.width * p.height) / 5000.0 for p in q.parcels)
     billed_weight = max(total_weight, vol_weight)
@@ -603,6 +601,7 @@ async def _compute_quotes_internal(q: QuoteRequest, user: dict) -> dict:
                     parcels=[p.model_dump() for p in q.parcels],
                     parcel_type=q.parcel_type,
                     customs_required=zone_info["is_extra_eu"] or q.customs.required,
+                    incoterms=q.customs.incoterms,
                     goods_description=q.goods_description,
                     insured_value=q.services.insurance_value if q.services.insurance else 0.0,
                     saturday_delivery=q.services.saturday_delivery,
@@ -701,6 +700,14 @@ async def quote_shipment(q: QuoteRequest, user=Depends(require_approved)):
     return full
 
 
+@api_router.post("/shipments/validate-address")
+async def validate_shipment_address(inp: ValidateAddressInput, _=Depends(require_approved)):
+    """Esegue la validazione indirizzo FedEx SOLO dopo la scelta del corriere FedEx."""
+    if inp.carrier_id != "tnt" or not is_fedex_configured():
+        return {"supported": False}
+    return await validate_fedex_address(inp.address.model_dump())
+
+
 def _tracking_number(carrier_id: str) -> str:
     return f"{carrier_id.upper()}{''.join(random.choices(string.digits, k=10))}"
 
@@ -744,6 +751,23 @@ async def create_shipment(inp: CreateShipmentInput, user=Depends(require_approve
     tracking_num = _tracking_number(inp.carrier_id)
     label_b64 = ""
     is_live_shipment = False
+    paperless_ok = False
+    fallback_paper = full_quotes["is_extra_eu"]
+
+    etd_docs = []
+    if full_quotes["is_extra_eu"]:
+        if inp.quote.customs.proforma_base64:
+            etd_docs.append({
+                "doc_type": "PRO_FORMA_INVOICE",
+                "content_type": "application/pdf",
+                "base64": inp.quote.customs.proforma_base64,
+            })
+        if inp.quote.customs.dae_base64:
+            etd_docs.append({
+                "doc_type": "OTHER",
+                "content_type": "application/pdf",
+                "base64": inp.quote.customs.dae_base64,
+            })
 
     if inp.carrier_id == "tnt" and is_fedex_configured() and code_used:
         try:
@@ -756,6 +780,9 @@ async def create_shipment(inp: CreateShipmentInput, user=Depends(require_approve
                 parcel_type=inp.quote.parcel_type,
                 goods_description=inp.quote.goods_description,
                 customs_required=full_quotes["is_extra_eu"] or inp.quote.customs.required,
+                incoterms=inp.quote.customs.incoterms,
+                customs_value=inp.quote.customs.customs_value,
+                etd_docs=etd_docs,
                 insured_value=inp.quote.services.insurance_value if inp.quote.services.insurance else 0.0,
                 saturday_delivery=inp.quote.services.saturday_delivery,
                 residential_delivery=inp.quote.services.residential_delivery,
@@ -765,8 +792,14 @@ async def create_shipment(inp: CreateShipmentInput, user=Depends(require_approve
                 tracking_num = fx_ship["tracking_number"]
             label_b64 = fx_ship.get("label_pdf_base64", "")
             is_live_shipment = True
+            paperless_ok = bool(fx_ship.get("paperless_ok", False))
+            fallback_paper = bool(fx_ship.get("fallback_paper", False))
         except Exception as e:
             raise HTTPException(502, str(e))
+
+    customs_saved = inp.quote.customs.model_dump(exclude={"proforma_base64", "dae_base64"})
+    customs_saved["paperless_ok"] = paperless_ok
+    customs_saved["fallback_paper"] = fallback_paper
 
     shipment = {
         "id": new_id(),
@@ -787,7 +820,7 @@ async def create_shipment(inp: CreateShipmentInput, user=Depends(require_approve
         "parcel_type": inp.quote.parcel_type,
         "parcels": [p.model_dump() for p in inp.quote.parcels],
         "goods_description": inp.quote.goods_description,
-        "customs": inp.quote.customs.model_dump(),
+        "customs": customs_saved,
         "services": inp.quote.services.model_dump(),
         "billed_weight": chosen["billed_weight"],
         "zone": chosen["zone"],
