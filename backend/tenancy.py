@@ -107,6 +107,32 @@ CARRIER_SCHEMAS = {
 DEFAULT_POLICIES = {c: "admin_only" for c in DEFAULT_CARRIERS}
 
 
+def normalize_markup_rule(raw: Any, fallback_flat: float = 0.0) -> Dict[str, Any]:
+    """Normalizza una regola margine in formato uniforme:
+    - mode='flat': {'mode': 'flat', 'flat': 10.0}
+    - mode='area': {'mode': 'area', 'domestic': 10.0, 'europe': 15.0, 'world': 20.0}
+    Supporta retrocompatibilità se raw è un numero semplice.
+    """
+    if isinstance(raw, (int, float)):
+        val = round(float(raw), 2)
+        return {"mode": "flat", "flat": val, "domestic": val, "europe": val, "world": val}
+    if isinstance(raw, dict):
+        mode = raw.get("mode", "flat")
+        flat = round(float(raw.get("flat", fallback_flat) or 0.0), 2)
+        dom = round(float(raw.get("domestic", flat) or 0.0), 2)
+        eur = round(float(raw.get("europe", flat) or 0.0), 2)
+        wld = round(float(raw.get("world", flat) or 0.0), 2)
+        return {
+            "mode": "area" if mode == "area" else "flat",
+            "flat": flat,
+            "domestic": dom,
+            "europe": eur,
+            "world": wld,
+        }
+    val = round(float(fallback_flat), 2)
+    return {"mode": "flat", "flat": val, "domestic": val, "europe": val, "world": val}
+
+
 async def require_super_admin(user=Depends(get_current_user)):
     if user.get("role") != "super_admin":
         raise HTTPException(403, "Super admin only")
@@ -147,6 +173,7 @@ class ResellerInput(BaseModel):
     company_name: str
     slug: Optional[str] = None
     admin_email: EmailStr
+    notification_email: Optional[str] = ""
     admin_password: Optional[str] = None
     address: Optional[str] = ""
     postal_code: Optional[str] = ""
@@ -156,14 +183,28 @@ class ResellerInput(BaseModel):
     phone: Optional[str] = ""
     plan: str = "basic"
     billing_type: str = "prepaid"
-    allow_ddp: bool = False  # Disabilitato di default per evitare rischi dazi su codice Admin
+    allow_ddp: bool = False
     features: Optional[Dict[str, bool]] = None
     enabled_surcharges: Optional[Dict[str, bool]] = None
     carrier_policies: Optional[Dict[str, str]] = None
-    admin_carrier_markups: Optional[Dict[str, Optional[float]]] = None
+    admin_carrier_markups: Optional[Dict[str, Any]] = None
     carrier_credentials: Optional[Dict[str, Dict[str, Any]]] = None
     per_shipment_fee: float = 0.0
     active: bool = True
+
+
+class ResellerProfileUpdate(BaseModel):
+    notification_email: Optional[str] = None
+    address: Optional[str] = None
+    postal_code: Optional[str] = None
+    city: Optional[str] = None
+    province: Optional[str] = None
+    country: Optional[str] = None
+    phone: Optional[str] = None
+
+
+class SuperSettingsUpdate(BaseModel):
+    notification_email: Optional[str] = None
 
 
 class ResellerTopUpInput(BaseModel):
@@ -174,6 +215,23 @@ class ResellerTopUpInput(BaseModel):
 class CarrierCredsSave(BaseModel):
     values: Dict[str, Any]
     default_markup_percent: Optional[float] = None
+    default_markup_rule: Optional[Dict[str, Any]] = None
+
+
+@super_router.get("/settings")
+async def get_super_settings(_=Depends(require_super_admin)):
+    doc = await db.system_settings.find_one({"id": "platform_profile"}, {"_id": 0})
+    return {"notification_email": (doc or {}).get("notification_email", "admin@spedportal.it")}
+
+
+@super_router.put("/settings")
+async def update_super_settings(inp: SuperSettingsUpdate, _=Depends(require_super_admin)):
+    await db.system_settings.update_one(
+        {"id": "platform_profile"},
+        {"$set": {"notification_email": (inp.notification_email or "").strip().lower(), "updated_at": now_iso()}},
+        upsert=True,
+    )
+    return {"ok": True}
 
 
 @super_router.get("/carrier-schemas")
@@ -186,10 +244,46 @@ async def get_carrier_schemas_reseller(_=Depends(get_current_user)):
     return CARRIER_SCHEMAS
 
 
+@reseller_router.get("/profile")
+async def get_reseller_profile(user=Depends(require_reseller_admin)):
+    res = await db.resellers.find_one({"id": user["reseller_id"]}, {"_id": 0})
+    if not res:
+        raise HTTPException(404)
+    return {
+        "company_name": res.get("company_name", ""),
+        "admin_email": res.get("admin_email", ""),
+        "notification_email": res.get("notification_email") or res.get("admin_email", ""),
+        "address": res.get("address", ""),
+        "postal_code": res.get("postal_code", ""),
+        "city": res.get("city", ""),
+        "province": res.get("province", ""),
+        "country": res.get("country", "IT"),
+        "phone": res.get("phone", ""),
+    }
+
+
+@reseller_router.put("/profile")
+async def update_reseller_profile(inp: ResellerProfileUpdate, user=Depends(require_reseller_admin)):
+    update = inp.model_dump(exclude_unset=True)
+    if "notification_email" in update:
+        update["notification_email"] = (update["notification_email"] or "").strip().lower()
+    if "province" in update:
+        update["province"] = (update["province"] or "").strip().upper()[:2]
+    if "country" in update:
+        update["country"] = (update["country"] or "IT").strip().upper()[:2]
+    await db.resellers.update_one({"id": user["reseller_id"]}, {"$set": update})
+    return {"ok": True}
+
+
 @super_router.get("/master-carriers")
 async def list_master_carriers(_=Depends(require_super_admin)):
     doc = await db.system_settings.find_one({"id": "master_carriers"}, {"_id": 0})
     carriers = (doc or {}).get("carriers", {})
+    for cid, cdata in carriers.items():
+        cdata["default_markup_rule"] = normalize_markup_rule(
+            cdata.get("default_markup_rule"),
+            cdata.get("default_markup_percent", 5.0),
+        )
     return {"schemas": CARRIER_SCHEMAS, "carriers": carriers}
 
 
@@ -203,17 +297,20 @@ async def save_master_carrier(carrier_id: str, inp: CarrierCredsSave, _=Depends(
     status = existing_entry.get("status") if existing_entry.get("status") == "verified" else (
         "verified" if schema["auth_type"] == "credentials" else "pending_auth"
     )
-    markup = (
-        float(inp.default_markup_percent)
-        if inp.default_markup_percent is not None
-        else float(existing_entry.get("default_markup_percent", 5.0))
-    )
+    if inp.default_markup_rule is not None:
+        rule = normalize_markup_rule(inp.default_markup_rule, 5.0)
+    elif inp.default_markup_percent is not None:
+        rule = normalize_markup_rule(inp.default_markup_percent, 5.0)
+    else:
+        rule = normalize_markup_rule(existing_entry.get("default_markup_rule"), existing_entry.get("default_markup_percent", 5.0))
+
     entry = {
         "values": inp.values,
         "primary_code": _extract_primary_code(carrier_id, inp.values),
         "auth_type": schema["auth_type"],
         "status": status,
-        "default_markup_percent": round(markup, 2),
+        "default_markup_percent": rule["flat"],
+        "default_markup_rule": rule,
         "updated_at": now_iso(),
     }
     await db.system_settings.update_one(
@@ -241,6 +338,16 @@ async def authenticate_master_carrier(carrier_id: str, _=Depends(require_super_a
     return {"ok": True, "status": "verified"}
 
 
+def _clean_admin_markups(raw_map: Optional[Dict[str, Any]]) -> Dict[str, Any]:
+    out = {}
+    for k, v in (raw_map or {}).items():
+        if v is None or v == "":
+            out[k] = None
+        else:
+            out[k] = normalize_markup_rule(v, 0.0)
+    return out
+
+
 @super_router.post("/resellers")
 async def create_reseller(inp: ResellerInput, _=Depends(require_super_admin)):
     if await db.resellers.find_one({"admin_email": inp.admin_email.lower()}):
@@ -252,10 +359,12 @@ async def create_reseller(inp: ResellerInput, _=Depends(require_super_admin)):
     surcharges = {**DEFAULT_SURCHARGES, **(inp.enabled_surcharges or {})}
     raw_pol = {**DEFAULT_POLICIES, **(inp.carrier_policies or {})}
     policies = {k: _normalize_policy(v) for k, v in raw_pol.items()}
-    markups = {k: (round(float(v), 2) if v is not None else None) for k, v in (inp.admin_carrier_markups or {}).items()}
+    markups = _clean_admin_markups(inp.admin_carrier_markups)
+    notif_email = (inp.notification_email or "").strip().lower() or inp.admin_email.lower()
     reseller = {
         "id": rid, "company_name": inp.company_name, "slug": slug,
         "admin_email": inp.admin_email.lower(),
+        "notification_email": notif_email,
         "address": inp.address or "",
         "postal_code": inp.postal_code or "",
         "city": inp.city or "",
@@ -291,8 +400,9 @@ async def list_resellers(_=Depends(require_super_admin)):
     for r in items:
         raw_pol = {**DEFAULT_POLICIES, **(r.get("carrier_policies") or {})}
         r["carrier_policies"] = {k: _normalize_policy(v) for k, v in raw_pol.items()}
-        r["admin_carrier_markups"] = r.get("admin_carrier_markups") or {}
+        r["admin_carrier_markups"] = _clean_admin_markups(r.get("admin_carrier_markups"))
         r["enabled_surcharges"] = {**DEFAULT_SURCHARGES, **(r.get("enabled_surcharges") or {})}
+        r["notification_email"] = r.get("notification_email") or r.get("admin_email", "")
         r["billing_type"] = r.get("billing_type") or "prepaid"
         r["allow_ddp"] = bool(r.get("allow_ddp", False))
         r["credit_balance"] = float(r.get("credit_balance") or 0.0)
@@ -309,6 +419,8 @@ async def update_reseller(rid: str, inp: ResellerInput, _=Depends(require_super_
     doc = inp.model_dump(exclude_unset=True)
     doc.pop("admin_email", None)
     doc.pop("admin_password", None)
+    if "notification_email" in doc:
+        doc["notification_email"] = (doc["notification_email"] or "").strip().lower()
     if "province" in doc:
         doc["province"] = (doc["province"] or "").strip().upper()[:2]
     if "country" in doc:
@@ -321,10 +433,7 @@ async def update_reseller(rid: str, inp: ResellerInput, _=Depends(require_super_
         merged = {**DEFAULT_POLICIES, **(existing.get("carrier_policies") or {}), **doc["carrier_policies"]}
         doc["carrier_policies"] = {k: _normalize_policy(v) for k, v in merged.items()}
     if "admin_carrier_markups" in doc and doc["admin_carrier_markups"] is not None:
-        doc["admin_carrier_markups"] = {
-            k: (round(float(v), 2) if v is not None else None)
-            for k, v in doc["admin_carrier_markups"].items()
-        }
+        doc["admin_carrier_markups"] = _clean_admin_markups(doc["admin_carrier_markups"])
     await db.resellers.update_one({"id": rid}, {"$set": doc})
     user_sync = {}
     if "billing_type" in doc:
@@ -516,12 +625,12 @@ async def bootstrap_multitenant():
         await db.system_settings.insert_one({
             "id": "master_carriers",
             "carriers": {
-                "brt": {"values": {"user_id": "MASTER_BRT", "password": "***", "customer_code": "1029384", "depot_code": "102"}, "primary_code": "1029384", "auth_type": "credentials", "status": "verified", "default_markup_percent": 6.0, "updated_at": now_iso()},
-                "gls": {"values": {"sede": "MI", "customer_code": "998877", "password": "***", "contract_code": "GLS-MST01"}, "primary_code": "998877", "auth_type": "credentials", "status": "verified", "default_markup_percent": 6.0, "updated_at": now_iso()},
-                "dhl": {"values": {"api_key": "DHL_KEY_MST", "api_secret": "***", "account_number": "123456789"}, "primary_code": "123456789", "auth_type": "credentials", "status": "verified", "default_markup_percent": 5.0, "updated_at": now_iso()},
-                "ups": {"values": {"account_number": "A1B2C3", "postal_code": "20100"}, "primary_code": "A1B2C3", "auth_type": "account_link", "status": "verified", "default_markup_percent": 5.0, "updated_at": now_iso()},
-                "tnt": {"values": {"account_number": "987654321", "country_code": "IT"}, "primary_code": "987654321", "auth_type": "account_link", "status": "verified", "default_markup_percent": 5.0, "updated_at": now_iso()},
-                "poste": {"values": {"client_id": "PI_MST_ID", "client_secret": "***", "cdc_code": "CDC001"}, "primary_code": "CDC001", "auth_type": "credentials", "status": "verified", "default_markup_percent": 8.0, "updated_at": now_iso()},
+                "brt": {"values": {"user_id": "MASTER_BRT", "password": "***", "customer_code": "1029384", "depot_code": "102"}, "primary_code": "1029384", "auth_type": "credentials", "status": "verified", "default_markup_percent": 6.0, "default_markup_rule": normalize_markup_rule(6.0), "updated_at": now_iso()},
+                "gls": {"values": {"sede": "MI", "customer_code": "998877", "password": "***", "contract_code": "GLS-MST01"}, "primary_code": "998877", "auth_type": "credentials", "status": "verified", "default_markup_percent": 6.0, "default_markup_rule": normalize_markup_rule(6.0), "updated_at": now_iso()},
+                "dhl": {"values": {"api_key": "DHL_KEY_MST", "api_secret": "***", "account_number": "123456789"}, "primary_code": "123456789", "auth_type": "credentials", "status": "verified", "default_markup_percent": 5.0, "default_markup_rule": normalize_markup_rule(5.0), "updated_at": now_iso()},
+                "ups": {"values": {"account_number": "A1B2C3", "postal_code": "20100"}, "primary_code": "A1B2C3", "auth_type": "account_link", "status": "verified", "default_markup_percent": 5.0, "default_markup_rule": normalize_markup_rule(5.0), "updated_at": now_iso()},
+                "tnt": {"values": {"account_number": "987654321", "country_code": "IT"}, "primary_code": "987654321", "auth_type": "account_link", "status": "verified", "default_markup_percent": 5.0, "default_markup_rule": normalize_markup_rule(5.0), "updated_at": now_iso()},
+                "poste": {"values": {"client_id": "PI_MST_ID", "client_secret": "***", "cdc_code": "CDC001"}, "primary_code": "CDC001", "auth_type": "credentials", "status": "verified", "default_markup_percent": 8.0, "default_markup_rule": normalize_markup_rule(8.0), "updated_at": now_iso()},
             }
         })
 
@@ -531,6 +640,7 @@ async def bootstrap_multitenant():
         await db.resellers.insert_one({
             "id": demo_id, "company_name": "SpedPortal Demo", "slug": "demo",
             "admin_email": "reseller@spedportal.it",
+            "notification_email": "reseller@spedportal.it",
             "address": "Via Monte Napoleone 10", "postal_code": "20121", "city": "Milano", "province": "MI", "country": "IT", "phone": "0212345678",
             "plan": "premium",
             "billing_type": "prepaid", "allow_ddp": False, "credit_balance": 500.0,
