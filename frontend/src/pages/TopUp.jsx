@@ -1,5 +1,4 @@
 import React, { useEffect, useMemo, useState } from "react";
-import { useNavigate } from "react-router-dom";
 import { api } from "@/lib/api";
 import { useAuth } from "@/lib/auth";
 import { Button } from "@/components/ui/button";
@@ -22,8 +21,8 @@ const TYPE_LABELS = {
 };
 
 export default function CustomTopUp() {
-  const nav = useNavigate();
   const { user, refresh } = useAuth();
+  const isReseller = user?.role === "reseller_admin";
   const [amount, setAmount] = useState(100);
   const [method, setMethod] = useState("card");
   const [loading, setLoading] = useState(false);
@@ -76,7 +75,6 @@ export default function CustomTopUp() {
     }
   };
 
-  // Calcola il saldo progressivo a ritroso a partire dal saldo attuale
   const enrichedLedger = useMemo(() => {
     let running = Number(wallet.balance || 0);
     return (wallet.ledger || []).map((entry) => {
@@ -87,12 +85,19 @@ export default function CustomTopUp() {
         label: amt >= 0 ? "Accredito" : "Addebito",
         cat: amt >= 0 ? "topup" : "charge",
       };
+      const isSubclientOrigin =
+        entry.created_by_role === "user" ||
+        (entry.note || "").toLowerCase().startsWith("sub-cliente");
+      const isShipmentMovement = ["shipment_charge", "label_fee", "shipment_refund"].includes(entry.type);
+
       return {
         ...entry,
         amount: amt,
         balanceAfter: after,
         typeLabel: meta.label,
         category: meta.cat,
+        isSubclientOrigin,
+        isShipmentMovement,
       };
     });
   }, [wallet]);
@@ -109,6 +114,12 @@ export default function CustomTopUp() {
 
   const filteredLedger = useMemo(() => {
     if (filter === "all") return enrichedLedger;
+    if (filter === "subclients") {
+      return enrichedLedger.filter((item) => item.isShipmentMovement && item.isSubclientOrigin);
+    }
+    if (filter === "direct") {
+      return enrichedLedger.filter((item) => item.isShipmentMovement && !item.isSubclientOrigin);
+    }
     return enrichedLedger.filter((item) => item.category === filter);
   }, [enrichedLedger, filter]);
 
@@ -152,6 +163,21 @@ export default function CustomTopUp() {
       </div>
     </button>
   );
+
+  const filterTabs = isReseller
+    ? [
+        ["all", "Tutti"],
+        ["topup", "Ricariche"],
+        ["direct", "Spese Dirette Reseller"],
+        ["subclients", "Spese Sub-Clienti"],
+        ["refund", "Rimborsi"],
+      ]
+    : [
+        ["all", "Tutti"],
+        ["topup", "Ricariche"],
+        ["charge", "Spese"],
+        ["refund", "Rimborsi"],
+      ];
 
   return (
     <div className="space-y-8">
@@ -250,12 +276,7 @@ export default function CustomTopUp() {
             </h2>
           </div>
           <div className="flex gap-1.5 flex-wrap">
-            {[
-              ["all", "Tutti"],
-              ["topup", "Ricariche"],
-              ["charge", "Spese & Fee"],
-              ["refund", "Rimborsi"],
-            ].map(([k, lbl]) => (
+            {filterTabs.map(([k, lbl]) => (
               <button
                 key={k}
                 type="button"
@@ -278,6 +299,7 @@ export default function CustomTopUp() {
               <tr className="text-left label-caps">
                 <th className="px-5 py-3">Data / Ora</th>
                 <th className="px-5 py-3">Operazione</th>
+                {isReseller && <th className="px-5 py-3">Origine</th>}
                 <th className="px-5 py-3">Dettaglio / Causale</th>
                 <th className="px-5 py-3 text-right">Importo</th>
                 <th className="px-5 py-3 text-right">Saldo Residuo</th>
@@ -286,13 +308,13 @@ export default function CustomTopUp() {
             <tbody>
               {loadingLedger ? (
                 <tr>
-                  <td colSpan={5} className="px-5 py-10 text-center text-slate-500">
+                  <td colSpan={isReseller ? 6 : 5} className="px-5 py-10 text-center text-slate-500">
                     Caricamento movimenti…
                   </td>
                 </tr>
               ) : filteredLedger.length === 0 ? (
                 <tr>
-                  <td colSpan={5} className="px-5 py-10 text-center text-slate-500">
+                  <td colSpan={isReseller ? 6 : 5} className="px-5 py-10 text-center text-slate-500">
                     Nessun movimento registrato per questo filtro.
                   </td>
                 </tr>
@@ -317,6 +339,23 @@ export default function CustomTopUp() {
                           {m.typeLabel}
                         </span>
                       </td>
+                      {isReseller && (
+                        <td className="px-5 py-3 text-xs">
+                          {m.isShipmentMovement ? (
+                            m.isSubclientOrigin ? (
+                              <span className="inline-block bg-blue-50 text-blue-800 border border-blue-200 px-2 py-0.5 rounded-sm font-semibold">
+                                Sub-cliente{m.client_company_name ? `: ${m.client_company_name}` : ""}
+                              </span>
+                            ) : (
+                              <span className="inline-block bg-slate-100 text-slate-700 px-2 py-0.5 rounded-sm font-semibold">
+                                Diretta Reseller
+                              </span>
+                            )
+                          ) : (
+                            <span className="text-slate-400">—</span>
+                          )}
+                        </td>
+                      )}
                       <td className="px-5 py-3 text-slate-700">
                         {m.note || (m.shipment_id ? `Spedizione #${m.shipment_id.slice(0, 8)}` : "Movimento conto")}
                       </td>
