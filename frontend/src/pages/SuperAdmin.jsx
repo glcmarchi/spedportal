@@ -20,7 +20,7 @@ const FEATURE_KEYS = [
   ["sub_clients", "Gestione Sub-Clienti (B2B2B)"],
   ["rate_tables", "Listini Clienti"],
   ["broadcasts", "Comunicazioni Clienti"],
-  ["client_prepaid", "Prepagato Sub-Clienti"],
+  ["client_prepaid", "Prepagato Sub-Clienti (solo se Reseller Fine Mese)"],
   ["client_billing", "Fatturazione Clienti"],
 ];
 
@@ -98,7 +98,6 @@ export default function SuperAdmin() {
   const [topupAmount, setTopupAmount] = useState("250");
   const [topupNote, setTopupNote] = useState("");
 
-  // Impostazioni email notifiche Super Admin & Test Email
   const [superNotifEmail, setSuperNotifEmail] = useState("");
   const [testEmailTo, setTestEmailTo] = useState("");
   const [testingEmail, setTestingEmail] = useState(false);
@@ -296,6 +295,26 @@ export default function SuperAdmin() {
     }));
   };
 
+  const billingBadge = (r) => {
+    const bt = r.billing_type || "prepaid";
+    if (bt === "prepaid") {
+      return {
+        cls: "bg-green-100 text-green-800",
+        label: `Prepagato · € ${Number(r.credit_balance || 0).toFixed(2)}`,
+      };
+    }
+    if (bt === "instant") {
+      return {
+        cls: "bg-blue-100 text-blue-800",
+        label: "Pagamento Istantaneo (Pay-per-Shipment)",
+      };
+    }
+    return {
+      cls: "bg-amber-100 text-amber-800",
+      label: "Fatturazione Fine Mese",
+    };
+  };
+
   return (
     <div className="min-h-screen bg-slate-50 p-6 lg:p-10 max-w-6xl mx-auto">
       <header className="flex items-end justify-between mb-6 flex-wrap gap-4">
@@ -376,6 +395,7 @@ export default function SuperAdmin() {
             const pols = r.carrier_policies || {};
             const customMk = r.admin_carrier_markups || {};
             const isPre = (r.billing_type || "prepaid") === "prepaid";
+            const badge = billingBadge(r);
             return (
               <div key={r.id} className="bg-white border border-slate-200 rounded-sm p-5">
                 <div className="flex items-start justify-between gap-4 flex-wrap">
@@ -385,8 +405,8 @@ export default function SuperAdmin() {
                       <div className="flex items-center gap-2 flex-wrap">
                         <span className="font-black text-xl" style={{ fontFamily: "Chivo" }}>{r.company_name}</span>
                         <span className="text-[10px] font-bold uppercase px-2 py-0.5 rounded-sm bg-slate-900 text-white">{r.plan}</span>
-                        <span className={`text-[10px] font-bold uppercase px-2 py-0.5 rounded-sm ${isPre ? "bg-green-100 text-green-800" : "bg-amber-100 text-amber-800"}`}>
-                          {isPre ? `Prepagato · € ${Number(r.credit_balance || 0).toFixed(2)}` : "Fatturazione Fine Mese"}
+                        <span className={`text-[10px] font-bold uppercase px-2 py-0.5 rounded-sm ${badge.cls}`}>
+                          {badge.label}
                         </span>
                         {r.allow_ddp && (
                           <span className="text-[10px] font-bold uppercase px-2 py-0.5 rounded-sm bg-red-100 text-red-800">DDP Attivo</span>
@@ -400,9 +420,9 @@ export default function SuperAdmin() {
                           const p = pols[c] || "admin_only";
                           const defRule = masterData.carriers?.[c]?.default_markup_rule || masterData.carriers?.[c]?.default_markup_percent || 5;
                           const effRule = customMk[c] !== undefined && customMk[c] !== null ? customMk[c] : defRule;
-                          const badge = p === "reseller_only" ? "bg-blue-100 text-blue-800" : p === "disabled" ? "bg-slate-100 text-slate-400 line-through" : "bg-orange-100 text-orange-800";
+                          const bCls = p === "reseller_only" ? "bg-blue-100 text-blue-800" : p === "disabled" ? "bg-slate-100 text-slate-400 line-through" : "bg-orange-100 text-orange-800";
                           const label = p === "reseller_only" ? `Reseller (Fee €${Number(r.per_shipment_fee || 0).toFixed(2)})` : p === "disabled" ? "Off" : `Admin (${formatRuleShort(effRule)})`;
-                          return <span key={c} className={`text-[10px] font-bold uppercase px-2 py-0.5 rounded-sm ${badge}`}>{c}: {label}</span>;
+                          return <span key={c} className={`text-[10px] font-bold uppercase px-2 py-0.5 rounded-sm ${bCls}`}>{c}: {label}</span>;
                         })}
                       </div>
                     </div>
@@ -613,6 +633,7 @@ export default function SuperAdmin() {
                   <SelectContent>
                     <SelectItem value="prepaid">Prepagato (Wallet Reseller)</SelectItem>
                     <SelectItem value="postpaid">Fatturazione Fine Mese</SelectItem>
+                    <SelectItem value="instant">Pagamento Istantaneo (Pay-per-Shipment)</SelectItem>
                   </SelectContent>
                 </Select>
               </div>
