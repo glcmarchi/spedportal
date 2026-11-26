@@ -103,6 +103,10 @@ export default function ShipmentDetail() {
 
   const events = s.tracking_events || [];
   const hasActivePickup = s.pickup?.status === "scheduled";
+  const isClientShip = s.created_by_role === "user";
+  const resellerCost = Number(s.reseller_cost ?? s.cost ?? 0);
+  const clientPrice = Number(s.price ?? 0);
+  const marginEarned = Math.round((clientPrice - resellerCost) * 100) / 100;
 
   return (
     <div className="space-y-6">
@@ -112,15 +116,33 @@ export default function ShipmentDetail() {
 
       <div className="flex flex-col sm:flex-row sm:items-center sm:justify-between gap-4">
         <div>
-          <div className="label-caps text-orange-600 mb-1 flex items-center gap-2">
+          <div className="label-caps text-orange-600 mb-1 flex items-center gap-2 flex-wrap">
             <span>{s.carrier_name}</span>
             {s.is_live && <span className="bg-green-100 text-green-800 px-1.5 py-0.5 rounded-sm text-[10px]">API LIVE</span>}
+            {isResellerOrAdmin && (
+              <span className={`px-2 py-0.5 rounded-sm text-[10px] font-bold ${isClientShip ? "bg-blue-100 text-blue-800" : "bg-slate-200 text-slate-800"}`}>
+                {isClientShip ? `Cliente: ${s.user_company_name || "Sub-cliente"}` : "Reseller"}
+              </span>
+            )}
           </div>
           <h1 className="text-3xl sm:text-4xl font-black tracking-tighter text-slate-900 font-mono" style={{ fontFamily: "Chivo" }}>
             {s.tracking_number}
           </h1>
           <div className="mt-2 flex items-center gap-3 flex-wrap">
             <StatusBadge status={s.status} />
+            {s.status === "cancelled" && s.cancelled_by_role && (
+              <span className={`text-xs font-bold px-2 py-0.5 rounded-sm ${
+                s.cancelled_by_role === "reseller_admin"
+                  ? "bg-orange-100 text-orange-800"
+                  : "bg-slate-100 text-slate-700"
+              }`}>
+                {s.cancelled_by_role === "reseller_admin"
+                  ? "Annullata dall'Agenzia (Reseller)"
+                  : s.cancelled_by_role === "super_admin"
+                  ? "Annullata dall'Amministratore"
+                  : "Annullata dal Cliente"}
+              </span>
+            )}
             {s.estimated_delivery && (
               <span className="text-xs text-slate-600">Consegna prevista: <b>{s.estimated_delivery.slice(0, 10)}</b></span>
             )}
@@ -217,18 +239,58 @@ export default function ShipmentDetail() {
       <div className="bg-white border border-slate-200 rounded-sm p-6">
         <h3 className="text-lg font-bold tracking-tight mb-4" style={{ fontFamily: "Chivo" }}>Colli & Dettaglio Costi</h3>
         <div className="grid grid-cols-2 sm:grid-cols-4 gap-4 text-sm">
-          <Kv k="Tipo" v={s.parcel_type} />
+          <Kv k="Imballaggio" v={s.parcel_type} />
           <Kv k="Peso tassato" v={`${s.billed_weight} kg`} />
           <Kv k="Zona" v={s.zone} />
-          <Kv k="Prezzo Totale" v={`€ ${s.price.toFixed(2)}`} />
+          <Kv k={isResellerOrAdmin && isClientShip ? "Prezzo Cliente" : "Prezzo Totale"} v={`€ ${clientPrice.toFixed(2)}`} />
         </div>
 
-        {isResellerOrAdmin && s.reseller_base_freight !== undefined && (
+        {/* Riquadro Costo & Margine riservato al Reseller sulle spedizioni dei Sub-Clienti */}
+        {isResellerOrAdmin && isClientShip && (
+          <div className="mt-4 bg-orange-50/60 border border-orange-200 rounded-sm p-4 space-y-2">
+            <div className="label-caps text-orange-800">Riepilogo Economico Reseller (Sub-Cliente: {s.user_company_name})</div>
+            <div className="grid grid-cols-1 sm:grid-cols-3 gap-3 text-sm pt-1">
+              <div className="bg-white border border-slate-200 rounded-sm p-3">
+                <div className="label-caps text-slate-500">Costo Totale Reseller</div>
+                <div className="text-xl font-black font-mono text-slate-900 mt-0.5">€ {resellerCost.toFixed(2)}</div>
+                {s.reseller_base_freight !== undefined && (
+                  <div className="text-[11px] text-slate-500 mt-0.5">
+                    Nolo € {Number(s.reseller_base_freight).toFixed(2)} + Suppl. € {Number(s.reseller_surcharges_total || 0).toFixed(2)}
+                  </div>
+                )}
+              </div>
+              <div className="bg-white border border-slate-200 rounded-sm p-3">
+                <div className="label-caps text-slate-500">Prezzo Applicato al Cliente</div>
+                <div className="text-xl font-black font-mono text-slate-900 mt-0.5">€ {clientPrice.toFixed(2)}</div>
+                {s.reseller_markup_percent !== undefined && (
+                  <div className="text-[11px] text-slate-500 mt-0.5">Ricarico: +{Number(s.reseller_markup_percent).toFixed(1)}%</div>
+                )}
+              </div>
+              <div className="bg-white border border-green-200 rounded-sm p-3">
+                <div className="label-caps text-green-800">Margine Totale Maturato</div>
+                <div className={`text-xl font-black font-mono mt-0.5 ${marginEarned >= 0 ? "text-green-700" : "text-red-600"}`}>
+                  {marginEarned >= 0 ? `+ € ${marginEarned.toFixed(2)}` : `- € ${Math.abs(marginEarned).toFixed(2)}`}
+                </div>
+                <div className="text-[11px] text-slate-500 mt-0.5">IVA esclusa</div>
+              </div>
+            </div>
+            {s.reseller_surcharge_items?.length > 0 && (
+              <div className="flex flex-wrap gap-x-4 gap-y-1 text-xs text-slate-600 pt-1">
+                {s.reseller_surcharge_items.map((sc, idx) => (
+                  <span key={idx}>• {sc.label}: € {Number(sc.amount).toFixed(2)}</span>
+                ))}
+              </div>
+            )}
+          </div>
+        )}
+
+        {/* Dettaglio nolo/supplementi per spedizioni dirette del Reseller */}
+        {isResellerOrAdmin && !isClientShip && s.reseller_base_freight !== undefined && (
           <div className="mt-4 bg-slate-50 border border-slate-200 rounded-sm p-3.5 text-xs space-y-1.5">
             <div className="flex flex-wrap gap-x-6 gap-y-1 text-sm">
               <span>Nolo base: <b className="text-slate-900">€ {Number(s.reseller_base_freight).toFixed(2)}</b></span>
               <span>Supplementi totali: <b className="text-slate-900">€ {Number(s.reseller_surcharges_total || 0).toFixed(2)}</b></span>
-              <span>Totale spedizione: <b className="text-orange-600">€ {Number(s.price).toFixed(2)}</b></span>
+              <span>Costo / Totale: <b className="text-orange-600">€ {clientPrice.toFixed(2)}</b></span>
             </div>
             {s.reseller_surcharge_items?.length > 0 && (
               <div className="flex flex-wrap gap-x-4 gap-y-1 text-slate-500 pt-1 border-t border-slate-200">
@@ -258,7 +320,7 @@ export default function ShipmentDetail() {
             </tbody>
           </table>
         </div>
-        {s.goods_description && <div className="mt-4 text-sm"><span className="label-caps">Merce: </span>{s.goods_description}</div>}
+        {s.goods_description && <div className="mt-4 text-sm"><span className="label-caps">Contenuto: </span>{s.goods_description}</div>}
       </div>
 
       <Dialog open={pickupOpen} onOpenChange={setPickupOpen}>
