@@ -59,6 +59,7 @@ EU_COUNTRIES = {
 EUROPE_EXTRA_COUNTRIES = {"GB", "UK", "CH", "NO", "IS", "LI", "AL", "RS", "BA", "ME", "MK", "MD", "UA", "TR"}
 NORTH_AMERICA_COUNTRIES = {"US", "CA", "MX"}
 ALL_CARRIER_IDS = ["brt", "gls", "dhl", "ups", "tnt", "poste"]
+VALID_BILLING_TYPES = ("instant", "prepaid", "postpaid")
 
 
 def now_iso():
@@ -167,6 +168,20 @@ async def ensure_reseller_standard_rate_table(reseller_id: Optional[str]) -> Opt
     return doc
 
 
+async def _validate_client_billing_allowed(reseller_id: Optional[str], requested_billing: str):
+    """Un sub-cliente può avere modalità 'prepaid' SOLO se il Reseller ha modalità 'postpaid' (Fine Mese)."""
+    if requested_billing != "prepaid":
+        return
+    if not reseller_id:
+        return
+    res = await db.resellers.find_one({"id": reseller_id}, {"_id": 0, "billing_type": 1})
+    if (res or {}).get("billing_type") != "postpaid":
+        raise HTTPException(
+            400,
+            "La modalità Prepagato per i sub-clienti è consentita solo ai Reseller con fatturazione a Fine Mese verso la piattaforma.",
+        )
+
+
 class RegisterInput(BaseModel):
     email: EmailStr
     password: str
@@ -184,7 +199,7 @@ class CreateClientInput(BaseModel):
     city: Optional[str] = ""
     province: Optional[str] = ""
     country: Optional[str] = "IT"
-    billing_type: str = "postpaid"
+    billing_type: str = "instant"
     rate_table_id: Optional[str] = None
     allowed_carriers: Optional[List[str]] = None
 
@@ -233,6 +248,7 @@ class CustomsDocs(BaseModel):
 class QuoteRequest(BaseModel):
     sender: Address
     recipient: Address
+    shipment_category: str = "goods"  # "documents" | "goods"
     parcel_type: str = "pacco"
     parcels: List[Parcel]
     goods_description: str = ""
@@ -244,6 +260,7 @@ class CreateShipmentInput(BaseModel):
     carrier_id: str
     service_type: Optional[str] = ""
     expect_live: Optional[bool] = None
+    origin_url: Optional[str] = ""
 
 class ValidateAddressInput(BaseModel):
     carrier_id: str
@@ -317,7 +334,7 @@ async def register(inp: RegisterInput):
         "role": "user",
         "reseller_id": reseller_id,
         "status": "pending",
-        "billing_type": "postpaid",
+        "billing_type": "instant",
         "rate_table_id": std_rt["id"] if std_rt else None,
         "allowed_carriers": list(ALL_CARRIER_IDS),
         "credit_balance": 0.0,
@@ -351,7 +368,7 @@ async def login(inp: LoginInput):
             "reseller_id": user.get("reseller_id"),
             "status": user.get("status", "pending"),
             "company_name": user.get("company_name", ""),
-            "billing_type": user.get("billing_type", "postpaid"),
+            "billing_type": user.get("billing_type", "instant"),
             "credit_balance": user.get("credit_balance", 0.0),
         },
     }
@@ -373,7 +390,12 @@ async def me(user=Depends(get_current_user)):
         user["can_manage_own_carriers"] = True
     elif rid:
         res = await db.resellers.find_one({"id": rid}, {"_id": 0})
-        user["features"] = (res or {}).get("features", {})
+        res_billing = (res or {}).get("billing_type", "prepaid")
+        feats = dict((res or {}).get("features", {}))
+        # Il prepagato sub-clienti è consentito solo se il Reseller paga a Fine Mese
+        if res_billing != "postpaid":
+            feats["client_prepaid"] = False
+        user["features"] = feats
         user["enabled_surcharges"] = (res or {}).get("enabled_surcharges") or {
             "insurance": True, "cod": True, "saturday_delivery": True,
             "neutral_delivery": True, "residential_delivery": True,
@@ -382,6 +404,7 @@ async def me(user=Depends(get_current_user)):
         user["reseller_name"] = (res or {}).get("company_name", "")
         user["reseller_slug"] = (res or {}).get("slug", "")
         user["reseller_plan"] = (res or {}).get("plan", "basic")
+        user["reseller_billing_type"] = res_billing
 
         if user.get("role") == "user":
             user["reseller_address"] = {
@@ -406,7 +429,7 @@ async def me(user=Depends(get_current_user)):
                 "email": (res or {}).get("admin_email", user.get("email", "")),
             }
         if user.get("role") == "reseller_admin":
-            user["billing_type"] = (res or {}).get("billing_type", user.get("billing_type", "prepaid"))
+            user["billing_type"] = res_billing
             user["credit_balance"] = float((res or {}).get("credit_balance") or user.get("credit_balance") or 0.0)
         policies = (res or {}).get("carrier_policies") or {}
         user["can_manage_own_carriers"] = any(p in ("reseller_only", "hybrid") for p in policies.values())
@@ -461,6 +484,8 @@ async def create_client_user(inp: CreateClientInput, admin=Depends(require_admin
     if not rid:
         demo = await db.resellers.find_one({"active": True})
         rid = demo["id"] if demo else None
+    b_type = inp.billing_type if inp.billing_type in VALID_BILLING_TYPES else "instant"
+    await _validate_client_billing_allowed(rid, b_type)
     std_rt = await ensure_reseller_standard_rate_table(rid)
     rt_id = inp.rate_table_id if inp.rate_table_id else (std_rt["id"] if std_rt else None)
     doc = {
@@ -477,7 +502,7 @@ async def create_client_user(inp: CreateClientInput, admin=Depends(require_admin
         "role": "user",
         "reseller_id": rid,
         "status": "approved",
-        "billing_type": inp.billing_type if inp.billing_type in ("prepaid", "postpaid") else "postpaid",
+        "billing_type": b_type,
         "rate_table_id": rt_id,
         "allowed_carriers": inp.allowed_carriers if inp.allowed_carriers is not None else list(ALL_CARRIER_IDS),
         "credit_balance": 0.0,
@@ -500,6 +525,10 @@ async def update_user(user_id: str, inp: UpdateUserInput, admin=Depends(require_
     update = inp.model_dump(exclude_unset=True)
     if not update:
         raise HTTPException(400, "Nessun campo da aggiornare")
+    if "billing_type" in update:
+        if update["billing_type"] not in VALID_BILLING_TYPES:
+            raise HTTPException(400, "Modalità di pagamento non valida")
+        await _validate_client_billing_allowed(target.get("reseller_id"), update["billing_type"])
     if "province" in update:
         update["province"] = (update["province"] or "").strip().upper()[:2]
     if "country" in update:
@@ -525,6 +554,7 @@ async def admin_topup_client(user_id: str, inp: ClientTopUpInput, admin=Depends(
         raise HTTPException(404, "Cliente non trovato")
     if admin.get("role") == "reseller_admin" and target.get("reseller_id") != admin.get("reseller_id"):
         raise HTTPException(403, "Cliente di altro reseller")
+    await _validate_client_billing_allowed(target.get("reseller_id"), "prepaid")
     amount = round(float(inp.amount), 2)
     if amount == 0:
         raise HTTPException(400, "Importo non valido")
@@ -855,6 +885,8 @@ async def _compute_quotes_internal(q: QuoteRequest, user: dict) -> dict:
     vol_weight = sum((p.length * p.width * p.height) / 5000.0 for p in q.parcels)
     billed_weight = max(total_weight, vol_weight)
     zone_info = _zone_of(q.sender, q.recipient)
+    is_docs = q.shipment_category == "documents" or q.parcel_type in ("documenti", "busta_documenti")
+    customs_needed = zone_info["is_extra_eu"] and not is_docs
     options = await _resolve_tenant_carrier_options(user, zone_info["macro"])
 
     quotes = []
@@ -878,7 +910,7 @@ async def _compute_quotes_internal(q: QuoteRequest, user: dict) -> dict:
                     recipient=q.recipient.model_dump(),
                     parcels=[p.model_dump() for p in q.parcels],
                     parcel_type=q.parcel_type,
-                    customs_required=zone_info["is_extra_eu"] or q.customs.required,
+                    customs_required=customs_needed,
                     incoterms=q.customs.incoterms,
                     customs_value=q.customs.customs_value,
                     customs_currency=q.customs.customs_currency,
@@ -901,7 +933,7 @@ async def _compute_quotes_internal(q: QuoteRequest, user: dict) -> dict:
                 if q.services.neutral_delivery:
                     raw_surcharge_items.append({"type": "NEUTRAL", "label": "Consegna Neutra", "amount": 2.00})
                     carrier_cost = round(carrier_cost + 2.00, 2)
-                if zone_info["is_extra_eu"] and (q.customs.incoterms or "DAP").upper() == "DDP":
+                if customs_needed and (q.customs.incoterms or "DAP").upper() == "DDP":
                     raw_surcharge_items.append({"type": "DDP", "label": "Gestione Resa DDP (Dazi Mittente)", "amount": 15.00})
                     carrier_cost = round(carrier_cost + 15.00, 2)
 
@@ -924,21 +956,21 @@ async def _compute_quotes_internal(q: QuoteRequest, user: dict) -> dict:
                     )
                 )
         else:
-            bk = _mock_carrier_breakdown(cid, billed_weight, zone_info, len(q.parcels), q.services, q.customs, zone_info["is_extra_eu"])
+            bk = _mock_carrier_breakdown(cid, billed_weight, zone_info, len(q.parcels), q.services, q.customs, customs_needed)
             transit = 1 if zone_info["macro"] == "NAZ" else (3 if cid in ["dhl", "ups"] else 5)
-            service_type = "STANDARD"
+            hint = "Consegna standard entro fine giornata"
             quotes.append(
                 _build_quote_option(
                     cid=cid,
                     carrier_label=c["name"],
                     color=c["color"],
-                    service_type=service_type,
+                    service_type="STANDARD",
                     is_live=False,
                     carrier_cost=bk["total_cost"],
                     raw_freight=bk["base_freight"],
                     raw_surcharge_items=bk["surcharge_items"],
                     transit=transit,
-                    commit_hint="",
+                    commit_hint=hint,
                     billed_weight=billed_weight,
                     zone_macro=zone_info["macro"],
                     opt=opt,
@@ -952,7 +984,7 @@ async def _compute_quotes_internal(q: QuoteRequest, user: dict) -> dict:
         "warnings": warnings,
         "billed_weight": round(billed_weight, 2),
         "zone": zone_info["macro"],
-        "is_extra_eu": zone_info["is_extra_eu"],
+        "is_extra_eu": customs_needed,
     }
 
 
@@ -1007,6 +1039,155 @@ def _tracking_number(carrier_id: str) -> str:
     return f"{carrier_id.upper()}{''.join(random.choices(string.digits, k=10))}"
 
 
+async def _issue_single_shipment_invoice(shipment: dict) -> dict:
+    """Emette in automatico una ricevuta/fattura per una spedizione pagata istantaneamente."""
+    existing = await db.invoices.find_one({"shipment_ids": shipment["id"]}, {"_id": 0})
+    if existing:
+        return existing
+    total = round(float(shipment.get("price") or 0.0), 2)
+    vat = round(total * 0.22, 2)
+    grand = round(total + vat, 2)
+    inv_num = f"FT-{datetime.now(timezone.utc).strftime('%Y%m')}-{random.randint(1000,9999)}"
+    inv = {
+        "id": new_id(),
+        "user_id": shipment["user_id"],
+        "reseller_id": shipment.get("reseller_id"),
+        "invoice_number": inv_num,
+        "shipment_ids": [shipment["id"]],
+        "total": total,
+        "vat": vat,
+        "grand_total": grand,
+        "payment_mode": "instant",
+        "created_at": now_iso(),
+        "status": "paid",
+    }
+    await db.invoices.insert_one(inv)
+    await db.shipments.update_one({"id": shipment["id"]}, {"$set": {"invoice_id": inv["id"]}})
+    inv.pop("_id", None)
+    return inv
+
+
+async def _dispatch_shipment_to_carrier_and_bill(shipment: dict, user_doc: dict) -> dict:
+    """Esegue la chiamata al corriere, genera etichetta e registra addebiti su wallet/ledger."""
+    if shipment.get("status") != "awaiting_payment" and shipment.get("tracking_number"):
+        return shipment
+
+    cid = shipment["carrier_id"]
+    code_used = shipment.get("carrier_code_used", "")
+    source = shipment.get("contract_owner", "admin")
+    applied_fee = float(shipment.get("applied_fee") or 0.0)
+    reseller_cost = float(shipment.get("reseller_cost") or 0.0)
+    price = float(shipment.get("price") or 0.0)
+    rid = shipment.get("reseller_id")
+    creator_role = shipment.get("created_by_role", user_doc.get("role", "user"))
+    creator_name = shipment.get("user_company_name", user_doc.get("company_name", ""))
+    customs_needed = bool((shipment.get("customs") or {}).get("required", False))
+
+    tracking_num = _tracking_number(cid)
+    label_b64 = ""
+    is_live_shipment = False
+    paperless_ok = False
+    fallback_paper = customs_needed
+
+    etd_docs = shipment.pop("_pending_etd_docs", None) or []
+
+    if cid == "tnt":
+        if not is_fedex_configured() or not code_used:
+            raise HTTPException(400, "Credenziali FedEx non configurate")
+        try:
+            c_info = shipment.get("customs") or {}
+            s_info = shipment.get("services") or {}
+            fx_ship = await create_fedex_shipment(
+                account_number=code_used,
+                sender=shipment["sender"],
+                recipient=shipment["recipient"],
+                parcels=shipment["parcels"],
+                service_type=shipment.get("service_type") or "INTERNATIONAL_PRIORITY",
+                parcel_type=shipment.get("parcel_type", "pacco"),
+                goods_description=shipment.get("goods_description", ""),
+                customs_required=customs_needed,
+                incoterms=c_info.get("incoterms", "DAP"),
+                customs_value=float(c_info.get("customs_value") or 0.0),
+                customs_currency=c_info.get("customs_currency", "EUR"),
+                hs_code=c_info.get("hs_code", ""),
+                etd_docs=etd_docs,
+                insured_value=float(s_info.get("insurance_value") or 0.0) if s_info.get("insurance") else 0.0,
+                saturday_delivery=bool(s_info.get("saturday_delivery", False)),
+                residential_delivery=bool(s_info.get("residential_delivery", False)),
+                cod_amount=float(s_info.get("cod_amount") or 0.0) if s_info.get("cod") else 0.0,
+            )
+            if fx_ship.get("tracking_number"):
+                tracking_num = fx_ship["tracking_number"]
+            label_b64 = fx_ship.get("label_pdf_base64", "")
+            is_live_shipment = True
+            paperless_ok = bool(fx_ship.get("paperless_ok", False))
+            fallback_paper = bool(fx_ship.get("fallback_paper", False))
+        except Exception as e:
+            raise HTTPException(502, str(e))
+
+    customs_saved = dict(shipment.get("customs") or {})
+    customs_saved["paperless_ok"] = paperless_ok
+    customs_saved["fallback_paper"] = fallback_paper
+
+    updates = {
+        "tracking_number": tracking_num,
+        "label_pdf_base64": label_b64,
+        "is_live": is_live_shipment,
+        "customs": customs_saved,
+        "status": "created",
+        "tracking_events": [
+            {
+                "ts": now_iso(),
+                "code": "created",
+                "label": "Spedizione creata / Etichetta generata",
+                "location": (shipment.get("sender") or {}).get("city", ""),
+            }
+        ],
+    }
+    await db.shipments.update_one(
+        {"id": shipment["id"]},
+        {"$set": updates, "$unset": {"_pending_etd_docs": ""}},
+    )
+    shipment.update(updates)
+
+    # Addebito sub-cliente prepagato
+    if creator_role == "user" and user_doc.get("billing_type") == "prepaid":
+        await db.users.update_one({"id": user_doc["id"]}, {"$inc": {"credit_balance": -price}})
+        await db.ledger.insert_one({
+            "id": new_id(), "user_id": user_doc["id"], "reseller_id": rid,
+            "type": "shipment_charge", "amount": -price,
+            "note": f"Spedizione {tracking_num} ({shipment['carrier_name']})",
+            "shipment_id": shipment["id"], "created_at": now_iso(),
+        })
+
+    # Addebito wallet reseller se il reseller è prepagato (es. su spedizioni proprie o sub-clienti non prepagati)
+    reseller_doc = await db.resellers.find_one({"id": rid}) if rid else None
+    admin_charge_to_reseller = reseller_cost if source == "admin" else applied_fee
+    if reseller_doc and reseller_doc.get("billing_type") == "prepaid" and admin_charge_to_reseller > 0:
+        origin_tag = f"Sub-cliente {creator_name}" if creator_role == "user" else "Spedizione Reseller"
+        await db.resellers.update_one({"id": rid}, {"$inc": {"credit_balance": -admin_charge_to_reseller}})
+        await db.users.update_many({"reseller_id": rid, "role": "reseller_admin"}, {"$inc": {"credit_balance": -admin_charge_to_reseller}})
+        await db.reseller_ledger.insert_one({
+            "id": new_id(), "reseller_id": rid, "shipment_id": shipment["id"],
+            "created_by_role": creator_role,
+            "client_company_name": creator_name if creator_role == "user" else "",
+            "type": "shipment_charge" if source == "admin" else "label_fee",
+            "amount": -admin_charge_to_reseller,
+            "note": f"{origin_tag} · {tracking_num} ({shipment['carrier_name']})",
+            "created_at": now_iso(),
+        })
+
+    return shipment
+
+
+def _effective_user_billing_mode(user: dict, reseller_doc: Optional[dict]) -> str:
+    if user.get("role") == "super_admin":
+        return "postpaid"
+    if user.get("role") == "reseller_admin":
+        return (reseller_doc or {}).get("billing_type") or user.get("billing_type") or "prepaid"
+    return user.get("billing_type") or "instant"
+
+
 @api_router.post("/shipments")
 async def create_shipment(inp: CreateShipmentInput, user=Depends(require_approved)):
     full_quotes = await _compute_quotes_internal(inp.quote, user)
@@ -1032,28 +1213,24 @@ async def create_shipment(inp: CreateShipmentInput, user=Depends(require_approve
     carrier_cost = chosen["carrier_cost"]
     reseller_cost = chosen["reseller_cost"]
     price = chosen["price"]
-
     admin_charge_to_reseller = reseller_cost if source == "admin" else applied_fee
 
-    if user.get("role") == "user" and user.get("billing_type") == "prepaid":
+    rid = user.get("reseller_id")
+    reseller_doc = await db.resellers.find_one({"id": rid}) if rid else None
+    billing_mode = _effective_user_billing_mode(user, reseller_doc)
+
+    # Verifica saldo se prepagato
+    if user.get("role") == "user" and billing_mode == "prepaid":
         bal = float(user.get("credit_balance") or 0.0)
         if bal < price:
             raise HTTPException(402, "Credito insufficiente. Ricarica il tuo saldo prepagato.")
 
-    rid = user.get("reseller_id")
-    reseller_doc = await db.resellers.find_one({"id": rid}) if rid else None
-    if reseller_doc and reseller_doc.get("billing_type", "prepaid") == "prepaid" and admin_charge_to_reseller > 0:
+    if reseller_doc and reseller_doc.get("billing_type") == "prepaid" and admin_charge_to_reseller > 0:
         res_bal = float(reseller_doc.get("credit_balance") or 0.0)
         if res_bal < admin_charge_to_reseller:
             if user.get("role") == "reseller_admin":
-                raise HTTPException(402, f"Credito piattaforma insufficiente (€ {res_bal:.2f}). Contatta l'amministratore per ricaricare.")
+                raise HTTPException(402, f"Credito piattaforma insufficiente (€ {res_bal:.2f}). Ricarica il tuo Wallet.")
             raise HTTPException(402, "Servizio temporaneamente sospeso per credito agenzia esaurito.")
-
-    tracking_num = _tracking_number(inp.carrier_id)
-    label_b64 = ""
-    is_live_shipment = False
-    paperless_ok = False
-    fallback_paper = full_quotes["is_extra_eu"]
 
     etd_docs = []
     if full_quotes["is_extra_eu"]:
@@ -1070,41 +1247,8 @@ async def create_shipment(inp: CreateShipmentInput, user=Depends(require_approve
                 "base64": inp.quote.customs.dae_base64,
             })
 
-    if inp.carrier_id == "tnt":
-        if not is_fedex_configured() or not code_used:
-            raise HTTPException(400, "Credenziali FedEx non configurate")
-        try:
-            fx_ship = await create_fedex_shipment(
-                account_number=code_used,
-                sender=inp.quote.sender.model_dump(),
-                recipient=inp.quote.recipient.model_dump(),
-                parcels=[p.model_dump() for p in inp.quote.parcels],
-                service_type=chosen.get("service_type") or "INTERNATIONAL_PRIORITY",
-                parcel_type=inp.quote.parcel_type,
-                goods_description=inp.quote.goods_description,
-                customs_required=full_quotes["is_extra_eu"] or inp.quote.customs.required,
-                incoterms=inp.quote.customs.incoterms,
-                customs_value=inp.quote.customs.customs_value,
-                customs_currency=inp.quote.customs.customs_currency,
-                hs_code=inp.quote.customs.hs_code or "",
-                etd_docs=etd_docs,
-                insured_value=inp.quote.services.insurance_value if inp.quote.services.insurance else 0.0,
-                saturday_delivery=inp.quote.services.saturday_delivery,
-                residential_delivery=inp.quote.services.residential_delivery,
-                cod_amount=inp.quote.services.cod_amount if inp.quote.services.cod else 0.0,
-            )
-            if fx_ship.get("tracking_number"):
-                tracking_num = fx_ship["tracking_number"]
-            label_b64 = fx_ship.get("label_pdf_base64", "")
-            is_live_shipment = True
-            paperless_ok = bool(fx_ship.get("paperless_ok", False))
-            fallback_paper = bool(fx_ship.get("fallback_paper", False))
-        except Exception as e:
-            raise HTTPException(502, str(e))
-
     customs_saved = inp.quote.customs.model_dump(exclude={"proforma_base64", "dae_base64"})
-    customs_saved["paperless_ok"] = paperless_ok
-    customs_saved["fallback_paper"] = fallback_paper
+    customs_saved["required"] = full_quotes["is_extra_eu"]
 
     creator_role = user.get("role", "user")
     creator_name = user.get("company_name", "")
@@ -1119,14 +1263,15 @@ async def create_shipment(inp: CreateShipmentInput, user=Depends(require_approve
         "contract_owner": source,
         "carrier_code_used": code_used,
         "applied_fee": applied_fee,
-        "is_live": is_live_shipment,
-        "tracking_number": tracking_num,
+        "is_live": False,
+        "tracking_number": "",
         "carrier_id": inp.carrier_id,
         "carrier_name": chosen["carrier_name"],
         "service_type": chosen.get("service_type", ""),
-        "label_pdf_base64": label_b64,
+        "label_pdf_base64": "",
         "sender": inp.quote.sender.model_dump(),
         "recipient": inp.quote.recipient.model_dump(),
+        "shipment_category": inp.quote.shipment_category,
         "parcel_type": inp.quote.parcel_type,
         "parcels": [p.model_dump() for p in inp.quote.parcels],
         "goods_description": inp.quote.goods_description,
@@ -1143,35 +1288,71 @@ async def create_shipment(inp: CreateShipmentInput, user=Depends(require_approve
         "reseller_markup_percent": chosen["reseller_markup_percent"],
         "cost": reseller_cost,
         "price": price,
-        "status": "created",
-        "tracking_events": [{"ts": now_iso(), "code": "created", "label": "Spedizione creata / Etichetta generata", "location": inp.quote.sender.city}],
+        "payment_mode": billing_mode,
+        "status": "awaiting_payment",
+        "tracking_events": [],
+        "_pending_etd_docs": etd_docs,
         "created_at": now_iso(),
     }
     await db.shipments.insert_one(shipment)
 
-    if creator_role == "user" and user.get("billing_type") == "prepaid":
-        await db.users.update_one({"id": user["id"]}, {"$inc": {"credit_balance": -price}})
-        await db.ledger.insert_one({
-            "id": new_id(), "user_id": user["id"], "reseller_id": rid,
-            "type": "shipment_charge", "amount": -price,
-            "note": f"Spedizione {tracking_num} ({chosen['carrier_name']})",
-            "shipment_id": shipment["id"], "created_at": now_iso()
-        })
+    # Flusso Pagamento Istantaneo (Pay-per-Shipment)
+    if billing_mode == "instant":
+        if not stripe.api_key:
+            raise HTTPException(400, "Gateway di pagamento istantaneo (Stripe) non configurato su Render")
+        origin = (inp.origin_url or FRONTEND_URL).rstrip("/")
+        success_url = f"{origin}/payment/success?session_id={{CHECKOUT_SESSION_ID}}"
+        cancel_url = f"{origin}/payment/cancel"
+        try:
+            session = stripe.checkout.Session.create(
+                mode="payment",
+                line_items=[{
+                    "price_data": {
+                        "currency": "eur",
+                        "product_data": {
+                            "name": f"Spedizione {chosen['carrier_name']} ({inp.quote.sender.city} → {inp.quote.recipient.city})",
+                        },
+                        "unit_amount": int(round(price * 100)),
+                    },
+                    "quantity": 1,
+                }],
+                success_url=success_url,
+                cancel_url=cancel_url,
+                metadata={
+                    "kind": "shipment_instant",
+                    "shipment_id": shipment["id"],
+                    "user_id": user["id"],
+                    "amount": str(price),
+                },
+            )
+        except Exception as e:
+            raise HTTPException(500, f"Errore creazione sessione pagamento: {e}")
 
-    if reseller_doc and reseller_doc.get("billing_type", "prepaid") == "prepaid" and admin_charge_to_reseller > 0:
-        origin_tag = f"Sub-cliente {creator_name}" if creator_role == "user" else "Spedizione diretta Reseller"
-        await db.resellers.update_one({"id": rid}, {"$inc": {"credit_balance": -admin_charge_to_reseller}})
-        await db.users.update_many({"reseller_id": rid, "role": "reseller_admin"}, {"$inc": {"credit_balance": -admin_charge_to_reseller}})
-        await db.reseller_ledger.insert_one({
-            "id": new_id(), "reseller_id": rid, "shipment_id": shipment["id"],
-            "created_by_role": creator_role,
-            "client_company_name": creator_name if creator_role == "user" else "",
-            "type": "shipment_charge" if source == "admin" else "label_fee",
-            "amount": -admin_charge_to_reseller,
-            "note": f"{origin_tag} · {tracking_num} ({chosen['carrier_name']})",
+        await db.payment_transactions.insert_one({
+            "session_id": session.id,
+            "kind": "shipment_instant",
+            "shipment_id": shipment["id"],
+            "user_id": user["id"],
+            "reseller_id": rid,
+            "amount": price,
+            "currency": "eur",
+            "status": "initiated",
+            "payment_status": "pending",
             "created_at": now_iso(),
+            "updated_at": now_iso(),
         })
+        shipment.pop("_id", None)
+        shipment.pop("label_pdf_base64", None)
+        shipment.pop("_pending_etd_docs", None)
+        return {
+            "requires_payment": True,
+            "checkout_url": session.url,
+            "session_id": session.id,
+            "shipment": _sanitize_shipment_for_role(shipment, creator_role),
+        }
 
+    # Flusso Prepagato / Fine Mese: invio immediato al corriere
+    shipment = await _dispatch_shipment_to_carrier_and_bill(shipment, user)
     shipment.pop("_id", None)
     shipment.pop("label_pdf_base64", None)
     return _sanitize_shipment_for_role(shipment, creator_role)
@@ -1189,7 +1370,7 @@ def _sanitize_shipment_for_role(s: dict, role: str) -> dict:
 
 
 async def _sync_live_tracking(s: dict) -> dict:
-    if s.get("status") in ("delivered", "cancelled"):
+    if s.get("status") in ("delivered", "cancelled", "awaiting_payment"):
         return s
 
     if s.get("carrier_id") != "tnt" or not is_fedex_configured():
@@ -1218,8 +1399,8 @@ async def _sync_live_tracking(s: dict) -> dict:
 
 @api_router.get("/shipments")
 async def list_shipments(user=Depends(require_approved)):
-    q = tenant_filter(user)
-    proj = {"_id": 0, "label_pdf_base64": 0}
+    q = tenant_filter(user, {"status": {"$ne": "awaiting_payment"}})
+    proj = {"_id": 0, "label_pdf_base64": 0, "_pending_etd_docs": 0}
     if user.get("role") == "user":
         proj.update({
             "cost": 0, "carrier_cost": 0, "reseller_cost": 0,
@@ -1227,7 +1408,20 @@ async def list_shipments(user=Depends(require_approved)):
             "admin_markup_percent": 0, "reseller_markup_percent": 0,
         })
     ships = await db.shipments.find(q, proj).sort("created_at", -1).to_list(1000)
+
+    # Risoluzione dinamica dell'origine (anche per record storici senza created_by_role)
+    user_ids = list({s.get("user_id") for s in ships if s.get("user_id")})
+    users_info: Dict[str, Dict[str, Any]] = {}
+    if user_ids:
+        u_docs = await db.users.find({"id": {"$in": user_ids}}, {"_id": 0, "id": 1, "role": 1, "company_name": 1}).to_list(1000)
+        users_info = {u["id"]: u for u in u_docs}
+
     for s in ships:
+        u_rec = users_info.get(s.get("user_id"))
+        if u_rec:
+            s["created_by_role"] = u_rec.get("role", s.get("created_by_role", "user"))
+            if not s.get("user_company_name"):
+                s["user_company_name"] = u_rec.get("company_name", "")
         if s.get("status") != "cancelled" and not s.get("is_live"):
             s["status"] = _simulate_status(s)
     return ships
@@ -1236,10 +1430,15 @@ async def list_shipments(user=Depends(require_approved)):
 @api_router.get("/shipments/{sid}")
 async def get_shipment(sid: str, user=Depends(require_approved)):
     q = tenant_filter(user, {"id": sid})
-    proj = {"_id": 0, "label_pdf_base64": 0}
+    proj = {"_id": 0, "label_pdf_base64": 0, "_pending_etd_docs": 0}
     s = await db.shipments.find_one(q, proj)
     if not s:
         raise HTTPException(404, "Spedizione non trovata")
+    u_rec = await db.users.find_one({"id": s.get("user_id")}, {"_id": 0, "role": 1, "company_name": 1})
+    if u_rec:
+        s["created_by_role"] = u_rec.get("role", s.get("created_by_role", "user"))
+        if not s.get("user_company_name"):
+            s["user_company_name"] = u_rec.get("company_name", "")
     s = await _sync_live_tracking(s)
     return _sanitize_shipment_for_role(s, user.get("role", "user"))
 
@@ -1247,7 +1446,7 @@ async def get_shipment(sid: str, user=Depends(require_approved)):
 @api_router.post("/shipments/{sid}/track/refresh")
 async def refresh_shipment_tracking(sid: str, user=Depends(require_approved)):
     q = tenant_filter(user, {"id": sid})
-    proj = {"_id": 0, "label_pdf_base64": 0}
+    proj = {"_id": 0, "label_pdf_base64": 0, "_pending_etd_docs": 0}
     s = await db.shipments.find_one(q, proj)
     if not s:
         raise HTTPException(404, "Spedizione non trovata")
@@ -1427,7 +1626,7 @@ async def cancel_shipment(sid: str, user=Depends(require_approved)):
 
     rid = s.get("reseller_id")
     reseller_doc = await db.resellers.find_one({"id": rid}) if rid else None
-    if reseller_doc and reseller_doc.get("billing_type", "prepaid") == "prepaid":
+    if reseller_doc and reseller_doc.get("billing_type") == "prepaid":
         owner_contract = s.get("contract_owner", "admin" if s.get("on_master_codes", True) else "reseller")
         res_refund = float(s.get("reseller_cost") or 0.0) if owner_contract == "admin" else float(s.get("applied_fee") or 0.0)
         if res_refund > 0:
@@ -1447,8 +1646,8 @@ async def cancel_shipment(sid: str, user=Depends(require_approved)):
 
 
 def _simulate_status(s: dict) -> str:
-    if s.get("status") == "cancelled":
-        return "cancelled"
+    if s.get("status") in ("cancelled", "awaiting_payment"):
+        return s["status"]
     try:
         created = datetime.fromisoformat(s["created_at"])
     except Exception:
@@ -1518,7 +1717,7 @@ async def download_label(sid: str, user=Depends(require_approved)):
 
 @api_router.get("/shipments/export/xlsx")
 async def export_shipments(user=Depends(require_approved)):
-    q = tenant_filter(user)
+    q = tenant_filter(user, {"status": {"$ne": "awaiting_payment"}})
     ships = await db.shipments.find(q, {"_id": 0, "label_pdf_base64": 0}).sort("created_at", -1).to_list(5000)
     wb = openpyxl.Workbook()
     ws = wb.active
@@ -1532,7 +1731,7 @@ async def export_shipments(user=Depends(require_approved)):
     for s in ships:
         owner = s.get("contract_owner", "admin" if s.get("on_master_codes", True) else "reseller")
         st = s.get("status") if (s.get("is_live") or s.get("status") == "cancelled") else _simulate_status(s)
-        origin = f"Sub-cliente: {s.get('user_company_name', '')}" if s.get("created_by_role") == "user" else "Diretta Reseller"
+        origin = s.get("user_company_name", "Cliente") if s.get("created_by_role") == "user" else "Reseller"
         ws.append([
             s.get("created_at", ""), s.get("tracking_number", ""), s.get("carrier_name", ""),
             origin,
@@ -1559,6 +1758,32 @@ async def wallet_balance(user=Depends(require_approved)):
     if user.get("role") == "reseller_admin" and user.get("reseller_id"):
         res = await db.resellers.find_one({"id": user["reseller_id"]}, {"_id": 0})
         ledger = await db.reseller_ledger.find({"reseller_id": user["reseller_id"]}, {"_id": 0}).sort("created_at", -1).limit(100).to_list(100)
+
+        # Arricchisce anche i movimenti storici collegati a spedizioni con l'origine reale (Reseller vs Nome Sub-Cliente)
+        ship_ids = list({m.get("shipment_id") for m in ledger if m.get("shipment_id")})
+        ship_map: Dict[str, Dict[str, Any]] = {}
+        if ship_ids:
+            s_docs = await db.shipments.find(
+                {"id": {"$in": ship_ids}},
+                {"_id": 0, "id": 1, "user_id": 1, "created_by_role": 1, "user_company_name": 1},
+            ).to_list(500)
+            u_ids = list({x.get("user_id") for x in s_docs if x.get("user_id")})
+            u_docs = await db.users.find({"id": {"$in": u_ids}}, {"_id": 0, "id": 1, "role": 1, "company_name": 1}).to_list(500) if u_ids else []
+            u_map = {u["id"]: u for u in u_docs}
+            for x in s_docs:
+                u_info = u_map.get(x.get("user_id")) or {}
+                ship_map[x["id"]] = {
+                    "role": u_info.get("role") or x.get("created_by_role", "user"),
+                    "company_name": u_info.get("company_name") or x.get("user_company_name", ""),
+                }
+
+        for m in ledger:
+            sid = m.get("shipment_id")
+            if sid and sid in ship_map:
+                m["created_by_role"] = ship_map[sid]["role"]
+                if ship_map[sid]["role"] == "user":
+                    m["client_company_name"] = ship_map[sid]["company_name"]
+
         return {
             "balance": float((res or {}).get("credit_balance") or 0.0),
             "ledger": ledger,
@@ -1567,7 +1792,7 @@ async def wallet_balance(user=Depends(require_approved)):
     u = await db.users.find_one({"id": user["id"]}, {"_id": 0, "password": 0})
     ledger = await db.ledger.find({"user_id": user["id"]}, {"_id": 0}).sort("created_at", -1).limit(100).to_list(100)
     return {"balance": u.get("credit_balance", 0.0), "ledger": ledger,
-            "billing_type": u.get("billing_type", "postpaid")}
+            "billing_type": u.get("billing_type", "instant")}
 
 @api_router.get("/wallet/packages")
 async def wallet_packages(_=Depends(require_approved)):
@@ -1604,6 +1829,9 @@ async def payment_status(session_id: str, user=Depends(get_current_user)):
     rec = await db.payment_transactions.find_one({"session_id": session_id, "user_id": user["id"]}, {"_id": 0})
     if not rec:
         raise HTTPException(404, "Transazione non trovata")
+
+    kind = rec.get("kind", "wallet_topup")
+
     if rec.get("payment_status") != "paid" and stripe.api_key:
         try:
             s = stripe.checkout.Session.retrieve(session_id)
@@ -1613,26 +1841,46 @@ async def payment_status(session_id: str, user=Depends(get_current_user)):
                     {"$set": {"status": "completed", "payment_status": "paid", "updated_at": now_iso()}},
                 )
                 if result.modified_count > 0:
-                    amount = rec.get("amount", 0.0)
-                    u_doc = await db.users.find_one({"id": rec["user_id"]})
-                    if u_doc and u_doc.get("role") == "reseller_admin" and u_doc.get("reseller_id"):
-                        await db.resellers.update_one({"id": u_doc["reseller_id"]}, {"$inc": {"credit_balance": amount}})
-                        await db.users.update_many({"reseller_id": u_doc["reseller_id"], "role": "reseller_admin"}, {"$inc": {"credit_balance": amount}})
-                        await db.reseller_ledger.insert_one({
-                            "id": new_id(), "reseller_id": u_doc["reseller_id"],
-                            "type": "stripe_topup", "amount": amount, "note": "Ricarica online", "created_at": now_iso()
-                        })
+                    if kind == "shipment_instant" and rec.get("shipment_id"):
+                        ship = await db.shipments.find_one({"id": rec["shipment_id"]})
+                        owner = await db.users.find_one({"id": rec["user_id"]})
+                        if ship and owner:
+                            ship = await _dispatch_shipment_to_carrier_and_bill(ship, owner)
+                            await _issue_single_shipment_invoice(ship)
                     else:
-                        await db.users.update_one({"id": rec["user_id"]}, {"$inc": {"credit_balance": amount}})
-                        await db.ledger.insert_one({
-                            "id": new_id(), "user_id": rec["user_id"], "reseller_id": rec.get("reseller_id"),
-                            "type": "topup", "amount": amount, "note": "Ricarica online", "session_id": session_id, "created_at": now_iso()
-                        })
+                        amount = rec.get("amount", 0.0)
+                        u_doc = await db.users.find_one({"id": rec["user_id"]})
+                        if u_doc and u_doc.get("role") == "reseller_admin" and u_doc.get("reseller_id"):
+                            await db.resellers.update_one({"id": u_doc["reseller_id"]}, {"$inc": {"credit_balance": amount}})
+                            await db.users.update_many({"reseller_id": u_doc["reseller_id"], "role": "reseller_admin"}, {"$inc": {"credit_balance": amount}})
+                            await db.reseller_ledger.insert_one({
+                                "id": new_id(), "reseller_id": u_doc["reseller_id"],
+                                "type": "stripe_topup", "amount": amount, "note": "Ricarica online", "created_at": now_iso()
+                            })
+                        else:
+                            await db.users.update_one({"id": rec["user_id"]}, {"$inc": {"credit_balance": amount}})
+                            await db.ledger.insert_one({
+                                "id": new_id(), "user_id": rec["user_id"], "reseller_id": rec.get("reseller_id"),
+                                "type": "topup", "amount": amount, "note": "Ricarica online", "session_id": session_id, "created_at": now_iso()
+                            })
                 rec = await db.payment_transactions.find_one({"session_id": session_id}, {"_id": 0})
+        except HTTPException:
+            raise
         except Exception as e:
             logger.exception("Stripe status error: %s", e)
-    return {"session_id": rec["session_id"], "status": rec["status"],
-            "payment_status": rec["payment_status"], "amount": rec.get("amount", 0)}
+
+    resp_payload: Dict[str, Any] = {
+        "session_id": rec["session_id"],
+        "kind": kind,
+        "status": rec["status"],
+        "payment_status": rec["payment_status"],
+        "amount": rec.get("amount", 0),
+    }
+    if kind == "shipment_instant" and rec.get("shipment_id"):
+        ship = await db.shipments.find_one({"id": rec["shipment_id"]}, {"_id": 0, "label_pdf_base64": 0, "_pending_etd_docs": 0})
+        if ship:
+            resp_payload["shipment"] = _sanitize_shipment_for_role(ship, user.get("role", "user"))
+    return resp_payload
 
 @api_router.post("/stripe/webhook")
 async def stripe_webhook(request: Request):
@@ -1651,11 +1899,18 @@ async def stripe_webhook(request: Request):
         if result.modified_count > 0:
             rec = await db.payment_transactions.find_one({"session_id": obj["id"]})
             if rec:
-                await db.users.update_one({"id": rec["user_id"]}, {"$inc": {"credit_balance": rec["amount"]}})
-                await db.ledger.insert_one({
-                    "id": new_id(), "user_id": rec["user_id"], "reseller_id": rec.get("reseller_id"),
-                    "type": "topup", "amount": rec["amount"], "note": "Ricarica online", "session_id": obj["id"], "created_at": now_iso()
-                })
+                if rec.get("kind") == "shipment_instant" and rec.get("shipment_id"):
+                    ship = await db.shipments.find_one({"id": rec["shipment_id"]})
+                    owner = await db.users.find_one({"id": rec["user_id"]})
+                    if ship and owner:
+                        ship = await _dispatch_shipment_to_carrier_and_bill(ship, owner)
+                        await _issue_single_shipment_invoice(ship)
+                else:
+                    await db.users.update_one({"id": rec["user_id"]}, {"$inc": {"credit_balance": rec["amount"]}})
+                    await db.ledger.insert_one({
+                        "id": new_id(), "user_id": rec["user_id"], "reseller_id": rec.get("reseller_id"),
+                        "type": "topup", "amount": rec["amount"], "note": "Ricarica online", "session_id": obj["id"], "created_at": now_iso()
+                    })
     return {"status": "ok"}
 
 @api_router.get("/invoices")
@@ -1670,7 +1925,7 @@ async def generate_invoice(user_id: str, admin=Depends(require_admin)):
     if admin.get("role") == "reseller_admin" and target.get("reseller_id") != admin.get("reseller_id"):
         raise HTTPException(403, "Utente di altro reseller")
     ships = await db.shipments.find(
-        {"user_id": user_id, "invoice_id": {"$exists": False}, "status": {"$ne": "cancelled"}},
+        {"user_id": user_id, "invoice_id": {"$exists": False}, "status": {"$nin": ["cancelled", "awaiting_payment"]}},
         {"_id": 0, "label_pdf_base64": 0}
     ).to_list(1000)
     if not ships:
@@ -1713,61 +1968,3 @@ async def invoice_pdf(iid: str, user=Depends(require_approved)):
     c.drawString(17 * mm, y, "Data"); c.drawString(38 * mm, y, "Tracking"); c.drawString(72 * mm, y, "Corriere")
     c.drawString(100 * mm, y, "Destinatario"); c.drawRightString(W - 17 * mm, y, "Prezzo €"); y -= 6 * mm
     c.setFont("Helvetica", 8)
-    for s in ships:
-        if y < 40 * mm:
-            c.showPage(); y = H - 20 * mm
-        c.drawString(17 * mm, y, s.get("created_at", "")[:10])
-        c.drawString(38 * mm, y, s.get("tracking_number", ""))
-        c.drawString(72 * mm, y, s.get("carrier_name", "")[:14])
-        c.drawString(100 * mm, y, s.get("recipient", {}).get("company_name", "")[:28])
-        c.drawRightString(W - 17 * mm, y, f"{s.get('price', 0):.2f}"); y -= 5 * mm
-    y -= 4 * mm; c.setFont("Helvetica-Bold", 10)
-    c.drawRightString(W - 40 * mm, y, "Imponibile:"); c.drawRightString(W - 17 * mm, y, f"€ {inv['total']:.2f}"); y -= 5 * mm
-    c.drawRightString(W - 40 * mm, y, "IVA 22%:"); c.drawRightString(W - 17 * mm, y, f"€ {inv['vat']:.2f}"); y -= 5 * mm
-    c.setFont("Helvetica-Bold", 12); c.setFillColor(rl_colors.HexColor("#EA580C"))
-    c.drawRightString(W - 40 * mm, y, "TOTALE:"); c.drawRightString(W - 17 * mm, y, f"€ {inv['grand_total']:.2f}")
-    c.showPage(); c.save(); buf.seek(0)
-    return StreamingResponse(buf, media_type="application/pdf",
-        headers={"Content-Disposition": f"attachment; filename={inv['invoice_number']}.pdf"})
-
-@app.on_event("startup")
-async def bootstrap():
-    admin = await db.users.find_one({"email": "admin@spedportal.it"})
-    if not admin:
-        await db.users.insert_one({
-            "id": new_id(), "email": "admin@spedportal.it", "password": hash_pw("Admin@2026"),
-            "company_name": "SpedPortal Admin", "phone": "", "role": "super_admin",
-            "reseller_id": None, "status": "approved", "billing_type": "postpaid",
-            "rate_table_id": None, "credit_balance": 0.0, "created_at": now_iso(),
-        })
-        logger.info("Super Admin seeded: admin@spedportal.it / Admin@2026")
-    await bootstrap_multitenant()
-    all_resellers = await db.resellers.find({}, {"_id": 0, "id": 1}).to_list(1000)
-    for r in all_resellers:
-        await ensure_reseller_standard_rate_table(r["id"])
-
-@api_router.get("/")
-async def root():
-    return {"service": "SpedPortal API", "status": "ok", "fedex_live": is_fedex_configured()}
-
-app.include_router(api_router)
-from extras import extra_router
-from mail import (
-    mail_router, send_email, tpl_registration, tpl_approved,
-    tpl_new_client_admin_alert, get_reseller_notification_email, FRONTEND_URL,
-)
-from tenancy import super_router, reseller_router, bootstrap_multitenant
-app.include_router(extra_router)
-app.include_router(mail_router)
-app.include_router(super_router)
-app.include_router(reseller_router)
-
-app.add_middleware(
-    CORSMiddleware, allow_credentials=True,
-    allow_origins=os.environ.get('CORS_ORIGINS', '*').split(','),
-    allow_methods=["*"], allow_headers=["*"],
-)
-
-@app.on_event("shutdown")
-async def shutdown_db_client():
-    client.close()
