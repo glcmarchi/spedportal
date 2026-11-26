@@ -87,6 +87,7 @@ export default function CustomTopUp() {
       };
       const isSubclientOrigin =
         entry.created_by_role === "user" ||
+        Boolean(entry.client_company_name) ||
         (entry.note || "").toLowerCase().startsWith("sub-cliente");
       const isShipmentMovement = ["shipment_charge", "label_fee", "shipment_refund"].includes(entry.type);
 
@@ -168,8 +169,8 @@ export default function CustomTopUp() {
     ? [
         ["all", "Tutti"],
         ["topup", "Ricariche"],
-        ["direct", "Spese Dirette Reseller"],
-        ["subclients", "Spese Sub-Clienti"],
+        ["direct", "Reseller"],
+        ["subclients", "Sub-Clienti"],
         ["refund", "Rimborsi"],
       ]
     : [
@@ -344,11 +345,11 @@ export default function CustomTopUp() {
                           {m.isShipmentMovement ? (
                             m.isSubclientOrigin ? (
                               <span className="inline-block bg-blue-50 text-blue-800 border border-blue-200 px-2 py-0.5 rounded-sm font-semibold">
-                                Sub-cliente{m.client_company_name ? `: ${m.client_company_name}` : ""}
+                                {m.client_company_name || "Sub-cliente"}
                               </span>
                             ) : (
                               <span className="inline-block bg-slate-100 text-slate-700 px-2 py-0.5 rounded-sm font-semibold">
-                                Diretta Reseller
+                                Reseller
                               </span>
                             )
                           ) : (
