@@ -1,6 +1,10 @@
 from fastapi import APIRouter, HTTPException, Depends
+from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, EmailStr
 from typing import Optional, Dict, Any
+import io
+import openpyxl
+from openpyxl.styles import Font, PatternFill
 from server import db, get_current_user, hash_pw, new_id, now_iso, logger
 
 super_router = APIRouter(prefix="/api/super")
@@ -184,6 +188,7 @@ class ResellerInput(BaseModel):
     carrier_policies: Optional[Dict[str, str]] = None
     admin_carrier_markups: Optional[Dict[str, Any]] = None
     carrier_credentials: Optional[Dict[str, Dict[str, Any]]] = None
+    fee_on_admin_codes: float = 0.0
     per_shipment_fee: float = 0.0
     active: bool = True
 
@@ -378,7 +383,10 @@ async def create_reseller(inp: ResellerInput, _=Depends(require_super_admin)):
         "carrier_policies": policies,
         "admin_carrier_markups": markups,
         "carrier_credentials": inp.carrier_credentials or {},
-        "per_shipment_fee": inp.per_shipment_fee, "active": inp.active, "created_at": now_iso(),
+        "fee_on_admin_codes": round(float(inp.fee_on_admin_codes or 0.0), 2),
+        "per_shipment_fee": round(float(inp.per_shipment_fee or 0.0), 2),
+        "active": inp.active,
+        "created_at": now_iso(),
     }
     await db.resellers.insert_one(reseller)
     pw = inp.admin_password or new_id()[:12]
@@ -406,8 +414,10 @@ async def list_resellers(_=Depends(require_super_admin)):
             r["features"]["client_prepaid"] = False
         r["allow_ddp"] = bool(r.get("allow_ddp", False))
         r["credit_balance"] = float(r.get("credit_balance") or 0.0)
+        r["fee_on_admin_codes"] = float(r.get("fee_on_admin_codes") or 0.0)
+        r["per_shipment_fee"] = float(r.get("per_shipment_fee") or 0.0)
         r["user_count"] = await db.users.count_documents({"reseller_id": r["id"], "role": "user"})
-        r["shipment_count"] = await db.shipments.count_documents({"reseller_id": r["id"]})
+        r["shipment_count"] = await db.shipments.count_documents({"reseller_id": r["id"], "status": {"$nin": ["cancelled", "awaiting_payment"]}})
     return items
 
 
@@ -428,6 +438,10 @@ async def update_reseller(rid: str, inp: ResellerInput, _=Depends(require_super_
         doc["province"] = (doc["province"] or "").strip().upper()[:2]
     if "country" in doc:
         doc["country"] = (doc["country"] or "IT").strip().upper()[:2]
+    if "fee_on_admin_codes" in doc:
+        doc["fee_on_admin_codes"] = round(float(doc["fee_on_admin_codes"] or 0.0), 2)
+    if "per_shipment_fee" in doc:
+        doc["per_shipment_fee"] = round(float(doc["per_shipment_fee"] or 0.0), 2)
     if "features" in doc and doc["features"]:
         feats = {**DEFAULT_FEATURES, **doc["features"]}
         if eff_billing != "postpaid":
@@ -442,7 +456,6 @@ async def update_reseller(rid: str, inp: ResellerInput, _=Depends(require_super_
         doc["admin_carrier_markups"] = _clean_admin_markups(doc["admin_carrier_markups"])
     await db.resellers.update_one({"id": rid}, {"$set": doc})
 
-    # Se il Reseller non è più Fine Mese, converti eventuali sub-clienti prepagati a Pagamento Istantaneo
     if eff_billing != "postpaid":
         await db.users.update_many(
             {"reseller_id": rid, "role": "user", "billing_type": "prepaid"},
@@ -486,42 +499,269 @@ async def super_topup_reseller(rid: str, inp: ResellerTopUpInput, _=Depends(requ
     return {"ok": True, "credit_balance": round(float(updated.get("credit_balance") or 0.0), 2)}
 
 
-@super_router.get("/resellers/{rid}/billing")
-async def reseller_billing(rid: str, _=Depends(require_super_admin)):
+async def _compute_reseller_accounting_data(rid: str, date_from: Optional[str] = None, date_to: Optional[str] = None) -> Dict[str, Any]:
     res = await db.resellers.find_one({"id": rid}, {"_id": 0})
     if not res:
-        raise HTTPException(404)
+        raise HTTPException(404, "Reseller non trovato")
+
+    q: Dict[str, Any] = {"reseller_id": rid, "status": {"$nin": ["cancelled", "awaiting_payment"]}}
+    if date_from or date_to:
+        dt_q: Dict[str, Any] = {}
+        if date_from:
+            dt_q["$gte"] = f"{date_from}T00:00:00"
+        if date_to:
+            dt_q["$lte"] = f"{date_to}T23:59:59.999999"
+        q["created_at"] = dt_q
+
     ships = await db.shipments.find(
-        {"reseller_id": rid, "status": {"$nin": ["cancelled", "awaiting_payment"]}},
+        q,
         {"_id": 0, "id": 1, "created_at": 1, "tracking_number": 1, "carrier_id": 1,
-         "carrier_name": 1, "cost": 1, "carrier_cost": 1, "reseller_cost": 1,
+         "carrier_name": 1, "user_id": 1, "user_company_name": 1, "created_by_role": 1,
+         "cost": 1, "carrier_cost": 1, "reseller_cost": 1, "reseller_transport_cost": 1,
          "admin_markup_percent": 1, "price": 1, "on_master_codes": 1,
          "contract_owner": 1, "carrier_code_used": 1, "applied_fee": 1}
     ).sort("created_at", -1).to_list(10000)
 
-    on_master = [s for s in ships if s.get("contract_owner", "admin" if s.get("on_master_codes", True) else "reseller") == "admin"]
-    on_own = [s for s in ships if s.get("contract_owner", "admin" if s.get("on_master_codes", True) else "reseller") == "reseller"]
+    # Risoluzione dinamica utenti
+    u_ids = list({s.get("user_id") for s in ships if s.get("user_id")})
+    u_docs = await db.users.find({"id": {"$in": u_ids}}, {"_id": 0, "id": 1, "role": 1, "company_name": 1, "billing_type": 1}).to_list(1000) if u_ids else []
+    u_map = {u["id"]: u for u in u_docs}
 
-    raw_carrier_cost_master = round(sum(s.get("carrier_cost", s.get("cost", 0)) for s in on_master), 2)
-    due_standard = round(sum(s.get("reseller_cost", s.get("cost", 0)) for s in on_master), 2)
-    admin_margin_earned = round(due_standard - raw_carrier_cost_master, 2)
+    fee_admin_def = float(res.get("fee_on_admin_codes") or 0.0)
+    fee_own_def = float(res.get("per_shipment_fee") or 0.0)
 
-    fee_unit = float(res.get("per_shipment_fee") or 0)
-    due_premium = round(sum(s.get("applied_fee", fee_unit) for s in on_own), 2)
+    on_master = []
+    on_own = []
+    by_origin: Dict[str, Dict[str, Any]] = {}
+
+    for s in ships:
+        u_info = u_map.get(s.get("user_id")) or {}
+        c_role = u_info.get("role") or s.get("created_by_role", "user")
+        c_name = u_info.get("company_name") or s.get("user_company_name") or ("Reseller" if c_role != "user" else "Sub-cliente")
+        s["created_by_role"] = c_role
+        s["user_company_name"] = c_name
+
+        owner = s.get("contract_owner", "admin" if s.get("on_master_codes", True) else "reseller")
+        raw_cost = float(s.get("carrier_cost", s.get("cost", 0)) or 0.0)
+        if owner == "admin":
+            on_master.append(s)
+            fee_val = float(s.get("applied_fee") if s.get("applied_fee") is not None else fee_admin_def)
+            if "reseller_transport_cost" in s and s["reseller_transport_cost"] is not None:
+                trans_val = float(s["reseller_transport_cost"])
+            else:
+                # Retrocompatibilità record precedenti
+                rc = float(s.get("reseller_cost", s.get("cost", 0)) or 0.0)
+                trans_val = rc
+            admin_due_ship = round(trans_val + fee_val, 2)
+        else:
+            on_own.append(s)
+            fee_val = float(s.get("applied_fee") if s.get("applied_fee") is not None else fee_own_def)
+            trans_val = 0.0
+            admin_due_ship = round(fee_val, 2)
+
+        s["_calc_raw_cost"] = round(raw_cost, 2)
+        s["_calc_transport_due"] = round(trans_val, 2)
+        s["_calc_fee_due"] = round(fee_val, 2)
+        s["_calc_admin_due"] = admin_due_ship
+
+        grp_key = "DIRECT_RESELLER" if c_role != "user" else f"CLIENT:{s.get('user_id')}"
+        if grp_key not in by_origin:
+            by_origin[grp_key] = {
+                "group_key": grp_key,
+                "is_reseller_direct": c_role != "user",
+                "company_name": f"{res.get('company_name')} (Spedizioni Dirette)" if c_role != "user" else c_name,
+                "client_billing_type": "reseller" if c_role != "user" else (u_info.get("billing_type") or "instant"),
+                "shipments_count": 0,
+                "master_count": 0,
+                "own_count": 0,
+                "transport_due": 0.0,
+                "fees_due": 0.0,
+                "total_due": 0.0,
+            }
+        g = by_origin[grp_key]
+        g["shipments_count"] += 1
+        if owner == "admin":
+            g["master_count"] += 1
+        else:
+            g["own_count"] += 1
+        g["transport_due"] = round(g["transport_due"] + trans_val, 2)
+        g["fees_due"] = round(g["fees_due"] + fee_val, 2)
+        g["total_due"] = round(g["total_due"] + admin_due_ship, 2)
+
+    raw_carrier_cost_master = round(sum(s["_calc_raw_cost"] for s in on_master), 2)
+    transport_due_master = round(sum(s["_calc_transport_due"] for s in on_master), 2)
+    fees_due_master = round(sum(s["_calc_fee_due"] for s in on_master), 2)
+    fees_due_own = round(sum(s["_calc_fee_due"] for s in on_own), 2)
+    admin_margin_earned = round(transport_due_master - raw_carrier_cost_master, 2)
+    amount_due_total = round(transport_due_master + fees_due_master + fees_due_own, 2)
 
     ledger = await db.reseller_ledger.find({"reseller_id": rid}, {"_id": 0}).sort("created_at", -1).limit(30).to_list(30)
 
+    breakdown = sorted(by_origin.values(), key=lambda x: (0 if x["is_reseller_direct"] else 1, -x["total_due"]))
+
     return {
         "reseller": res,
+        "shipments_total": len(ships),
         "shipments_on_master": len(on_master),
         "shipments_on_own": len(on_own),
         "raw_carrier_cost_master": raw_carrier_cost_master,
         "admin_margin_earned": admin_margin_earned,
-        "amount_due_standard": due_standard,
-        "amount_due_premium": due_premium,
-        "amount_due_total": round(due_standard + due_premium, 2),
-        "recent_shipments": ships[:30],
+        "amount_due_standard": transport_due_master,
+        "fees_due_master": fees_due_master,
+        "amount_due_premium": fees_due_own,
+        "fees_due_total": round(fees_due_master + fees_due_own, 2),
+        "amount_due_total": amount_due_total,
+        "breakdown_by_origin": breakdown,
+        "recent_shipments": ships[:100],
         "ledger": ledger,
+    }
+
+
+@super_router.get("/resellers/{rid}/billing")
+async def reseller_billing(rid: str, date_from: Optional[str] = None, date_to: Optional[str] = None, _=Depends(require_super_admin)):
+    return await _compute_reseller_accounting_data(rid, date_from, date_to)
+
+
+@super_router.get("/resellers/{rid}/billing/export")
+async def export_reseller_billing_xlsx(rid: str, date_from: Optional[str] = None, date_to: Optional[str] = None, _=Depends(require_super_admin)):
+    data = await _compute_reseller_accounting_data(rid, date_from, date_to)
+    wb = openpyxl.Workbook()
+    ws = wb.active
+    ws.title = "Riepilogo Contabile"
+    ws.append(["Origine / Sub-Cliente", "N. Spedizioni", "Su Codici Admin", "Su Codici Reseller", "Trasporto (€)", "Commissioni Piattaforma (€)", "Totale Imponibile (€)"])
+    for cell in ws[1]:
+        cell.font = Font(bold=True, color="FFFFFF")
+        cell.fill = PatternFill("solid", fgColor="0F172A")
+    for row in data["breakdown_by_origin"]:
+        ws.append([
+            row["company_name"], row["shipments_count"], row["master_count"], row["own_count"],
+            row["transport_due"], row["fees_due"], row["total_due"],
+        ])
+    ws.append([])
+    ws.append(["TOTALE COMPLESSIVO", data["shipments_total"], data["shipments_on_master"], data["shipments_on_own"],
+               data["amount_due_standard"], data["fees_due_total"], data["amount_due_total"]])
+
+    ws2 = wb.create_sheet("Dettaglio Spedizioni")
+    ws2.append(["Data", "Tracking", "Origine", "Corriere", "Contratto", "Costo API (€)", "Trasporto Addebitato (€)", "Commissione Piattaforma (€)", "Totale Addebito Reseller (€)"])
+    for cell in ws2[1]:
+        cell.font = Font(bold=True, color="FFFFFF")
+        cell.fill = PatternFill("solid", fgColor="0F172A")
+    for s in data["recent_shipments"]:
+        owner = s.get("contract_owner", "admin" if s.get("on_master_codes", True) else "reseller")
+        ws2.append([
+            (s.get("created_at") or "")[:10],
+            s.get("tracking_number", ""),
+            s.get("user_company_name", ""),
+            s.get("carrier_name", ""),
+            "Admin" if owner == "admin" else "Reseller",
+            s["_calc_raw_cost"],
+            s["_calc_transport_due"],
+            s["_calc_fee_due"],
+            s["_calc_admin_due"],
+        ])
+
+    buf = io.BytesIO()
+    wb.save(buf); buf.seek(0)
+    slug = data["reseller"].get("slug") or rid[:8]
+    return StreamingResponse(
+        buf,
+        media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        headers={"Content-Disposition": f"attachment; filename=contabilita-{slug}.xlsx"},
+    )
+
+
+@reseller_router.get("/accounting")
+async def reseller_subclients_accounting(
+    date_from: Optional[str] = None,
+    date_to: Optional[str] = None,
+    client_id: Optional[str] = None,
+    user=Depends(require_reseller_admin),
+):
+    """Contabilità e monitoraggio economico del Reseller verso i propri Sub-Clienti."""
+    rid = user["reseller_id"]
+    q: Dict[str, Any] = {
+        "reseller_id": rid,
+        "status": {"$nin": ["cancelled", "awaiting_payment"]},
+    }
+    if client_id and client_id != "all":
+        q["user_id"] = client_id
+    if date_from or date_to:
+        dt_q: Dict[str, Any] = {}
+        if date_from:
+            dt_q["$gte"] = f"{date_from}T00:00:00"
+        if date_to:
+            dt_q["$lte"] = f"{date_to}T23:59:59.999999"
+        q["created_at"] = dt_q
+
+    ships = await db.shipments.find(
+        q,
+        {"_id": 0, "id": 1, "created_at": 1, "tracking_number": 1, "carrier_name": 1,
+         "user_id": 1, "user_company_name": 1, "created_by_role": 1,
+         "cost": 1, "reseller_cost": 1, "reseller_transport_cost": 1, "applied_fee": 1,
+         "price": 1, "invoice_id": 1, "contract_owner": 1, "on_master_codes": 1}
+    ).sort("created_at", -1).to_list(10000)
+
+    u_docs = await db.users.find(
+        {"reseller_id": rid, "role": "user"},
+        {"_id": 0, "id": 1, "company_name": 1, "billing_type": 1, "credit_balance": 1},
+    ).to_list(1000)
+    u_map = {u["id"]: u for u in u_docs}
+
+    by_client: Dict[str, Dict[str, Any]] = {}
+    client_ships = []
+
+    for s in ships:
+        u_info = u_map.get(s.get("user_id"))
+        if not u_info and s.get("created_by_role") != "user":
+            continue
+        uid = s.get("user_id")
+        cname = (u_info or {}).get("company_name") or s.get("user_company_name") or "Sub-cliente"
+        btype = (u_info or {}).get("billing_type") or "instant"
+        res_cost = round(float(s.get("reseller_cost") or s.get("cost") or 0.0), 2)
+        fee_val = round(float(s.get("applied_fee") or 0.0), 2)
+        price_val = round(float(s.get("price") or 0.0), 2)
+        margin_val = round(price_val - res_cost, 2)
+
+        s["user_company_name"] = cname
+        s["_reseller_cost"] = res_cost
+        s["_applied_fee"] = fee_val
+        s["_margin"] = margin_val
+        client_ships.append(s)
+
+        if uid not in by_client:
+            by_client[uid] = {
+                "user_id": uid,
+                "company_name": cname,
+                "billing_type": btype,
+                "shipments_count": 0,
+                "unbilled_count": 0,
+                "unbilled_amount": 0.0,
+                "reseller_cost_total": 0.0,
+                "fees_total": 0.0,
+                "client_price_total": 0.0,
+                "margin_total": 0.0,
+            }
+        c = by_client[uid]
+        c["shipments_count"] += 1
+        c["reseller_cost_total"] = round(c["reseller_cost_total"] + res_cost, 2)
+        c["fees_total"] = round(c["fees_total"] + fee_val, 2)
+        c["client_price_total"] = round(c["client_price_total"] + price_val, 2)
+        c["margin_total"] = round(c["margin_total"] + margin_val, 2)
+        if not s.get("invoice_id") and btype == "postpaid":
+            c["unbilled_count"] += 1
+            c["unbilled_amount"] = round(c["unbilled_amount"] + price_val, 2)
+
+    clients_summary = sorted(by_client.values(), key=lambda x: -x["client_price_total"])
+    return {
+        "clients_summary": clients_summary,
+        "shipments": client_ships[:200],
+        "totals": {
+            "shipments_count": len(client_ships),
+            "reseller_cost_total": round(sum(x["_reseller_cost"] for x in client_ships), 2),
+            "fees_total": round(sum(x["_applied_fee"] for x in client_ships), 2),
+            "client_price_total": round(sum(float(x.get("price") or 0.0) for x in client_ships), 2),
+            "margin_total": round(sum(x["_margin"] for x in client_ships), 2),
+        },
     }
 
 
@@ -583,7 +823,11 @@ async def reseller_list_carriers(user=Depends(require_reseller_admin)):
             "can_configure_own": (pol == "reseller_only"),
             "own_config": own,
         })
-    return {"carriers": items, "per_shipment_fee": res.get("per_shipment_fee", 0.0)}
+    return {
+        "carriers": items,
+        "fee_on_admin_codes": float(res.get("fee_on_admin_codes") or 0.0),
+        "per_shipment_fee": float(res.get("per_shipment_fee") or 0.0),
+    }
 
 
 @reseller_router.put("/carriers/{carrier_id}")
@@ -669,7 +913,10 @@ async def bootstrap_multitenant():
             },
             "admin_carrier_markups": {},
             "carrier_credentials": {},
-            "per_shipment_fee": 0.15, "active": True, "created_at": now_iso(),
+            "fee_on_admin_codes": 0.25,
+            "per_shipment_fee": 0.15,
+            "active": True,
+            "created_at": now_iso(),
         })
         if not await db.users.find_one({"email": "reseller@spedportal.it"}):
             await db.users.insert_one({
