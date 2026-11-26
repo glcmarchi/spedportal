@@ -168,14 +168,12 @@ export default function NewShipment() {
   const [sender, setSender] = useState({ ...emptyAddr });
   const [recipient, setRecipient] = useState({ ...emptyAddr });
 
-  // Nuovo flusso guidato: Documenti vs Merce + Imballaggio
-  const [shipmentCategory, setShipmentCategory] = useState("goods"); // "documents" | "goods"
+  const [shipmentCategory, setShipmentCategory] = useState("goods");
   const [docSubType, setDocSubType] = useState(DOCUMENT_TYPES[0]);
   const [parcelType, setParcelType] = useState("pacco");
   const [parcels, setParcels] = useState([{ ...emptyParcel }]);
   const [goods, setGoods] = useState("");
 
-  // Dialog helper & articoli proibiti & salva pacco
   const [helperOpen, setHelperOpen] = useState(false);
   const [prohibitedOpen, setProhibitedOpen] = useState(false);
   const [savePkgOpen, setSavePkgOpen] = useState(false);
@@ -500,7 +498,6 @@ export default function NewShipment() {
               </div>
             </div>
 
-            {/* Scelta principale stile DHL: Documenti vs Merce / Colli */}
             <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
               <button
                 type="button"
@@ -545,7 +542,6 @@ export default function NewShipment() {
               </button>
             </div>
 
-            {/* Dettaglio Documenti se scelta categoria Documenti */}
             {isDocs && (
               <div className="bg-slate-50 border border-slate-200 rounded-sm p-4 space-y-3">
                 <div>
@@ -571,7 +567,6 @@ export default function NewShipment() {
               </div>
             )}
 
-            {/* Selezione Imballaggio Guidata */}
             <div className="space-y-3 border-t border-slate-200 pt-4">
               <div className="flex items-center justify-between flex-wrap gap-2">
                 <Label className="label-caps text-orange-600">Seleziona Imballaggio</Label>
@@ -625,7 +620,6 @@ export default function NewShipment() {
               )}
             </div>
 
-            {/* Elenco Colli */}
             {parcels.map((p, i) => (
               <div key={i} className="border border-slate-200 rounded-sm p-4 bg-slate-50/50 relative">
                 <div className="flex items-center justify-between mb-3">
@@ -953,7 +947,10 @@ export default function NewShipment() {
                     <div className="mt-3 pt-3 border-t border-slate-100 text-xs text-slate-600 bg-slate-50/70 px-3 py-2 rounded-sm">
                       <div className="flex flex-wrap gap-x-4 gap-y-1">
                         <span>Nolo base: <b className="text-slate-900">€ {q.reseller_base_freight.toFixed(2)}</b></span>
-                        <span>Supplementi totali: <b className="text-slate-900">€ {(q.reseller_surcharges_total ?? 0).toFixed(2)}</b></span>
+                        <span>Supplementi: <b className="text-slate-900">€ {(q.reseller_surcharges_total ?? 0).toFixed(2)}</b></span>
+                        {Number(q.platform_fee || 0) > 0 && (
+                          <span>Commissione Piattaforma: <b className="text-orange-700">€ {Number(q.platform_fee).toFixed(2)}</b></span>
+                        )}
                         {q.reseller_surcharge_items?.map((sc, idx) => (
                           <span key={idx} className="text-slate-500">
                             • {sc.label}: € {sc.amount.toFixed(2)}
