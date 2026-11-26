@@ -10,7 +10,7 @@ import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@
 import { toast } from "sonner";
 import {
   Buildings, Plus, Receipt, Gear, Key, CheckCircle,
-  WarningCircle, ShieldCheck, Wallet, EnvelopeSimple, PaperPlaneTilt,
+  WarningCircle, ShieldCheck, Wallet, EnvelopeSimple, PaperPlaneTilt, DownloadSimple,
 } from "@phosphor-icons/react";
 
 const FEATURE_KEYS = [
@@ -93,7 +93,14 @@ export default function SuperAdmin() {
   const [masterRules, setMasterRules] = useState({});
   const [open, setOpen] = useState(false);
   const [editing, setEditing] = useState(null);
+
+  // Contabilità Reseller
   const [billing, setBilling] = useState(null);
+  const [billingResellerId, setBillingResellerId] = useState(null);
+  const [billingFrom, setBillingFrom] = useState("");
+  const [billingTo, setBillingTo] = useState("");
+  const [billingLoading, setBillingLoading] = useState(false);
+
   const [topupTarget, setTopupTarget] = useState(null);
   const [topupAmount, setTopupAmount] = useState("250");
   const [topupNote, setTopupNote] = useState("");
@@ -112,7 +119,9 @@ export default function SuperAdmin() {
     enabled_surcharges: Object.fromEntries(SURCHARGE_KEYS.map(([k]) => [k, true])),
     carrier_policies: Object.fromEntries(CARRIERS.map(c => [c, "admin_only"])),
     admin_carrier_markups: {},
-    per_shipment_fee: 0.15, active: true,
+    fee_on_admin_codes: 0.25,
+    per_shipment_fee: 0.15,
+    active: true,
   };
   const [form, setForm] = useState(empty);
 
@@ -188,6 +197,7 @@ export default function SuperAdmin() {
     try {
       const payload = {
         ...form,
+        fee_on_admin_codes: parseFloat(form.fee_on_admin_codes) || 0,
         per_shipment_fee: parseFloat(form.per_shipment_fee) || 0,
       };
       if (editing) {
@@ -262,6 +272,8 @@ export default function SuperAdmin() {
     setForm({
       ...empty,
       ...r,
+      fee_on_admin_codes: r.fee_on_admin_codes ?? 0,
+      per_shipment_fee: r.per_shipment_fee ?? 0,
       notification_email: r.notification_email || r.admin_email || "",
       allow_ddp: !!r.allow_ddp,
       features: { ...empty.features, ...(r.features || {}) },
@@ -273,9 +285,48 @@ export default function SuperAdmin() {
     });
     setOpen(true);
   };
+
+  const loadBillingReport = async (rid, fromDt = billingFrom, toDt = billingTo) => {
+    setBillingLoading(true);
+    try {
+      const params = new URLSearchParams();
+      if (fromDt) params.set("date_from", fromDt);
+      if (toDt) params.set("date_to", toDt);
+      const qs = params.toString() ? `?${params.toString()}` : "";
+      const resp = await api.get(`/super/resellers/${rid}/billing${qs}`);
+      setBilling(resp.data);
+    } catch {
+      toast.error("Errore caricamento contabilità");
+    } finally {
+      setBillingLoading(false);
+    }
+  };
+
   const showBilling = async (r) => {
-    const resp = await api.get(`/super/resellers/${r.id}/billing`);
-    setBilling(resp.data);
+    setBillingResellerId(r.id);
+    setBillingFrom("");
+    setBillingTo("");
+    await loadBillingReport(r.id, "", "");
+  };
+
+  const exportBillingXlsx = async () => {
+    if (!billingResellerId) return;
+    try {
+      const params = new URLSearchParams();
+      if (billingFrom) params.set("date_from", billingFrom);
+      if (billingTo) params.set("date_to", billingTo);
+      const qs = params.toString() ? `?${params.toString()}` : "";
+      const resp = await api.get(`/super/resellers/${billingResellerId}/billing/export${qs}`, { responseType: "blob" });
+      const url = URL.createObjectURL(resp.data);
+      const a = document.createElement("a");
+      a.href = url;
+      a.download = `contabilita-${billing?.reseller?.slug || "reseller"}.xlsx`;
+      a.click();
+      URL.revokeObjectURL(url);
+      toast.success("Report contabile Excel scaricato");
+    } catch {
+      toast.error("Errore esportazione Excel");
+    }
   };
 
   const updateMasterRule = (cid, patch) => {
@@ -413,7 +464,10 @@ export default function SuperAdmin() {
                         )}
                       </div>
                       <div className="text-xs text-slate-500 mt-0.5">
-                        Login: <b>{r.admin_email}</b> · Notifiche: <b>{r.notification_email || r.admin_email}</b> {r.city && `· ${r.city} (${r.province})`} · sub-clienti: <b>{r.user_count}</b> · fee codici propri: <b>€ {Number(r.per_shipment_fee || 0).toFixed(2)}/sped</b>
+                        Login: <b>{r.admin_email}</b> · Notifiche: <b>{r.notification_email || r.admin_email}</b> {r.city && `· ${r.city} (${r.province})`} · sub-clienti: <b>{r.user_count}</b>
+                      </div>
+                      <div className="text-xs text-slate-600 mt-0.5">
+                        Commissione Piattaforma: <b>€ {Number(r.fee_on_admin_codes || 0).toFixed(2)}</b> (su codici Admin) · <b>€ {Number(r.per_shipment_fee || 0).toFixed(2)}</b> (su codici Reseller)
                       </div>
                       <div className="flex flex-wrap gap-1.5 mt-2">
                         {CARRIERS.map(c => {
@@ -421,7 +475,7 @@ export default function SuperAdmin() {
                           const defRule = masterData.carriers?.[c]?.default_markup_rule || masterData.carriers?.[c]?.default_markup_percent || 5;
                           const effRule = customMk[c] !== undefined && customMk[c] !== null ? customMk[c] : defRule;
                           const bCls = p === "reseller_only" ? "bg-blue-100 text-blue-800" : p === "disabled" ? "bg-slate-100 text-slate-400 line-through" : "bg-orange-100 text-orange-800";
-                          const label = p === "reseller_only" ? `Reseller (Fee €${Number(r.per_shipment_fee || 0).toFixed(2)})` : p === "disabled" ? "Off" : `Admin (${formatRuleShort(effRule)})`;
+                          const label = p === "reseller_only" ? `Reseller (Comm. €${Number(r.per_shipment_fee || 0).toFixed(2)})` : p === "disabled" ? "Off" : `Admin (${formatRuleShort(effRule)} + €${Number(r.fee_on_admin_codes || 0).toFixed(2)})`;
                           return <span key={c} className={`text-[10px] font-bold uppercase px-2 py-0.5 rounded-sm ${bCls}`}>{c}: {label}</span>;
                         })}
                       </div>
@@ -637,9 +691,35 @@ export default function SuperAdmin() {
                   </SelectContent>
                 </Select>
               </div>
-              <div className="sm:col-span-2">
-                <Label className="label-caps">Fee fissa per lettera di vettura su codici propri Reseller (€)</Label>
-                <Input type="number" step="0.01" min="0" value={form.per_shipment_fee} onChange={(e) => setForm({ ...form, per_shipment_fee: e.target.value })} className="mt-1 rounded-sm h-10 max-w-xs" />
+            </div>
+
+            <div className="bg-orange-50/60 border border-orange-200 rounded-sm p-3.5 space-y-3">
+              <div className="label-caps text-orange-800">Commissioni Piattaforma per Lettera di Vettura (€)</div>
+              <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
+                <div>
+                  <Label className="label-caps text-xs">Commissione su Codici Admin (Master) (€)</Label>
+                  <Input
+                    type="number"
+                    step="0.01"
+                    min="0"
+                    value={form.fee_on_admin_codes}
+                    onChange={(e) => setForm({ ...form, fee_on_admin_codes: e.target.value })}
+                    className="mt-1 rounded-sm h-10 bg-white font-mono"
+                  />
+                  <div className="text-[11px] text-slate-500 mt-0.5">Aggiunta ad ogni spedizione emessa sui tuoi codici Master</div>
+                </div>
+                <div>
+                  <Label className="label-caps text-xs">Commissione su Codici Reseller (Propri) (€)</Label>
+                  <Input
+                    type="number"
+                    step="0.01"
+                    min="0"
+                    value={form.per_shipment_fee}
+                    onChange={(e) => setForm({ ...form, per_shipment_fee: e.target.value })}
+                    className="mt-1 rounded-sm h-10 bg-white font-mono"
+                  />
+                  <div className="text-[11px] text-slate-500 mt-0.5">Aggiunta ad ogni spedizione emessa sui codici propri del Reseller</div>
+                </div>
               </div>
             </div>
 
@@ -658,7 +738,7 @@ export default function SuperAdmin() {
             <div className="border-t pt-4">
               <div className="label-caps text-orange-600 mb-1">Assegnazione Codici Corrieri & Margine Admin</div>
               <p className="text-xs text-slate-500 mb-3">
-                Per <b>Codice Admin (Master)</b> puoi lasciare il margine default dei tuoi codici Master oppure personalizzarlo (Unico o per Macro-Area). Per <b>Codice Reseller (Proprio)</b> si applica la fee fissa impostata sopra.
+                Per <b>Codice Admin (Master)</b> puoi lasciare il margine default dei tuoi codici Master oppure personalizzarlo (Unico o per Macro-Area). In aggiunta verrà applicata la rispettiva Commissione Piattaforma impostata sopra.
               </p>
               <div className="space-y-2.5">
                 {CARRIERS.map(cid => {
@@ -709,7 +789,7 @@ export default function SuperAdmin() {
                             </Select>
                           ) : (
                             <div className="text-xs font-semibold text-blue-700 bg-blue-50 px-2.5 py-1.5 rounded-sm">
-                              {pol === "reseller_only" ? `Fee € ${Number(form.per_shipment_fee || 0).toFixed(2)} / sped` : "Disabilitato"}
+                              {pol === "reseller_only" ? `Comm. € ${Number(form.per_shipment_fee || 0).toFixed(2)} / sped` : "Disabilitato"}
                             </div>
                           )}
                         </div>
@@ -816,24 +896,151 @@ export default function SuperAdmin() {
         </DialogContent>
       </Dialog>
 
-      {/* DIALOG REPORT CONTABILITA' & MARGINI */}
+      {/* DIALOG REPORT CONTABILITA' & ESTRATTO CONTO RESELLER */}
       <Dialog open={!!billing} onOpenChange={(o) => !o && setBilling(null)}>
-        <DialogContent className="rounded-sm max-w-2xl max-h-[85vh] overflow-y-auto">
+        <DialogContent className="rounded-sm max-w-4xl max-h-[90vh] overflow-y-auto">
           {billing && (
             <>
-              <DialogHeader><DialogTitle style={{ fontFamily: "Chivo" }}>Contabilità & Margini — {billing.reseller.company_name}</DialogTitle></DialogHeader>
-              <div className="space-y-2 text-sm">
-                <div className="flex justify-between py-2 border-b"><span>Modalità pagamento</span><b className="uppercase">{billing.reseller.billing_type || "prepaid"}</b></div>
-                {(billing.reseller.billing_type || "prepaid") === "prepaid" && (
-                  <div className="flex justify-between py-2 border-b bg-green-50 px-2 rounded-sm"><span>Credito residuo nel Wallet</span><b className="text-green-700">€ {Number(billing.reseller.credit_balance || 0).toFixed(2)}</b></div>
+              <DialogHeader>
+                <div className="flex items-center justify-between gap-2 flex-wrap pr-6">
+                  <DialogTitle style={{ fontFamily: "Chivo" }}>
+                    Contabilità & Estratto Conto — {billing.reseller.company_name}
+                  </DialogTitle>
+                  <Button size="sm" variant="outline" onClick={exportBillingXlsx} className="rounded-sm">
+                    <DownloadSimple size={15} className="mr-1.5" /> Esporta Excel
+                  </Button>
+                </div>
+              </DialogHeader>
+
+              {/* Filtro periodo */}
+              <div className="bg-slate-50 border border-slate-200 rounded-sm p-3 flex flex-wrap items-end gap-3 text-xs">
+                <div>
+                  <Label className="label-caps text-[10px]">Dal</Label>
+                  <Input type="date" value={billingFrom} onChange={(e) => setBillingFrom(e.target.value)} className="mt-1 h-8 rounded-sm bg-white text-xs" />
+                </div>
+                <div>
+                  <Label className="label-caps text-[10px]">Al</Label>
+                  <Input type="date" value={billingTo} onChange={(e) => setBillingTo(e.target.value)} className="mt-1 h-8 rounded-sm bg-white text-xs" />
+                </div>
+                <Button size="sm" onClick={() => loadBillingReport(billingResellerId, billingFrom, billingTo)} disabled={billingLoading} className="h-8 bg-slate-900 rounded-sm">
+                  {billingLoading ? "Calcolo…" : "Filtra Periodo"}
+                </Button>
+                {(billingFrom || billingTo) && (
+                  <Button size="sm" variant="ghost" onClick={() => { setBillingFrom(""); setBillingTo(""); loadBillingReport(billingResellerId, "", ""); }} className="h-8 text-xs">
+                    Azzera
+                  </Button>
                 )}
-                <div className="flex justify-between py-2 border-b"><span>Spedizioni su codici Admin</span><b>{billing.shipments_on_master}</b></div>
-                <div className="flex justify-between py-2 border-b text-slate-500"><span>Costo vivo API corriere (codici Admin)</span><span>€ {(billing.raw_carrier_cost_master ?? billing.amount_due_standard).toFixed(2)}</span></div>
-                <div className="flex justify-between py-2 border-b text-green-700"><span>Margine Admin maturato</span><b>+ € {(billing.admin_margin_earned ?? 0).toFixed(2)}</b></div>
-                <div className="flex justify-between py-2 border-b"><span>Totale trasporto codici Admin</span><b>€ {billing.amount_due_standard.toFixed(2)}</b></div>
-                <div className="flex justify-between py-2 border-b"><span>Fee lettere di vettura su codici Reseller ({billing.shipments_on_own})</span><b>€ {billing.amount_due_premium.toFixed(2)}</b></div>
-                <div className="flex justify-between py-3 border-t-2 border-slate-900 text-lg"><span className="font-black">Volume complessivo Admin</span><b className="text-orange-600">€ {billing.amount_due_total.toFixed(2)}</b></div>
               </div>
+
+              {/* KPI Sintesi */}
+              <div className="grid grid-cols-2 sm:grid-cols-4 gap-3 text-xs">
+                <div className="border border-slate-200 rounded-sm p-3 bg-white">
+                  <div className="label-caps text-slate-500">Modalità</div>
+                  <div className="font-bold uppercase text-sm mt-1">{billing.reseller.billing_type || "prepaid"}</div>
+                  {(billing.reseller.billing_type || "prepaid") === "prepaid" && (
+                    <div className="text-green-700 font-semibold mt-0.5">Wallet: € {Number(billing.reseller.credit_balance || 0).toFixed(2)}</div>
+                  )}
+                </div>
+                <div className="border border-slate-200 rounded-sm p-3 bg-white">
+                  <div className="label-caps text-slate-500">Trasporto Codici Admin</div>
+                  <div className="font-black font-mono text-lg mt-1">€ {Number(billing.amount_due_standard || 0).toFixed(2)}</div>
+                  <div className="text-green-700">Margine Admin: +€ {Number(billing.admin_margin_earned || 0).toFixed(2)}</div>
+                </div>
+                <div className="border border-slate-200 rounded-sm p-3 bg-white">
+                  <div className="label-caps text-slate-500">Commissioni Piattaforma</div>
+                  <div className="font-black font-mono text-lg mt-1">€ {Number(billing.fees_due_total || 0).toFixed(2)}</div>
+                  <div className="text-slate-500">
+                    Admin €{Number(billing.fees_due_master || 0).toFixed(2)} · Propri €{Number(billing.amount_due_premium || 0).toFixed(2)}
+                  </div>
+                </div>
+                <div className="border-2 border-slate-900 rounded-sm p-3 bg-slate-900 text-white">
+                  <div className="label-caps text-orange-400">Totale Imponibile</div>
+                  <div className="font-black font-mono text-xl mt-1">€ {Number(billing.amount_due_total || 0).toFixed(2)}</div>
+                  <div className="text-slate-400">{billing.shipments_total} spedizioni nel periodo</div>
+                </div>
+              </div>
+
+              {/* Riepilogo raggruppato: Reseller Diretto vs Singoli Sub-Clienti */}
+              {billing.breakdown_by_origin?.length > 0 && (
+                <div className="mt-3">
+                  <div className="label-caps text-orange-600 mb-2">Riepilogo per Origine (Spedizioni Dirette vs Sub-Clienti)</div>
+                  <div className="border rounded-sm overflow-hidden text-xs">
+                    <table className="w-full text-left">
+                      <thead className="bg-slate-100">
+                        <tr>
+                          <th className="p-2.5">Origine / Sub-Cliente</th>
+                          <th className="p-2.5 text-center">Spedizioni</th>
+                          <th className="p-2.5 text-right">Trasporto (€)</th>
+                          <th className="p-2.5 text-right">Comm. Piattaforma (€)</th>
+                          <th className="p-2.5 text-right">Totale Imponibile (€)</th>
+                        </tr>
+                      </thead>
+                      <tbody>
+                        {billing.breakdown_by_origin.map((row) => (
+                          <tr key={row.group_key} className="border-t">
+                            <td className="p-2.5 font-semibold">
+                              {row.company_name}
+                              {!row.is_reseller_direct && (
+                                <span className="ml-2 text-[10px] uppercase px-1.5 py-0.5 rounded-sm bg-slate-100 text-slate-600">
+                                  {row.client_billing_type}
+                                </span>
+                              )}
+                            </td>
+                            <td className="p-2.5 text-center font-mono">{row.shipments_count}</td>
+                            <td className="p-2.5 text-right font-mono">€ {row.transport_due.toFixed(2)}</td>
+                            <td className="p-2.5 text-right font-mono text-slate-600">€ {row.fees_due.toFixed(2)}</td>
+                            <td className="p-2.5 text-right font-mono font-bold text-slate-900">€ {row.total_due.toFixed(2)}</td>
+                          </tr>
+                        ))}
+                      </tbody>
+                    </table>
+                  </div>
+                </div>
+              )}
+
+              {/* Dettaglio spedizioni */}
+              {billing.recent_shipments?.length > 0 && (
+                <div className="mt-4">
+                  <div className="label-caps mb-2">Dettaglio spedizioni nel periodo</div>
+                  <div className="border rounded-sm overflow-hidden text-xs">
+                    <table className="w-full text-left">
+                      <thead className="bg-slate-100">
+                        <tr>
+                          <th className="p-2">Data</th>
+                          <th className="p-2">Tracking</th>
+                          <th className="p-2">Origine</th>
+                          <th className="p-2">Corriere</th>
+                          <th className="p-2">Contratto</th>
+                          <th className="p-2 text-right">Trasporto</th>
+                          <th className="p-2 text-right">Comm. Piatt.</th>
+                          <th className="p-2 text-right">Totale Reseller</th>
+                        </tr>
+                      </thead>
+                      <tbody>
+                        {billing.recent_shipments.map(s => {
+                          const isAdm = (s.contract_owner || (s.on_master_codes ? "admin" : "reseller")) === "admin";
+                          return (
+                            <tr key={s.id} className="border-t">
+                              <td className="p-2 font-mono text-slate-500">{(s.created_at || "").slice(0, 10)}</td>
+                              <td className="p-2 font-mono">{s.tracking_number}</td>
+                              <td className="p-2 font-semibold">{s.user_company_name || "Reseller"}</td>
+                              <td className="p-2">{s.carrier_name}</td>
+                              <td className="p-2">
+                                <span className={`px-1.5 py-0.5 rounded-sm font-bold ${isAdm ? "bg-orange-100 text-orange-800" : "bg-blue-100 text-blue-800"}`}>
+                                  {isAdm ? `Admin (+${s.admin_markup_percent ?? 0}%)` : "Reseller"}
+                                </span>
+                              </td>
+                              <td className="p-2 text-right font-mono">€ {Number(s._calc_transport_due || 0).toFixed(2)}</td>
+                              <td className="p-2 text-right font-mono text-slate-600">€ {Number(s._calc_fee_due || 0).toFixed(2)}</td>
+                              <td className="p-2 text-right font-mono font-bold">€ {Number(s._calc_admin_due || 0).toFixed(2)}</td>
+                            </tr>
+                          );
+                        })}
+                      </tbody>
+                    </table>
+                  </div>
+                </div>
+              )}
 
               {billing.ledger?.length > 0 && (
                 <div className="mt-4">
@@ -859,47 +1066,6 @@ export default function SuperAdmin() {
                               <td className={`p-2 text-right font-mono font-bold ${amt >= 0 ? "text-green-700" : "text-red-600"}`}>
                                 {amt >= 0 ? `+ € ${amt.toFixed(2)}` : `- € ${Math.abs(amt).toFixed(2)}`}
                               </td>
-                            </tr>
-                          );
-                        })}
-                      </tbody>
-                    </table>
-                  </div>
-                </div>
-              )}
-
-              {billing.recent_shipments?.length > 0 && (
-                <div className="mt-4">
-                  <div className="label-caps mb-2">Dettaglio ultime spedizioni</div>
-                  <div className="border rounded-sm overflow-hidden text-xs">
-                    <table className="w-full text-left">
-                      <thead className="bg-slate-100">
-                        <tr>
-                          <th className="p-2">Tracking</th>
-                          <th className="p-2">Corriere</th>
-                          <th className="p-2">Titolare</th>
-                          <th className="p-2">Codice</th>
-                          <th className="p-2 text-right">Costo API</th>
-                          <th className="p-2 text-right">Addebito Reseller</th>
-                        </tr>
-                      </thead>
-                      <tbody>
-                        {billing.recent_shipments.map(s => {
-                          const isAdm = (s.contract_owner || (s.on_master_codes ? "admin" : "reseller")) === "admin";
-                          const rawC = s.carrier_cost ?? s.cost ?? 0;
-                          const billedR = isAdm ? (s.reseller_cost ?? s.cost ?? 0) : (s.applied_fee ?? billing.reseller.per_shipment_fee ?? 0);
-                          return (
-                            <tr key={s.id} className="border-t">
-                              <td className="p-2 font-mono">{s.tracking_number}</td>
-                              <td className="p-2">{s.carrier_name}</td>
-                              <td className="p-2">
-                                <span className={`px-1.5 py-0.5 rounded-sm font-bold ${isAdm ? "bg-orange-100 text-orange-800" : "bg-blue-100 text-blue-800"}`}>
-                                  {isAdm ? `Admin (+${s.admin_markup_percent ?? 0}%)` : "Reseller"}
-                                </span>
-                              </td>
-                              <td className="p-2 font-mono">{s.carrier_code_used || "-"}</td>
-                              <td className="p-2 text-right text-slate-500">€ {rawC.toFixed(2)}</td>
-                              <td className="p-2 text-right font-semibold">€ {billedR.toFixed(2)}</td>
                             </tr>
                           );
                         })}
