@@ -108,11 +108,6 @@ DEFAULT_POLICIES = {c: "admin_only" for c in DEFAULT_CARRIERS}
 
 
 def normalize_markup_rule(raw: Any, fallback_flat: float = 0.0) -> Dict[str, Any]:
-    """Normalizza una regola margine in formato uniforme:
-    - mode='flat': {'mode': 'flat', 'flat': 10.0}
-    - mode='area': {'mode': 'area', 'domestic': 10.0, 'europe': 15.0, 'world': 20.0}
-    Supporta retrocompatibilità se raw è un numero semplice.
-    """
     if isinstance(raw, (int, float)):
         val = round(float(raw), 2)
         return {"mode": "flat", "flat": val, "domestic": val, "europe": val, "world": val}
@@ -354,8 +349,11 @@ async def create_reseller(inp: ResellerInput, _=Depends(require_super_admin)):
         raise HTTPException(400, "Admin email già utilizzata")
     rid = new_id()
     slug = (inp.slug or inp.company_name.lower().replace(" ", "-"))
+    b_type = inp.billing_type if inp.billing_type in ("prepaid", "postpaid", "instant") else "prepaid"
     preset = PLAN_PRESETS.get(inp.plan, DEFAULT_FEATURES)
     features = {**DEFAULT_FEATURES, **preset, **(inp.features or {})}
+    if b_type != "postpaid":
+        features["client_prepaid"] = False
     surcharges = {**DEFAULT_SURCHARGES, **(inp.enabled_surcharges or {})}
     raw_pol = {**DEFAULT_POLICIES, **(inp.carrier_policies or {})}
     policies = {k: _normalize_policy(v) for k, v in raw_pol.items()}
@@ -372,7 +370,7 @@ async def create_reseller(inp: ResellerInput, _=Depends(require_super_admin)):
         "country": (inp.country or "IT").strip().upper()[:2],
         "phone": inp.phone or "",
         "plan": inp.plan,
-        "billing_type": inp.billing_type if inp.billing_type in ("prepaid", "postpaid") else "prepaid",
+        "billing_type": b_type,
         "allow_ddp": bool(inp.allow_ddp),
         "credit_balance": 0.0,
         "features": features,
@@ -387,7 +385,7 @@ async def create_reseller(inp: ResellerInput, _=Depends(require_super_admin)):
     await db.users.insert_one({
         "id": new_id(), "email": inp.admin_email.lower(), "password": hash_pw(pw),
         "company_name": inp.company_name, "phone": inp.phone or "", "role": "reseller_admin",
-        "reseller_id": rid, "status": "approved", "billing_type": reseller["billing_type"],
+        "reseller_id": rid, "status": "approved", "billing_type": b_type,
         "credit_balance": 0.0, "created_at": now_iso(),
     })
     reseller.pop("_id", None)
@@ -404,6 +402,8 @@ async def list_resellers(_=Depends(require_super_admin)):
         r["enabled_surcharges"] = {**DEFAULT_SURCHARGES, **(r.get("enabled_surcharges") or {})}
         r["notification_email"] = r.get("notification_email") or r.get("admin_email", "")
         r["billing_type"] = r.get("billing_type") or "prepaid"
+        if r["billing_type"] != "postpaid" and r.get("features"):
+            r["features"]["client_prepaid"] = False
         r["allow_ddp"] = bool(r.get("allow_ddp", False))
         r["credit_balance"] = float(r.get("credit_balance") or 0.0)
         r["user_count"] = await db.users.count_documents({"reseller_id": r["id"], "role": "user"})
@@ -419,6 +419,9 @@ async def update_reseller(rid: str, inp: ResellerInput, _=Depends(require_super_
     doc = inp.model_dump(exclude_unset=True)
     doc.pop("admin_email", None)
     doc.pop("admin_password", None)
+    if "billing_type" in doc and doc["billing_type"] not in ("prepaid", "postpaid", "instant"):
+        doc["billing_type"] = "prepaid"
+    eff_billing = doc.get("billing_type") or existing.get("billing_type") or "prepaid"
     if "notification_email" in doc:
         doc["notification_email"] = (doc["notification_email"] or "").strip().lower()
     if "province" in doc:
@@ -426,7 +429,10 @@ async def update_reseller(rid: str, inp: ResellerInput, _=Depends(require_super_
     if "country" in doc:
         doc["country"] = (doc["country"] or "IT").strip().upper()[:2]
     if "features" in doc and doc["features"]:
-        doc["features"] = {**DEFAULT_FEATURES, **doc["features"]}
+        feats = {**DEFAULT_FEATURES, **doc["features"]}
+        if eff_billing != "postpaid":
+            feats["client_prepaid"] = False
+        doc["features"] = feats
     if "enabled_surcharges" in doc and doc["enabled_surcharges"]:
         doc["enabled_surcharges"] = {**DEFAULT_SURCHARGES, **doc["enabled_surcharges"]}
     if "carrier_policies" in doc and doc["carrier_policies"]:
@@ -435,6 +441,14 @@ async def update_reseller(rid: str, inp: ResellerInput, _=Depends(require_super_
     if "admin_carrier_markups" in doc and doc["admin_carrier_markups"] is not None:
         doc["admin_carrier_markups"] = _clean_admin_markups(doc["admin_carrier_markups"])
     await db.resellers.update_one({"id": rid}, {"$set": doc})
+
+    # Se il Reseller non è più Fine Mese, converti eventuali sub-clienti prepagati a Pagamento Istantaneo
+    if eff_billing != "postpaid":
+        await db.users.update_many(
+            {"reseller_id": rid, "role": "user", "billing_type": "prepaid"},
+            {"$set": {"billing_type": "instant"}},
+        )
+
     user_sync = {}
     if "billing_type" in doc:
         user_sync["billing_type"] = doc["billing_type"]
@@ -478,7 +492,7 @@ async def reseller_billing(rid: str, _=Depends(require_super_admin)):
     if not res:
         raise HTTPException(404)
     ships = await db.shipments.find(
-        {"reseller_id": rid, "status": {"$ne": "cancelled"}},
+        {"reseller_id": rid, "status": {"$nin": ["cancelled", "awaiting_payment"]}},
         {"_id": 0, "id": 1, "created_at": 1, "tracking_number": 1, "carrier_id": 1,
          "carrier_name": 1, "cost": 1, "carrier_cost": 1, "reseller_cost": 1,
          "admin_markup_percent": 1, "price": 1, "on_master_codes": 1,
@@ -520,7 +534,10 @@ async def my_features(user=Depends(get_current_user)):
     if not rid:
         return {"features": DEFAULT_FEATURES, "enabled_surcharges": DEFAULT_SURCHARGES, "allow_ddp": False, "role": user.get("role")}
     res = await db.resellers.find_one({"id": rid}, {"_id": 0})
+    res_billing = (res or {}).get("billing_type", "prepaid")
     features = {**DEFAULT_FEATURES, **((res or {}).get("features") or {})}
+    if res_billing != "postpaid":
+        features["client_prepaid"] = False
     surcharges = {**DEFAULT_SURCHARGES, **((res or {}).get("enabled_surcharges") or {})}
     policies = {k: _normalize_policy(v) for k, v in {**DEFAULT_POLICIES, **((res or {}).get("carrier_policies") or {})}.items()}
     can_manage_own = any(p == "reseller_only" for p in policies.values())
@@ -534,7 +551,7 @@ async def my_features(user=Depends(get_current_user)):
             "company_name": (res or {}).get("company_name", ""),
             "slug": (res or {}).get("slug", ""),
             "plan": (res or {}).get("plan", "basic"),
-            "billing_type": (res or {}).get("billing_type", "prepaid"),
+            "billing_type": res_billing,
             "credit_balance": float((res or {}).get("credit_balance") or 0.0),
         },
     }
@@ -644,7 +661,7 @@ async def bootstrap_multitenant():
             "address": "Via Monte Napoleone 10", "postal_code": "20121", "city": "Milano", "province": "MI", "country": "IT", "phone": "0212345678",
             "plan": "premium",
             "billing_type": "prepaid", "allow_ddp": False, "credit_balance": 500.0,
-            "features": {**PLAN_PRESETS["premium"]},
+            "features": {**PLAN_PRESETS["premium"], "client_prepaid": False},
             "enabled_surcharges": {**DEFAULT_SURCHARGES},
             "carrier_policies": {
                 "brt": "admin_only", "gls": "admin_only", "dhl": "admin_only",
