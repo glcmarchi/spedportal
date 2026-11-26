@@ -9,11 +9,12 @@ import { Textarea } from "@/components/ui/textarea";
 import { Checkbox } from "@/components/ui/checkbox";
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
 import { Popover, PopoverContent, PopoverTrigger } from "@/components/ui/popover";
+import { Dialog, DialogContent, DialogHeader, DialogTitle } from "@/components/ui/dialog";
 import { toast } from "sonner";
 import {
   ArrowLeft, ArrowRight, Package, Plus, X, Printer, CheckCircle,
   User, AddressBook, Question, UploadSimple, Warning, FloppyDisk, Eraser,
-  MagnifyingGlass, Clock,
+  MagnifyingGlass, FileText, Cube, ShieldWarning, CreditCard,
 } from "@phosphor-icons/react";
 
 export const COUNTRIES = [
@@ -65,9 +66,83 @@ const EU_COUNTRIES = new Set([
 
 export const PROVINCE_COUNTRIES = new Set(["IT", "US", "CA", "AU"]);
 
+const DOCUMENT_TYPES = [
+  "Contratti / Atti legali / Procure",
+  "Documenti aziendali / Fatture / Polizze di carico",
+  "Biglietti da visita / Brochure / Listini cartacei",
+  "Passaporti / Documenti d'identità / Certificati",
+  "Disegni tecnici / Progetti su carta",
+  "Altro documento privo di valore commerciale",
+];
+
+const PACKAGING_PRESETS = [
+  {
+    id: "busta_documenti",
+    name: "Busta Documenti Standard",
+    subtitle: "Max 0,5 kg · 35×25×2 cm",
+    maxWeight: 0.5,
+    length: 35,
+    width: 25,
+    height: 2,
+    weight: 0.3,
+    fixedDims: true,
+    docsOnly: true,
+  },
+  {
+    id: "busta_imbottita",
+    name: "Busta Imbottita / Pak",
+    subtitle: "Max 2,5 kg · 40×30×5 cm",
+    maxWeight: 2.5,
+    length: 40,
+    width: 30,
+    height: 5,
+    weight: 1.0,
+    fixedDims: true,
+    docsOnly: false,
+  },
+  {
+    id: "pacco",
+    name: "Pacco / Scatola Personalizzata",
+    subtitle: "Misure e peso liberi",
+    maxWeight: 999,
+    length: 30,
+    width: 20,
+    height: 15,
+    weight: 1.0,
+    fixedDims: false,
+    docsOnly: false,
+  },
+];
+
+const DOC_OR_GOODS_GUIDE = [
+  { item: "Contratti firmati, atti notarili, fatture, polizze di carico", type: "Documenti", note: "Nessuna restrizione doganale significativa." },
+  { item: "Etichette adesive / cartellini / packaging stampato (LABELS)", type: "Merce / Colli", note: "Articolo fisico: spedire come Merce. Nessuna restrizione particolare." },
+  { item: "Campioni tessili, abbigliamento, calzature", type: "Merce / Colli", note: "Richiede fattura proforma/commerciale con composizione materiale se Extra-UE." },
+  { item: "Piante, fiori stabilizzati, semi (PLANTS)", type: "Merce / Colli", note: "Richiede certificato fitosanitario originale del paese d'origine; possibili controlli e ritardi." },
+  { item: "Giocattoli (TOYS)", type: "Merce / Colli", note: "Ammessi solo se conformi alla normativa CE/locale con dichiarazione di conformità." },
+  { item: "Componenti elettronici, ricambi, dispositivi con batterie", type: "Merce / Colli", note: "Specificare codice HS e dichiarazione batterie al litio se presenti." },
+];
+
+const PROHIBITED_COMMON = [
+  "Armi da fuoco, munizioni, repliche o parti di armi",
+  "Esplosivi, fuochi d'artificio, gas compressi e liquidi infiammabili",
+  "Denaro contante, lingotti di metalli preziosi, pietre preziose sfuse",
+  "Sostanze stupefacenti, merci contraffatte o illegali",
+  "Animali vivi, resti umani o ceneri, trofei di caccia",
+  "Materiale pornografico o osceno",
+  "Alimenti deperibili senza imballo isotermico autorizzato",
+];
+
+const PROHIBITED_EXTRA_BY_COUNTRY = {
+  IT: ["Biglietti aerei o assegni in bianco", "Cannabis medica senza autorizzazione ministeriale", "Prodotti petroliferi sfusi"],
+  US: ["Prodotti alimentari non registrati FDA", "Bevande alcoliche senza licenza importatore", "Articoli in avorio o pelli esotiche"],
+  GB: ["Coltelli a serramanico o lame non conformi", "Prodotti lattiero-caseari o carni fresche senza certificato sanitario"],
+  CH: ["Prodotti animali / carni oltre franchigia senza certificato veterinario", "Orologi contraffatti"],
+};
+
 const emptyAddr = { company_name: "", address: "", postal_code: "", city: "", province: "", country: "IT", reference: "", email: "", phone: "" };
 const emptyParcel = { length: 30, width: 20, height: 15, weight: 1 };
-const STEPS = ["Mittente", "Destinatario", "Colli", "Servizi & Dogana", "Preventivo", "Conferma"];
+const STEPS = ["Mittente", "Destinatario", "Cosa Spedisci & Colli", "Servizi & Dogana", "Preventivo", "Conferma"];
 
 function fileToBase64(file) {
   return new Promise((resolve, reject) => {
@@ -87,13 +162,27 @@ export default function NewShipment() {
   };
   const allowDdp = !!user?.allow_ddp;
   const isResellerOrAdmin = ["reseller_admin", "super_admin", "admin"].includes(user?.role);
+  const isInstantBilling = (user?.billing_type || "instant") === "instant" && user?.role !== "super_admin";
 
   const [step, setStep] = useState(0);
   const [sender, setSender] = useState({ ...emptyAddr });
   const [recipient, setRecipient] = useState({ ...emptyAddr });
+
+  // Nuovo flusso guidato: Documenti vs Merce + Imballaggio
+  const [shipmentCategory, setShipmentCategory] = useState("goods"); // "documents" | "goods"
+  const [docSubType, setDocSubType] = useState(DOCUMENT_TYPES[0]);
   const [parcelType, setParcelType] = useState("pacco");
   const [parcels, setParcels] = useState([{ ...emptyParcel }]);
   const [goods, setGoods] = useState("");
+
+  // Dialog helper & articoli proibiti & salva pacco
+  const [helperOpen, setHelperOpen] = useState(false);
+  const [prohibitedOpen, setProhibitedOpen] = useState(false);
+  const [savePkgOpen, setSavePkgOpen] = useState(false);
+  const [newPkgName, setNewPkgName] = useState("");
+  const [newPkgDefault, setNewPkgDefault] = useState(true);
+  const [savingPkg, setSavingPkg] = useState(false);
+
   const [customs, setCustoms] = useState({
     required: false,
     incoterms: "DAP",
@@ -103,7 +192,7 @@ export default function NewShipment() {
     dae_base64: "",
     eori_number: "",
     hs_code: "",
-    customs_value: 100,
+    customs_value: "",
     customs_currency: "EUR",
   });
   const [services, setServices] = useState({
@@ -117,15 +206,14 @@ export default function NewShipment() {
   const [chosen, setChosen] = useState(null);
   const [addrCheck, setAddrCheck] = useState(null);
   const [checkingAddr, setCheckingAddr] = useState(false);
-  const [transitInfo, setTransitInfo] = useState(null);
-  const [checkingTransit, setCheckingTransit] = useState(false);
   const [loading, setLoading] = useState(false);
   const [created, setCreated] = useState(null);
   const [addressbook, setAddressbook] = useState([]);
   const [savedParcels, setSavedParcels] = useState([]);
 
   const destCountry = (recipient.country || "IT").toUpperCase();
-  const isExtraEu = destCountry.length === 2 && !EU_COUNTRIES.has(destCountry);
+  const isDocs = shipmentCategory === "documents";
+  const isExtraEu = !isDocs && destCountry.length === 2 && !EU_COUNTRIES.has(destCountry);
 
   useEffect(() => {
     setCustoms(c => ({ ...c, required: isExtraEu, incoterms: allowDdp ? c.incoterms : "DAP" }));
@@ -137,16 +225,76 @@ export default function NewShipment() {
     }
   };
 
+  const reloadParcels = () => {
+    api.get("/parcels").then(r => {
+      const list = r.data || [];
+      setSavedParcels(list);
+      const def = list.find(p => p.is_default);
+      if (def) {
+        setParcelType("pacco");
+        setParcels([{ length: def.length, width: def.width, height: def.height, weight: def.weight }]);
+      }
+    }).catch(() => {});
+  };
+
   useEffect(() => {
     reloadBook();
-    if (features.parcels) {
-      api.get("/parcels").then(r => {
-        setSavedParcels(r.data);
-        const def = r.data.find(p => p.is_default);
-        if (def) setParcels([{ length: def.length, width: def.width, height: def.height, weight: def.weight }]);
-      }).catch(() => {});
+    reloadParcels();
+  }, [features.address_book]);
+
+  const handleCategoryChange = (cat) => {
+    setShipmentCategory(cat);
+    if (cat === "documents") {
+      setParcelType("busta_documenti");
+      setParcels([{ length: 35, width: 25, height: 2, weight: 0.3 }]);
+      if (!goods.trim()) setGoods(docSubType);
+    } else {
+      const def = savedParcels.find(p => p.is_default);
+      setParcelType("pacco");
+      setParcels(def
+        ? [{ length: def.length, width: def.width, height: def.height, weight: def.weight }]
+        : [{ ...emptyParcel }]
+      );
+      if (DOCUMENT_TYPES.includes(goods)) setGoods("");
     }
-  }, [features.address_book, features.parcels]);
+  };
+
+  const handleSelectPackagingPreset = (preset) => {
+    setParcelType(preset.id);
+    setParcels([{
+      length: preset.length,
+      width: preset.width,
+      height: preset.height,
+      weight: preset.weight,
+    }]);
+  };
+
+  const saveCurrentParcelToFavorites = async () => {
+    if (!newPkgName.trim()) {
+      toast.error("Inserisci un nome per l'imballaggio (es. Scatola Media)");
+      return;
+    }
+    const p0 = parcels[0] || emptyParcel;
+    setSavingPkg(true);
+    try {
+      await api.post("/parcels", {
+        name: newPkgName.trim(),
+        length: Number(p0.length) || 30,
+        width: Number(p0.width) || 20,
+        height: Number(p0.height) || 15,
+        weight: Number(p0.weight) || 1,
+        is_default: newPkgDefault,
+      });
+      toast.success("Imballaggio salvato in 'I miei pacchi'!");
+      setSavePkgOpen(false);
+      setNewPkgName("");
+      reloadParcels();
+    } catch (err) {
+      toast.error(err?.response?.data?.detail || "Errore salvataggio imballaggio");
+    } finally {
+      setSavingPkg(false);
+    }
+  };
 
   const loadMyAddress = () => {
     const ra = user?.reseller_address || {};
@@ -187,22 +335,6 @@ export default function NewShipment() {
     }
   };
 
-  const handleCheckTransitTimes = async () => {
-    setCheckingTransit(true);
-    try {
-      const r = await api.post("/shipments/transit-times", buildBody());
-      const list = r.data?.services || [];
-      setTransitInfo(list);
-      if (list.length === 0) {
-        toast.info("Nessun dettaglio cut-off aggiuntivo restituito per questa tratta.");
-      }
-    } catch {
-      toast.error("Errore verifica tempi di resa");
-    } finally {
-      setCheckingTransit(false);
-    }
-  };
-
   const handlePdfUpload = async (fieldPrefix, file) => {
     if (!file) return;
     if (file.size > 5 * 1024 * 1024) {
@@ -221,10 +353,15 @@ export default function NewShipment() {
   const buildBody = () => ({
     sender,
     recipient,
+    shipment_category: shipmentCategory,
     parcel_type: parcelType,
     parcels,
-    goods_description: goods,
-    customs: { ...customs, required: isExtraEu },
+    goods_description: isDocs ? (goods.trim() || docSubType) : goods,
+    customs: {
+      ...customs,
+      required: isExtraEu,
+      customs_value: isExtraEu ? (parseFloat(customs.customs_value) || 0) : 0,
+    },
     services,
   });
 
@@ -238,11 +375,12 @@ export default function NewShipment() {
       toast.error("Per spedizioni Extra-UE è obbligatorio caricare la Fattura Proforma / Commerciale");
       return;
     }
-    if (isExtraEu && (!customs.customs_value || customs.customs_value <= 0)) {
-      toast.error("Inserisci un valore doganale dichiarato maggiore di 0");
+    const parsedVal = parseFloat(customs.customs_value);
+    if (isExtraEu && (!parsedVal || parsedVal <= 0)) {
+      toast.error("Inserisci manualmente un valore doganale dichiarato maggiore di 0");
       return;
     }
-    setLoading(true); setChosen(null); setAddrCheck(null); setTransitInfo(null);
+    setLoading(true); setChosen(null); setAddrCheck(null);
     try {
       const r = await api.post("/shipments/quote", buildBody());
       setQuotes(r.data); setStep(4);
@@ -259,10 +397,21 @@ export default function NewShipment() {
         carrier_id: chosen.carrier_id,
         service_type: chosen.service_type || "",
         expect_live: !!chosen.is_live,
+        origin_url: window.location.origin,
       });
-      setCreated(r.data); await refresh(); setStep(5); toast.success("Spedizione creata!");
-    } catch (err) { toast.error(err?.response?.data?.detail || "Errore creazione"); }
-    finally { setLoading(false); }
+      if (r.data?.requires_payment && r.data?.checkout_url) {
+        window.location.href = r.data.checkout_url;
+        return;
+      }
+      setCreated(r.data);
+      await refresh();
+      setStep(5);
+      toast.success("Spedizione creata!");
+    } catch (err) {
+      toast.error(err?.response?.data?.detail || "Errore creazione");
+    } finally {
+      setLoading(false);
+    }
   };
 
   const downloadLabel = async () => {
@@ -270,6 +419,8 @@ export default function NewShipment() {
     const url = URL.createObjectURL(r.data);
     const a = document.createElement("a"); a.href = url; a.download = `label-${created.tracking_number}.pdf`; a.click(); URL.revokeObjectURL(url);
   };
+
+  const currentPreset = PACKAGING_PRESETS.find(p => p.id === parcelType) || PACKAGING_PRESETS[2];
 
   const canNext = () => {
     if (step === 0) return sender.company_name && sender.address && sender.postal_code && sender.city;
@@ -282,6 +433,11 @@ export default function NewShipment() {
     }
     return true;
   };
+
+  const prohibitedList = [
+    ...PROHIBITED_COMMON,
+    ...(PROHIBITED_EXTRA_BY_COUNTRY[destCountry] || []),
+  ];
 
   return (
     <div className="space-y-6">
@@ -322,66 +478,234 @@ export default function NewShipment() {
         )}
         {step === 2 && (
           <div className="space-y-6">
-            <h2 className="text-2xl font-bold tracking-tight" style={{ fontFamily: "Chivo" }}>Colli</h2>
-            <div>
-              <Label className="label-caps">Tipo di spedizione</Label>
-              <Select value={parcelType} onValueChange={setParcelType}>
-                <SelectTrigger className="mt-1.5 rounded-sm max-w-xs h-11"><SelectValue /></SelectTrigger>
-                <SelectContent>
-                  <SelectItem value="pacco">Pacco</SelectItem>
-                  <SelectItem value="busta">Busta</SelectItem>
-                  <SelectItem value="documenti">Documenti</SelectItem>
-                  <SelectItem value="pallet">Pallet</SelectItem>
-                </SelectContent>
-              </Select>
-            </div>
-            {parcels.map((p, i) => (
-              <div key={i} className="border border-slate-200 rounded-sm p-4 bg-slate-50/50 relative">
-                <div className="flex items-center justify-between mb-3">
-                  <div className="label-caps">Collo #{i + 1}</div>
-                  {parcels.length > 1 && <button onClick={() => setParcels(parcels.filter((_, x) => x !== i))} className="text-slate-500 hover:text-red-600"><X size={16} /></button>}
-                </div>
-                <div className="grid grid-cols-2 sm:grid-cols-4 gap-3">
-                  {["length", "width", "height", "weight"].map((k) => (
-                    <div key={k}>
-                      <Label className="label-caps">{{length: "Lung. (cm)", width: "Larg. (cm)", height: "Prof. (cm)", weight: "Peso (kg)"}[k]}</Label>
-                      <Input type="number" min="0.1" step="0.1" value={p[k]}
-                        onChange={(e) => { const np = [...parcels]; np[i] = { ...np[i], [k]: Math.max(0, parseFloat(e.target.value) || 0) }; setParcels(np); }}
-                        className="mt-1.5 rounded-sm h-10" />
-                    </div>
-                  ))}
-                </div>
+            <div className="flex items-center justify-between flex-wrap gap-2">
+              <h2 className="text-2xl font-bold tracking-tight" style={{ fontFamily: "Chivo" }}>Cosa stai spedendo?</h2>
+              <div className="flex gap-2 flex-wrap">
+                <button
+                  type="button"
+                  onClick={() => setHelperOpen(true)}
+                  className="inline-flex items-center gap-1.5 text-xs font-bold bg-slate-100 hover:bg-orange-100 text-slate-800 px-3 py-1.5 rounded-sm"
+                >
+                  <Question size={15} weight="fill" className="text-orange-600" />
+                  Non sei sicuro se è Merce o Documenti?
+                </button>
+                <button
+                  type="button"
+                  onClick={() => setProhibitedOpen(true)}
+                  className="inline-flex items-center gap-1.5 text-xs font-bold bg-red-50 hover:bg-red-100 text-red-800 border border-red-200 px-3 py-1.5 rounded-sm"
+                >
+                  <ShieldWarning size={15} weight="fill" />
+                  Articoli proibiti ({destCountry})
+                </button>
               </div>
-            ))}
-            <Button variant="outline" onClick={() => setParcels([...parcels, { ...emptyParcel }])} className="rounded-sm"><Plus size={16} className="mr-2" /> Aggiungi collo</Button>
-            {savedParcels.length > 0 && (
-              <div>
-                <Label className="label-caps">Applica pacco salvato</Label>
-                <div className="flex flex-wrap gap-2 mt-2">
-                  {savedParcels.map(sp => (
-                    <button key={sp.id} onClick={() => setParcels([{ length: sp.length, width: sp.width, height: sp.height, weight: sp.weight }])}
-                      className="text-xs bg-slate-100 hover:bg-orange-100 border border-slate-200 px-3 py-1.5 rounded-sm font-semibold">
-                      {sp.name} · {sp.length}×{sp.width}×{sp.height} · {sp.weight}kg{sp.is_default && " ★"}
-                    </button>
-                  ))}
+            </div>
+
+            {/* Scelta principale stile DHL: Documenti vs Merce / Colli */}
+            <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+              <button
+                type="button"
+                onClick={() => handleCategoryChange("documents")}
+                className={`text-left border-2 rounded-sm p-5 transition-all ${
+                  isDocs ? "border-orange-600 bg-orange-50/40" : "border-slate-200 bg-white hover:border-slate-400"
+                }`}
+              >
+                <div className="flex items-center gap-3">
+                  <div className={`w-11 h-11 rounded-sm flex items-center justify-center ${isDocs ? "bg-orange-600 text-white" : "bg-slate-100 text-slate-700"}`}>
+                    <FileText size={24} weight="fill" />
+                  </div>
+                  <div>
+                    <div className="font-black text-lg" style={{ fontFamily: "Chivo" }}>Documenti</div>
+                    <div className="text-xs text-slate-500 font-semibold">Nessuna dogana richiesta</div>
+                  </div>
+                </div>
+                <p className="text-xs text-slate-600 mt-3 leading-relaxed">
+                  Include ogni tipologia di documento cartaceo privo di valore commerciale (contratti, fatture, atti, disegni). Gli articoli aventi valore commerciale non possono essere considerati documenti.
+                </p>
+              </button>
+
+              <button
+                type="button"
+                onClick={() => handleCategoryChange("goods")}
+                className={`text-left border-2 rounded-sm p-5 transition-all ${
+                  !isDocs ? "border-orange-600 bg-orange-50/40" : "border-slate-200 bg-white hover:border-slate-400"
+                }`}
+              >
+                <div className="flex items-center gap-3">
+                  <div className={`w-11 h-11 rounded-sm flex items-center justify-center ${!isDocs ? "bg-orange-600 text-white" : "bg-slate-100 text-slate-700"}`}>
+                    <Cube size={24} weight="fill" />
+                  </div>
+                  <div>
+                    <div className="font-black text-lg" style={{ fontFamily: "Chivo" }}>Merce / Colli</div>
+                    <div className="text-xs text-slate-500 font-semibold">Pacchi, scatole e articoli commerciali</div>
+                  </div>
+                </div>
+                <p className="text-xs text-slate-600 mt-3 leading-relaxed">
+                  Include qualsiasi merce, campione o oggetto con valore commerciale. Nel caso di spedizione fuori dall'Unione Europea, le merci saranno soggette a controllo doganale.
+                </p>
+              </button>
+            </div>
+
+            {/* Dettaglio Documenti se scelta categoria Documenti */}
+            {isDocs && (
+              <div className="bg-slate-50 border border-slate-200 rounded-sm p-4 space-y-3">
+                <div>
+                  <Label className="label-caps">Tipologia Documento*</Label>
+                  <Select
+                    value={docSubType}
+                    onValueChange={(v) => {
+                      setDocSubType(v);
+                      setGoods(v);
+                    }}
+                  >
+                    <SelectTrigger className="mt-1.5 rounded-sm h-10 bg-white"><SelectValue /></SelectTrigger>
+                    <SelectContent>
+                      {DOCUMENT_TYPES.map((dt) => (
+                        <SelectItem key={dt} value={dt}>{dt}</SelectItem>
+                      ))}
+                    </SelectContent>
+                  </Select>
+                </div>
+                <div className="text-xs text-amber-800 bg-amber-50 border border-amber-200 rounded-sm px-3 py-2">
+                  <b>Oggetto non in lista o con valore commerciale?</b> Seleziona <b>Merce / Colli</b> qui sopra per evitare blocchi doganali.
                 </div>
               </div>
             )}
-            <div>
-              <Label className="label-caps">
-                Descrizione merce {isExtraEu && <span className="text-orange-600">* (obbligatoria per dogana Extra-UE)</span>}
-              </Label>
-              <Textarea
-                value={goods}
-                onChange={(e) => setGoods(e.target.value)}
-                placeholder={isExtraEu ? "Es. Cotton T-Shirts / Electronic Components (descrizione dettagliata in inglese)" : "Descrizione contenuto del collo"}
-                className="mt-1.5 rounded-sm"
-                rows={3}
-              />
-              {isExtraEu && !goods.trim() && (
-                <div className="text-xs text-orange-600 font-semibold mt-1">Compila la descrizione della merce per poter proseguire.</div>
+
+            {/* Selezione Imballaggio Guidata */}
+            <div className="space-y-3 border-t border-slate-200 pt-4">
+              <div className="flex items-center justify-between flex-wrap gap-2">
+                <Label className="label-caps text-orange-600">Seleziona Imballaggio</Label>
+                <button
+                  type="button"
+                  onClick={() => { setNewPkgName(""); setNewPkgDefault(true); setSavePkgOpen(true); }}
+                  className="inline-flex items-center gap-1 text-xs font-bold text-orange-700 bg-orange-50 hover:bg-orange-100 border border-orange-200 px-3 py-1.5 rounded-sm"
+                >
+                  <FloppyDisk size={14} weight="fill" /> Salva questo imballo in "I miei pacchi"
+                </button>
+              </div>
+
+              <div className="grid grid-cols-1 sm:grid-cols-3 gap-3">
+                {PACKAGING_PRESETS.filter(p => (isDocs ? true : p.id !== "busta_documenti")).map((preset) => {
+                  const active = parcelType === preset.id;
+                  return (
+                    <button
+                      type="button"
+                      key={preset.id}
+                      onClick={() => handleSelectPackagingPreset(preset)}
+                      className={`text-left border rounded-sm p-3.5 transition-all ${
+                        active ? "border-orange-600 bg-orange-50/50 border-l-[3px]" : "border-slate-200 bg-white hover:border-slate-400"
+                      }`}
+                    >
+                      <div className="font-bold text-sm text-slate-900">{preset.name}</div>
+                      <div className="text-xs text-slate-500 mt-0.5">{preset.subtitle}</div>
+                    </button>
+                  );
+                })}
+              </div>
+
+              {savedParcels.length > 0 && !isDocs && (
+                <div className="pt-1">
+                  <div className="text-[11px] font-bold uppercase text-slate-500 mb-1.5">I miei pacchi salvati:</div>
+                  <div className="flex flex-wrap gap-2">
+                    {savedParcels.map(sp => (
+                      <button
+                        type="button"
+                        key={sp.id}
+                        onClick={() => {
+                          setParcelType("pacco");
+                          setParcels([{ length: sp.length, width: sp.width, height: sp.height, weight: sp.weight }]);
+                        }}
+                        className="text-xs bg-slate-100 hover:bg-orange-100 border border-slate-200 px-3 py-1.5 rounded-sm font-semibold"
+                      >
+                        {sp.name} · {sp.length}×{sp.width}×{sp.height} cm · {sp.weight} kg{sp.is_default && " ★"}
+                      </button>
+                    ))}
+                  </div>
+                </div>
               )}
             </div>
+
+            {/* Elenco Colli */}
+            {parcels.map((p, i) => (
+              <div key={i} className="border border-slate-200 rounded-sm p-4 bg-slate-50/50 relative">
+                <div className="flex items-center justify-between mb-3">
+                  <div className="label-caps">Collo #{i + 1} · {currentPreset.name}</div>
+                  {parcels.length > 1 && (
+                    <button type="button" onClick={() => setParcels(parcels.filter((_, x) => x !== i))} className="text-slate-500 hover:text-red-600">
+                      <X size={16} />
+                    </button>
+                  )}
+                </div>
+                <div className="grid grid-cols-2 sm:grid-cols-4 gap-3">
+                  {["length", "width", "height", "weight"].map((k) => {
+                    const isDim = k !== "weight";
+                    const disabled = isDim && currentPreset.fixedDims;
+                    return (
+                      <div key={k}>
+                        <Label className="label-caps">
+                          {{ length: "Lung. (cm)", width: "Larg. (cm)", height: "Prof. (cm)", weight: `Peso (kg)${currentPreset.maxWeight < 999 ? ` max ${currentPreset.maxWeight}` : ""}` }[k]}
+                        </Label>
+                        <Input
+                          type="number"
+                          min="0.1"
+                          step="0.1"
+                          disabled={disabled}
+                          value={p[k]}
+                          onChange={(e) => {
+                            let val = Math.max(0, parseFloat(e.target.value) || 0);
+                            if (k === "weight" && parcelType === "busta_documenti" && val > 0.5) {
+                              toast.info("Oltre 0,5 kg l'imballaggio passa automaticamente a Busta Imbottita / Pak");
+                              setParcelType("busta_imbottita");
+                              const np = [...parcels];
+                              np[i] = { length: 40, width: 30, height: 5, weight: val };
+                              setParcels(np);
+                              return;
+                            }
+                            if (k === "weight" && parcelType === "busta_imbottita" && val > 2.5) {
+                              toast.info("Oltre 2,5 kg l'imballaggio passa automaticamente a Pacco Personalizzato");
+                              setParcelType("pacco");
+                            }
+                            const np = [...parcels];
+                            np[i] = { ...np[i], [k]: val };
+                            setParcels(np);
+                          }}
+                          className="mt-1.5 rounded-sm h-10 bg-white"
+                        />
+                      </div>
+                    );
+                  })}
+                </div>
+              </div>
+            ))}
+
+            {parcelType !== "busta_documenti" && (
+              <Button
+                type="button"
+                variant="outline"
+                onClick={() => setParcels([...parcels, { ...parcels[0] }])}
+                className="rounded-sm"
+              >
+                <Plus size={16} className="mr-2" /> Aggiungi collo dello stesso tipo
+              </Button>
+            )}
+
+            {!isDocs && (
+              <div>
+                <Label className="label-caps">
+                  Descrizione merce {isExtraEu && <span className="text-orange-600">* (obbligatoria per dogana Extra-UE)</span>}
+                </Label>
+                <Textarea
+                  value={goods}
+                  onChange={(e) => setGoods(e.target.value)}
+                  placeholder={isExtraEu ? "Es. Cotton T-Shirts / Electronic Components (descrizione dettagliata in inglese)" : "Descrizione contenuto del collo"}
+                  className="mt-1.5 rounded-sm"
+                  rows={3}
+                />
+                {isExtraEu && !goods.trim() && (
+                  <div className="text-xs text-orange-600 font-semibold mt-1">Compila la descrizione della merce per poter proseguire.</div>
+                )}
+              </div>
+            )}
           </div>
         )}
 
@@ -392,7 +716,7 @@ export default function NewShipment() {
             <div className="border border-slate-200 rounded-sm p-5 space-y-4">
               <div className="label-caps text-orange-600">Servizi Accessori & Supplementi</div>
 
-              {enabledSurcharges.insurance !== false && (
+              {enabledSurcharges.insurance !== false && !isDocs && (
                 <label className="flex items-start gap-3 cursor-pointer">
                   <Checkbox checked={services.insurance} onCheckedChange={(v) => setServices({ ...services, insurance: !!v })} className="mt-1" />
                   <div className="flex-1">
@@ -473,9 +797,9 @@ export default function NewShipment() {
                       <p><b>• DAP (Delivered At Place):</b> dazi e IVA d'importazione sono pagati dal <b>destinatario</b> alla consegna.</p>
                       <p><b>• DDP (Delivered Duty Paid):</b> dazi e IVA d'importazione sono addebitati al <b>mittente</b> (richiede abilitazione espressa).</p>
                       <p><b>• Fattura Proforma / Commerciale (Obbligatoria):</b> documento che dichiara contenuto, valore della merce, valuta, paese d'origine e causale dell'esportazione.</p>
-                      <p><b>• Codice Doganale HS Code (6-10 cifre):</b> codice tariffario internazionale (Harmonized System) che identifica la tipologia di merce (es. <code>620342</code> per abbigliamento in cotone, <code>850440</code> per alimentatori). Riduce i tempi di sdoganamento ed evita blocchi verso USA, UK e Svizzera.</p>
-                      <p><b>• Codice EORI:</b> codice identificativo doganale dell'operatore economico (in Italia è composto da <code>IT</code> + Partita IVA). Obbligatorio per le aziende che esportano fuori UE; non richiesto ai privati.</p>
-                      <p><b>• DAE (Documento Accompagnamento Esportazione):</b> obbligatorio per spedizioni commerciali di valore superiore a <b>1.000 €</b>.</p>
+                      <p><b>• Codice Doganale HS Code (6-10 cifre):</b> codice tariffario internazionale che identifica la tipologia di merce (es. <code>620342</code> abbigliamento cotone, <code>850440</code> alimentatori).</p>
+                      <p><b>• Codice EORI:</b> codice doganale dell'esportatore (in Italia <code>IT</code> + Partita IVA).</p>
+                      <p><b>• DAE:</b> obbligatorio per spedizioni commerciali di valore superiore a <b>1.000 €</b>.</p>
                     </PopoverContent>
                   </Popover>
                 </div>
@@ -529,7 +853,15 @@ export default function NewShipment() {
                           <SelectItem value="CHF">CHF</SelectItem>
                         </SelectContent>
                       </Select>
-                      <Input type="number" min="1" step="0.01" value={customs.customs_value} onChange={(e) => setCustoms({ ...customs, customs_value: Math.max(0, parseFloat(e.target.value) || 0) })} className="rounded-sm h-10 bg-white flex-1" />
+                      <Input
+                        type="number"
+                        min="0.01"
+                        step="0.01"
+                        placeholder="Inserisci valore merce"
+                        value={customs.customs_value}
+                        onChange={(e) => setCustoms({ ...customs, customs_value: e.target.value })}
+                        className="rounded-sm h-10 bg-white flex-1"
+                      />
                     </div>
                   </div>
 
@@ -552,7 +884,9 @@ export default function NewShipment() {
               </div>
             ) : (
               <div className="text-xs text-slate-500 bg-slate-50 border border-slate-200 rounded-sm p-3">
-                Destinazione <b>{destCountry}</b> (Italia / Unione Europea): nessun documento doganale richiesto.
+                {isDocs
+                  ? "Spedizione Documenti (privi di valore commerciale): nessun documento doganale richiesto."
+                  : <>Destinazione <b>{destCountry}</b> (Italia / Unione Europea): nessun documento doganale richiesto.</>}
               </div>
             )}
           </div>
@@ -563,40 +897,11 @@ export default function NewShipment() {
             <div className="flex items-center justify-between flex-wrap gap-2">
               <div>
                 <h2 className="text-2xl font-bold tracking-tight" style={{ fontFamily: "Chivo" }}>Preventivo</h2>
-                <div className="text-sm text-slate-600">Macro-Zona: <b>{quotes.zone}</b> · Peso tassato: <b>{quotes.billed_weight} kg</b></div>
-              </div>
-              <Button
-                type="button"
-                variant="outline"
-                size="sm"
-                onClick={handleCheckTransitTimes}
-                disabled={checkingTransit}
-                className="rounded-sm h-9 text-xs"
-              >
-                <Clock size={15} className="mr-1.5 text-orange-600" />
-                {checkingTransit ? "Verifica in corso…" : "Verifica Tempi di Resa & Cut-off Ritiro"}
-              </Button>
-            </div>
-
-            {transitInfo && transitInfo.length > 0 && (
-              <div className="bg-slate-50 border border-slate-200 rounded-sm p-4 text-xs space-y-2">
-                <div className="label-caps text-slate-800">Dettaglio Tempi di Resa & Orari Limite Ritiro (FedEx Service Availability)</div>
-                <div className="grid grid-cols-1 sm:grid-cols-2 gap-2">
-                  {transitInfo.map((t, idx) => (
-                    <div key={idx} className="bg-white border border-slate-200 p-2.5 rounded-sm">
-                      <div className="font-bold text-slate-900">{t.service_name || t.service_type}</div>
-                      <div className="text-slate-600 mt-0.5">
-                        Transito: <b>{t.transit_days} gg</b>
-                        {t.delivery_day && ` · Consegna stimata: ${t.delivery_day} ${t.delivery_time || ""}`}
-                      </div>
-                      {t.cutoff_time && (
-                        <div className="text-orange-700 font-semibold mt-0.5">Cut-off ritiro: ore {t.cutoff_time.slice(0, 5)}</div>
-                      )}
-                    </div>
-                  ))}
+                <div className="text-sm text-slate-600">
+                  Tipologia: <b>{isDocs ? "Documenti" : "Merce"}</b> · Macro-Zona: <b>{quotes.zone}</b> · Peso tassato: <b>{quotes.billed_weight} kg</b>
                 </div>
               </div>
-            )}
+            </div>
 
             {quotes.warnings?.length > 0 && (
               <div className="bg-amber-50 border border-amber-300 text-amber-900 rounded-sm p-3 text-xs space-y-1">
@@ -632,8 +937,9 @@ export default function NewShipment() {
                           </span>
                         )}
                       </div>
-                      <div className="text-xs text-slate-500">
-                        Consegna stimata: {q.transit_days} {q.transit_days === 1 ? "giorno" : "giorni"} lav.
+                      <div className="text-xs text-slate-600 mt-0.5">
+                        Consegna stimata: <b>{q.transit_days} {q.transit_days === 1 ? "giorno" : "giorni"} lav.</b>
+                        {q.commit_hint && <span className="text-slate-500"> · {q.commit_hint}</span>}
                       </div>
                       {i === 0 && <div className="mt-1 label-caps text-orange-600">Miglior prezzo</div>}
                     </div>
@@ -659,6 +965,12 @@ export default function NewShipment() {
                 </div>
               );
             })}
+
+            {isInstantBilling && chosen && (
+              <div className="bg-blue-50 border border-blue-200 rounded-sm p-3.5 text-xs text-blue-900">
+                <b>Modalità Pagamento Istantaneo:</b> cliccando su <b>Procedi al Pagamento</b> verrai reindirizzato al checkout sicuro (Carta / PayPal). La lettera di vettura e la fattura saranno emesse immediatamente alla conferma del pagamento.
+              </div>
+            )}
 
             {checkingAddr && (
               <div className="text-xs text-slate-500 bg-slate-50 border border-slate-200 rounded-sm p-3">
@@ -721,9 +1033,113 @@ export default function NewShipment() {
           <Button variant="outline" onClick={() => setStep(Math.max(0, step - 1))} disabled={step === 0} className="rounded-sm"><ArrowLeft size={16} className="mr-2" /> Indietro</Button>
           {step < 3 && <Button disabled={!canNext()} onClick={() => setStep(step + 1)} className="bg-orange-600 hover:bg-orange-700 rounded-sm">Avanti <ArrowRight size={16} className="ml-2" /></Button>}
           {step === 3 && <Button disabled={loading} onClick={fetchQuotes} className="bg-orange-600 hover:bg-orange-700 rounded-sm">{loading ? "Calcolo…" : "Calcola tariffe"} <ArrowRight size={16} className="ml-2" /></Button>}
-          {step === 4 && <Button disabled={!chosen || loading} onClick={confirm} className="bg-orange-600 hover:bg-orange-700 rounded-sm">{loading ? "Creazione…" : "Conferma & Crea"} <Package size={16} className="ml-2" weight="fill" /></Button>}
+          {step === 4 && (
+            <Button disabled={!chosen || loading} onClick={confirm} className="bg-orange-600 hover:bg-orange-700 rounded-sm">
+              {isInstantBilling ? (
+                <>
+                  <CreditCard size={16} className="mr-2" weight="fill" />
+                  {loading ? "Apertura pagamento…" : `Procedi al Pagamento (€ ${chosen ? chosen.price.toFixed(2) : "0.00"})`}
+                </>
+              ) : (
+                <>
+                  <Package size={16} className="mr-2" weight="fill" />
+                  {loading ? "Creazione…" : "Conferma & Crea"}
+                </>
+              )}
+            </Button>
+          )}
         </div>
       )}
+
+      {/* Dialog Helper: Documenti vs Merce */}
+      <Dialog open={helperOpen} onOpenChange={setHelperOpen}>
+        <DialogContent className="max-w-2xl rounded-sm max-h-[85vh] overflow-y-auto">
+          <DialogHeader>
+            <DialogTitle style={{ fontFamily: "Chivo" }}>Guida: Documento o Merce?</DialogTitle>
+          </DialogHeader>
+          <div className="space-y-3 text-xs">
+            <p className="text-slate-600">
+              Consulta la tabella per identificare correttamente il contenuto ed evitare ritardi o sanzioni doganali:
+            </p>
+            <div className="border border-slate-200 rounded-sm overflow-hidden">
+              <table className="w-full text-left">
+                <thead className="bg-slate-50 border-b border-slate-200">
+                  <tr>
+                    <th className="p-2.5">Tipologia Contenuto</th>
+                    <th className="p-2.5">Categoria</th>
+                    <th className="p-2.5">Osservazioni</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {DOC_OR_GOODS_GUIDE.map((row, idx) => (
+                    <tr key={idx} className="border-t border-slate-100">
+                      <td className="p-2.5 font-semibold text-slate-900">{row.item}</td>
+                      <td className="p-2.5 whitespace-nowrap">
+                        <span className={`px-2 py-0.5 rounded-sm font-bold ${row.type === "Documenti" ? "bg-blue-100 text-blue-800" : "bg-orange-100 text-orange-800"}`}>
+                          {row.type}
+                        </span>
+                      </td>
+                      <td className="p-2.5 text-slate-600">{row.note}</td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </div>
+          </div>
+        </DialogContent>
+      </Dialog>
+
+      {/* Dialog Articoli Proibiti */}
+      <Dialog open={prohibitedOpen} onOpenChange={setProhibitedOpen}>
+        <DialogContent className="max-w-lg rounded-sm max-h-[85vh] overflow-y-auto">
+          <DialogHeader>
+            <DialogTitle style={{ fontFamily: "Chivo" }}>Articoli Proibiti · Destinazione {destCountry}</DialogTitle>
+          </DialogHeader>
+          <div className="space-y-3 text-xs">
+            <p className="text-slate-600">
+              I seguenti articoli sono vietati o soggetti a restrizioni severe per il trasporto aereo/stradale verso <b>{destCountry}</b>:
+            </p>
+            <ul className="space-y-1.5 bg-red-50/60 border border-red-200 rounded-sm p-3.5 text-red-950">
+              {prohibitedList.map((item, idx) => (
+                <li key={idx}>• {item}</li>
+              ))}
+            </ul>
+          </div>
+        </DialogContent>
+      </Dialog>
+
+      {/* Dialog Salva Imballaggio in I miei pacchi */}
+      <Dialog open={savePkgOpen} onOpenChange={setSavePkgOpen}>
+        <DialogContent className="max-w-md rounded-sm">
+          <DialogHeader>
+            <DialogTitle style={{ fontFamily: "Chivo" }}>Salva Imballaggio Preferito</DialogTitle>
+          </DialogHeader>
+          <div className="space-y-4 text-sm">
+            <div className="bg-slate-50 border border-slate-200 rounded-sm p-3 text-xs text-slate-600">
+              Misure attuali: <b>{parcels[0]?.length}×{parcels[0]?.width}×{parcels[0]?.height} cm</b> · Peso: <b>{parcels[0]?.weight} kg</b>
+            </div>
+            <div>
+              <Label className="label-caps">Nome Imballaggio*</Label>
+              <Input
+                value={newPkgName}
+                onChange={(e) => setNewPkgName(e.target.value)}
+                placeholder="es. Scatola Standard 30x20x15"
+                className="mt-1 rounded-sm h-10"
+              />
+            </div>
+            <label className="flex items-center gap-2 cursor-pointer text-xs font-semibold">
+              <Checkbox checked={newPkgDefault} onCheckedChange={(v) => setNewPkgDefault(!!v)} />
+              <span>Imposta come predefinito per le prossime spedizioni</span>
+            </label>
+            <div className="flex justify-end gap-2">
+              <Button variant="outline" onClick={() => setSavePkgOpen(false)} className="rounded-sm">Annulla</Button>
+              <Button onClick={saveCurrentParcelToFavorites} disabled={savingPkg} className="bg-orange-600 hover:bg-orange-700 rounded-sm">
+                {savingPkg ? "Salvataggio…" : "Salva Imballaggio"}
+              </Button>
+            </div>
+          </div>
+        </DialogContent>
+      </Dialog>
     </div>
   );
 }
