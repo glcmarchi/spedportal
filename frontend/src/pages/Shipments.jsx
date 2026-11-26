@@ -88,7 +88,7 @@ export default function Shipments() {
           <Input
             value={q}
             onChange={(e) => setQ(e.target.value)}
-            placeholder={isResellerOrAdmin ? "Cerca tracking, destinatario, sub-cliente, corriere…" : "Cerca per tracking, destinatario, corriere…"}
+            placeholder={isResellerOrAdmin ? "Cerca tracking, destinatario, cliente, corriere…" : "Cerca per tracking, destinatario, corriere…"}
             className="pl-9 h-11 rounded-sm"
           />
         </div>
@@ -97,7 +97,7 @@ export default function Shipments() {
           <div className="flex gap-1.5 flex-wrap">
             {[
               ["all", "Tutte"],
-              ["reseller", "Dirette Reseller"],
+              ["reseller", "Reseller"],
               ["subclients", "Sub-Clienti"],
             ].map(([k, lbl]) => (
               <button
@@ -129,9 +129,7 @@ export default function Shipments() {
                 <th className="px-4 py-3">Destinatario</th>
                 <th className="px-4 py-3">Città</th>
                 <th className="px-4 py-3">Naz.</th>
-                {isResellerOrAdmin && <th className="px-4 py-3 text-right">Tuo Costo</th>}
-                <th className="px-4 py-3 text-right">{isResellerOrAdmin ? "Prezzo Cliente" : "Prezzo"}</th>
-                {isResellerOrAdmin && <th className="px-4 py-3 text-right">Margine</th>}
+                <th className="px-4 py-3 text-right">Prezzo</th>
                 <th className="px-4 py-3">Stato</th>
                 <th className="px-4 py-3"></th>
               </tr>
@@ -139,9 +137,6 @@ export default function Shipments() {
             <tbody>
               {filtered.map((s, i) => {
                 const isClientShip = s.created_by_role === "user";
-                const resellerCost = Number(s.reseller_cost ?? s.cost ?? 0);
-                const clientPrice = Number(s.price ?? 0);
-                const margin = isClientShip ? Math.round((clientPrice - resellerCost) * 100) / 100 : 0;
                 const cancelNote = cancelledByText(s);
 
                 return (
@@ -155,11 +150,11 @@ export default function Shipments() {
                       <td className="px-4 py-2.5 text-xs">
                         {isClientShip ? (
                           <span className="inline-block bg-blue-50 text-blue-800 border border-blue-200 px-2 py-0.5 rounded-sm font-semibold">
-                            Sub-cliente: {s.user_company_name || "Cliente"}
+                            {s.user_company_name || "Sub-cliente"}
                           </span>
                         ) : (
                           <span className="inline-block bg-slate-100 text-slate-700 px-2 py-0.5 rounded-sm font-semibold">
-                            Diretta Reseller
+                            Reseller
                           </span>
                         )}
                       </td>
@@ -167,23 +162,7 @@ export default function Shipments() {
                     <td className="px-4 py-2.5">{s.recipient?.company_name}</td>
                     <td className="px-4 py-2.5">{s.recipient?.city}</td>
                     <td className="px-4 py-2.5 font-mono">{s.recipient?.country}</td>
-                    {isResellerOrAdmin && (
-                      <td className="px-4 py-2.5 text-right font-mono text-xs text-slate-600 whitespace-nowrap">
-                        € {resellerCost.toFixed(2)}
-                      </td>
-                    )}
-                    <td className="px-4 py-2.5 text-right font-semibold whitespace-nowrap">€ {clientPrice.toFixed(2)}</td>
-                    {isResellerOrAdmin && (
-                      <td className="px-4 py-2.5 text-right font-mono text-xs font-bold whitespace-nowrap">
-                        {isClientShip && s.status !== "cancelled" ? (
-                          <span className={margin >= 0 ? "text-green-700" : "text-red-600"}>
-                            {margin >= 0 ? `+ € ${margin.toFixed(2)}` : `- € ${Math.abs(margin).toFixed(2)}`}
-                          </span>
-                        ) : (
-                          <span className="text-slate-400">—</span>
-                        )}
-                      </td>
-                    )}
+                    <td className="px-4 py-2.5 text-right font-semibold whitespace-nowrap">€ {Number(s.price || 0).toFixed(2)}</td>
                     <td className="px-4 py-2.5">
                       <div className="flex flex-col items-start gap-1">
                         <StatusBadge status={s.status} />
@@ -208,7 +187,7 @@ export default function Shipments() {
               })}
               {filtered.length === 0 && (
                 <tr>
-                  <td colSpan={isResellerOrAdmin ? 12 : 9} className="px-4 py-10 text-center text-slate-500">
+                  <td colSpan={isResellerOrAdmin ? 10 : 9} className="px-4 py-10 text-center text-slate-500">
                     Nessuna spedizione trovata.
                   </td>
                 </tr>
