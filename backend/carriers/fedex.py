@@ -26,18 +26,18 @@ TRANSIT_MAP = {
 }
 
 SERVICE_COMMIT_HINTS = {
-    "FEDEX_FIRST": "Consegna mattutina entro le 10:00",
-    "FEDEX_FIRST_OVERNIGHT": "Consegna mattutina entro le 08:30 / 10:00",
+    "FEDEX_FIRST": "Consegna mattutina urgente entro le 10:00",
+    "FEDEX_FIRST_OVERNIGHT": "Consegna mattutina urgente entro le 08:30 / 10:00",
     "INTERNATIONAL_FIRST": "Consegna mattutina prioritaria entro le 10:00",
-    "FEDEX_PRIORITY_EXPRESS": "Consegna espressa entro le 12:00",
-    "FEDEX_PRIORITY": "Consegna entro fine giornata lavorativa",
-    "PRIORITY_OVERNIGHT": "Consegna entro le 10:30 / 12:00",
-    "STANDARD_OVERNIGHT": "Consegna entro fine giornata",
-    "INTERNATIONAL_PRIORITY": "Consegna espressa prioritaria",
-    "FEDEX_INTERNATIONAL_PRIORITY": "Consegna espressa prioritaria",
-    "FEDEX_INTERNATIONAL_PRIORITY_EXPRESS": "Consegna espressa entro le 12:00",
+    "FEDEX_PRIORITY_EXPRESS": "Consegna espressa prioritaria entro le 12:00",
+    "FEDEX_INTERNATIONAL_PRIORITY_EXPRESS": "Consegna espressa prioritaria entro le 12:00",
+    "PRIORITY_OVERNIGHT": "Consegna espressa entro le 10:30 / 12:00",
+    "FEDEX_PRIORITY": "Consegna espressa entro fine giornata lavorativa",
+    "STANDARD_OVERNIGHT": "Consegna espressa entro fine giornata",
+    "INTERNATIONAL_PRIORITY": "Consegna espressa prioritaria entro fine giornata",
+    "FEDEX_INTERNATIONAL_PRIORITY": "Consegna espressa prioritaria entro fine giornata",
+    "FEDEX_INTERNATIONAL_CONNECT_PLUS": "Consegna e-commerce internazionale programmata",
     "INTERNATIONAL_ECONOMY": "Consegna economica programmata",
-    "FEDEX_INTERNATIONAL_CONNECT_PLUS": "Consegna e-commerce programmata",
     "FEDEX_REGIONAL_ECONOMY": "Consegna stradale programmata Europa",
 }
 
@@ -59,6 +59,21 @@ FEDEX_STATUS_MAP = {
     "CA": "cancelled",
     "RS": "exception",
 }
+
+
+def resolve_fedex_packaging(parcel_type: str, parcels: List[Dict[str, Any]]) -> str:
+    """Mappa in sicurezza la tipologia di imballaggio neutrale sul packagingType FedEx."""
+    pt = (parcel_type or "pacco").lower().strip()
+    max_w = max((float(p.get("weight", 1.0)) for p in parcels), default=1.0)
+    if pt in ("busta", "documenti", "busta_documenti"):
+        if max_w <= 0.5 and len(parcels) == 1:
+            return "FEDEX_ENVELOPE"
+        if max_w <= 2.5:
+            return "FEDEX_PAK"
+        return "YOUR_PACKAGING"
+    if pt == "busta_imbottita":
+        return "FEDEX_PAK" if max_w <= 9.0 else "YOUR_PACKAGING"
+    return "YOUR_PACKAGING"
 
 
 def is_fedex_configured() -> bool:
@@ -228,7 +243,7 @@ async def get_fedex_transit_times(
         "shipDatestamp": ship_date,
         "pickupType": "DROPOFF_AT_FEDEX_LOCATION",
         "packagingType": "YOUR_PACKAGING",
-        "requestedPackageLineItems": _build_package_items(parcels, 0.0),
+        "requestedPackageLineItems": _build_package_items(parcels, 0.0, False),
     }
     if s_country != r_country:
         total_w = round(sum(float(p["weight"]) for p in parcels), 2)
@@ -339,20 +354,25 @@ async def upload_fedex_etd_documents(
         return {"uploaded": [], "paperless_ok": False, "fallback_paper": True}
 
 
-def _build_package_items(parcels: List[Dict[str, Any]], insured_value: float = 0.0) -> List[Dict[str, Any]]:
+def _build_package_items(
+    parcels: List[Dict[str, Any]],
+    insured_value: float = 0.0,
+    is_envelope: bool = False,
+) -> List[Dict[str, Any]]:
     items = []
     per_pkg_ins = round(insured_value / max(1, len(parcels)), 2) if insured_value > 0 else 0.0
     for idx, p in enumerate(parcels, start=1):
         entry: Dict[str, Any] = {
             "sequenceNumber": idx,
-            "weight": {"units": "KG", "value": round(float(p["weight"]), 2)},
-            "dimensions": {
+            "weight": {"units": "KG", "value": round(max(0.1, float(p["weight"])), 2)},
+        }
+        if not is_envelope:
+            entry["dimensions"] = {
                 "length": max(1, int(round(float(p["length"])))),
                 "width": max(1, int(round(float(p["width"])))),
                 "height": max(1, int(round(float(p["height"])))),
                 "units": "CM",
-            },
-        }
+            }
         if per_pkg_ins > 0:
             entry["declaredValue"] = {"amount": per_pkg_ins, "currency": "EUR"}
         items.append(entry)
@@ -492,16 +512,18 @@ async def get_fedex_rates(
     s_country = (sender.get("country") or "IT").upper()
     r_country = (recipient.get("country") or "IT").upper()
     is_intl = s_country != r_country
+    pkg_type = resolve_fedex_packaging(parcel_type, parcels)
+    is_env = pkg_type == "FEDEX_ENVELOPE"
 
     requested_shipment: Dict[str, Any] = {
         "shipper": {"address": _addr_obj(sender, False)},
         "recipient": {"address": _addr_obj(recipient, residential_delivery)},
         "shipDateStamp": ship_date,
         "pickupType": "DROPOFF_AT_FEDEX_LOCATION",
-        "packagingType": "FEDEX_ENVELOPE" if parcel_type in ("busta", "documenti") else "YOUR_PACKAGING",
+        "packagingType": pkg_type,
         "rateRequestType": ["ACCOUNT", "LIST"],
         "preferredCurrency": "EUR",
-        "requestedPackageLineItems": _build_package_items(parcels, insured_value),
+        "requestedPackageLineItems": _build_package_items(parcels, insured_value, is_env),
     }
 
     special_types = []
@@ -523,7 +545,7 @@ async def get_fedex_rates(
         val = round(max(1.0, float(customs_value or insured_value or 50.0)), 2)
         curr = (customs_currency or "EUR").upper()
         comm: Dict[str, Any] = {
-            "description": (goods_description or "Commercial Goods")[:400],
+            "description": (goods_description or "Documents" if parcel_type == "documenti" else "Commercial Goods")[:400],
             "quantity": 1,
             "quantityUnits": "PCS",
             "weight": {"units": "KG", "value": max(0.1, total_w)},
@@ -556,7 +578,6 @@ async def get_fedex_rates(
             )
             if resp.status_code == 200:
                 break
-            # Retry silenzioso in caso di errore transitorio Sandbox (500 / SYSTEM.UNEXPECTED.ERROR)
             if resp.status_code >= 500 and attempt == 0:
                 await asyncio.sleep(1.0)
                 continue
@@ -592,7 +613,7 @@ async def get_fedex_rates(
             if commit_time and len(commit_time) >= 5:
                 commit_hint = f"Consegna entro le {commit_time[:5]}"
             else:
-                commit_hint = SERVICE_COMMIT_HINTS.get(svc_type, "")
+                commit_hint = SERVICE_COMMIT_HINTS.get(svc_type, "Consegna programmata")
 
             results.append({
                 "service_type": svc_type,
@@ -641,6 +662,8 @@ async def create_fedex_shipment(
     s_country = (sender.get("country") or "IT").upper()
     r_country = (recipient.get("country") or "IT").upper()
     total_w = round(sum(float(p["weight"]) for p in parcels), 2)
+    pkg_type = resolve_fedex_packaging(parcel_type, parcels)
+    is_env = pkg_type == "FEDEX_ENVELOPE"
 
     shipper_addr = {
         "streetLines": _split_street(sender.get("address", "")),
@@ -655,7 +678,7 @@ async def create_fedex_shipment(
         "shipDatestamp": ship_date,
         "pickupType": "DROPOFF_AT_FEDEX_LOCATION",
         "serviceType": service_type,
-        "packagingType": "FEDEX_ENVELOPE" if parcel_type in ("busta", "documenti") else "YOUR_PACKAGING",
+        "packagingType": pkg_type,
         "totalWeight": max(0.1, total_w),
         "shipper": {
             "address": shipper_addr,
@@ -686,7 +709,7 @@ async def create_fedex_shipment(
             "imageType": "PDF",
             "labelStockType": "PAPER_4X6",
         },
-        "requestedPackageLineItems": _build_package_items(parcels, insured_value),
+        "requestedPackageLineItems": _build_package_items(parcels, insured_value, is_env),
     }
 
     special_types = []
