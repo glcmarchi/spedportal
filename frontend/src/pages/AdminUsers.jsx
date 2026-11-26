@@ -32,7 +32,7 @@ const emptyClientForm = {
   city: "",
   province: "",
   country: "IT",
-  billing_type: "postpaid",
+  billing_type: "instant",
   rate_table_id: "",
   allowed_carriers: ALL_CARRIERS.map((c) => c.id),
 };
@@ -40,27 +40,27 @@ const emptyClientForm = {
 export default function AdminUsers() {
   const { user } = useAuth();
   const features = user?.features || {};
+  const canGrantPrepaid =
+    user?.role === "super_admin" ||
+    (user?.reseller_billing_type === "postpaid" && features.client_prepaid !== false);
+
   const [users, setUsers] = useState([]);
   const [rates, setRates] = useState([]);
   const [availableCarriers, setAvailableCarriers] = useState(ALL_CARRIERS);
 
-  // Profilo notifiche reseller
   const [notifEmail, setNotifEmail] = useState("");
   const [savingProfile, setSavingProfile] = useState(false);
 
-  // Dialog crea / modifica sub-cliente
   const [openModal, setOpenModal] = useState(false);
   const [editingUser, setEditingUser] = useState(null);
   const [form, setForm] = useState(emptyClientForm);
   const [cityOptions, setCityOptions] = useState([]);
 
-  // Dialog ricarica saldo sub-cliente
   const [topupTarget, setTopupTarget] = useState(null);
   const [topupAmount, setTopupAmount] = useState("");
   const [topupNote, setTopupNote] = useState("");
   const [topupLoading, setTopupLoading] = useState(false);
 
-  // Storico transazioni sub-clienti
   const [ledger, setLedger] = useState([]);
   const [ledgerFilterUser, setLedgerFilterUser] = useState("all");
 
@@ -146,6 +146,7 @@ export default function AdminUsers() {
     setCityOptions([]);
     setForm({
       ...emptyClientForm,
+      billing_type: "instant",
       rate_table_id: defaultRateId,
       allowed_carriers: availableCarriers.map((c) => c.id),
     });
@@ -165,7 +166,7 @@ export default function AdminUsers() {
       city: u.city || "",
       province: u.province || "",
       country: u.country || "IT",
-      billing_type: u.billing_type || "postpaid",
+      billing_type: u.billing_type || "instant",
       rate_table_id: u.rate_table_id || defaultRateId,
       allowed_carriers: u.allowed_carriers || availableCarriers.map((c) => c.id),
     });
@@ -285,6 +286,12 @@ export default function AdminUsers() {
         </Button>
       </div>
 
+      {!canGrantPrepaid && user?.role === "reseller_admin" && (
+        <div className="bg-amber-50 border border-amber-200 rounded-sm p-3.5 text-xs text-amber-900">
+          <b>Nota sulle modalità di pagamento:</b> la modalità <b>Prepagato (Wallet)</b> per i sub-clienti è attivabile solo quando la tua agenzia ha fatturazione a <b>Fine Mese</b> verso la piattaforma. Con la tua attuale configurazione puoi assegnare ai sub-clienti <b>Pagamento Istantaneo (Pay-per-Shipment)</b> oppure <b>Fine Mese</b>.
+        </div>
+      )}
+
       <div className="grid grid-cols-1 lg:grid-cols-2 gap-4">
         <div className="bg-slate-900 text-white rounded-sm p-4 flex flex-col sm:flex-row sm:items-center justify-between gap-3">
           <div className="text-xs">
@@ -354,11 +361,12 @@ export default function AdminUsers() {
                       </span>
                     </td>
                     <td className="px-4 py-3">
-                      <Select value={u.billing_type} onValueChange={(v) => quickUpdate(u.id, { billing_type: v })}>
-                        <SelectTrigger className="h-8 rounded-sm text-xs w-32"><SelectValue /></SelectTrigger>
+                      <Select value={u.billing_type || "instant"} onValueChange={(v) => quickUpdate(u.id, { billing_type: v })}>
+                        <SelectTrigger className="h-8 rounded-sm text-xs w-44"><SelectValue /></SelectTrigger>
                         <SelectContent>
+                          <SelectItem value="instant">Pagamento Istantaneo</SelectItem>
                           <SelectItem value="postpaid">Fine mese</SelectItem>
-                          {features.client_prepaid !== false && <SelectItem value="prepaid">Prepagato</SelectItem>}
+                          {canGrantPrepaid && <SelectItem value="prepaid">Prepagato (Wallet)</SelectItem>}
                         </SelectContent>
                       </Select>
                     </td>
@@ -373,14 +381,14 @@ export default function AdminUsers() {
                       </Select>
                     </td>
                     <td className="px-4 py-3 text-right font-mono font-bold">
-                      € {(u.credit_balance || 0).toFixed(2)}
+                      {u.billing_type === "prepaid" ? `€ ${(u.credit_balance || 0).toFixed(2)}` : "—"}
                     </td>
                     <td className="px-4 py-3">
                       <div className="flex items-center gap-1 flex-wrap">
                         <Button size="sm" variant="outline" onClick={() => openEditModal(u)} className="rounded-sm h-8" title="Modifica Anagrafica, Sede e Corrieri">
                           <PencilSimple size={14} />
                         </Button>
-                        {u.billing_type === "prepaid" && (
+                        {u.billing_type === "prepaid" && canGrantPrepaid && (
                           <Button
                             size="sm"
                             onClick={() => { setTopupTarget(u); setTopupAmount(""); setTopupNote(""); }}
@@ -564,8 +572,9 @@ export default function AdminUsers() {
                 <Select value={form.billing_type} onValueChange={(v) => setForm({ ...form, billing_type: v })}>
                   <SelectTrigger className="mt-1 rounded-sm h-10"><SelectValue /></SelectTrigger>
                   <SelectContent>
+                    <SelectItem value="instant">Pagamento Istantaneo (Pay-per-Shipment)</SelectItem>
                     <SelectItem value="postpaid">Fine mese</SelectItem>
-                    {features.client_prepaid !== false && <SelectItem value="prepaid">Prepagato</SelectItem>}
+                    {canGrantPrepaid && <SelectItem value="prepaid">Prepagato (Wallet)</SelectItem>}
                   </SelectContent>
                 </Select>
               </div>
