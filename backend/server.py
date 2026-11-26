@@ -248,7 +248,7 @@ class CustomsDocs(BaseModel):
 class QuoteRequest(BaseModel):
     sender: Address
     recipient: Address
-    shipment_category: str = "goods"  # "documents" | "goods"
+    shipment_category: str = "goods"
     parcel_type: str = "pacco"
     parcels: List[Parcel]
     goods_description: str = ""
@@ -392,7 +392,6 @@ async def me(user=Depends(get_current_user)):
         res = await db.resellers.find_one({"id": rid}, {"_id": 0})
         res_billing = (res or {}).get("billing_type", "prepaid")
         feats = dict((res or {}).get("features", {}))
-        # Il prepagato sub-clienti è consentito solo se il Reseller paga a Fine Mese
         if res_billing != "postpaid":
             feats["client_prepaid"] = False
         user["features"] = feats
@@ -767,7 +766,7 @@ async def _resolve_tenant_carrier_options(user: dict, zone_macro: str = "NAZ") -
                     "owner": "admin",
                     "code": m.get("primary_code", ""),
                     "admin_markup_percent": 0.0,
-                    "per_shipment_fee": 0.0,
+                    "platform_fee": 0.0,
                 }
         return out
 
@@ -777,6 +776,8 @@ async def _resolve_tenant_carrier_options(user: dict, zone_macro: str = "NAZ") -
     policies = res.get("carrier_policies") or {}
     custom_markups = res.get("admin_carrier_markups") or {}
     own_creds = res.get("carrier_credentials") or {}
+    fee_admin = round(float(res.get("fee_on_admin_codes") or 0.0), 2)
+    fee_own = round(float(res.get("per_shipment_fee") or 0.0), 2)
     out = {}
 
     for c in MOCK_CARRIERS:
@@ -802,7 +803,7 @@ async def _resolve_tenant_carrier_options(user: dict, zone_macro: str = "NAZ") -
                     "owner": "admin",
                     "code": m.get("primary_code", ""),
                     "admin_markup_percent": round(admin_mk, 2),
-                    "per_shipment_fee": 0.0,
+                    "platform_fee": fee_admin,
                 }
         elif pol == "reseller_only":
             o = own_creds.get(cid) or {}
@@ -811,7 +812,7 @@ async def _resolve_tenant_carrier_options(user: dict, zone_macro: str = "NAZ") -
                     "owner": "reseller",
                     "code": o.get("primary_code", ""),
                     "admin_markup_percent": 0.0,
-                    "per_shipment_fee": float(res.get("per_shipment_fee") or 0.0),
+                    "platform_fee": fee_own,
                 }
     return out
 
@@ -843,8 +844,13 @@ def _build_quote_option(
     opt: dict,
     reseller_mk_pct: float,
 ) -> dict:
+    """Calcolo Opzione B:
+    - Il ricarico % Reseller si applica solo al trasporto (nolo + supplementi),
+      mentre la Commissione Piattaforma (platform_fee) viene aggiunta netta senza ulteriore ricarico.
+    """
     admin_mk_pct = opt["admin_markup_percent"] if opt["owner"] == "admin" else 0.0
     mult_admin = 1 + admin_mk_pct / 100.0
+    platform_fee = round(float(opt.get("platform_fee") or 0.0), 2)
 
     reseller_base_freight = round(raw_freight * mult_admin, 2)
     reseller_surcharge_items = [
@@ -852,8 +858,13 @@ def _build_quote_option(
         for item in raw_surcharge_items
     ]
     reseller_surcharges_total = round(sum(x["amount"] for x in reseller_surcharge_items), 2)
-    reseller_cost = round(reseller_base_freight + reseller_surcharges_total, 2)
-    client_price = round(reseller_cost * (1 + reseller_mk_pct / 100.0), 2)
+    reseller_transport_cost = round(reseller_base_freight + reseller_surcharges_total, 2)
+
+    # Costo totale sostenuto dal Reseller (trasporto + Commissione Piattaforma)
+    reseller_cost = round(reseller_transport_cost + platform_fee, 2)
+
+    # Opzione B: ricarico % Reseller solo sul trasporto + Commissione Piattaforma netta
+    client_price = round(reseller_transport_cost * (1 + reseller_mk_pct / 100.0) + platform_fee, 2)
 
     return {
         "option_key": f"{cid}:{service_type}",
@@ -867,6 +878,8 @@ def _build_quote_option(
         "reseller_base_freight": reseller_base_freight,
         "reseller_surcharges_total": reseller_surcharges_total,
         "reseller_surcharge_items": reseller_surcharge_items,
+        "reseller_transport_cost": reseller_transport_cost,
+        "platform_fee": platform_fee,
         "reseller_cost": reseller_cost,
         "reseller_markup_percent": reseller_mk_pct,
         "cost": reseller_cost,
@@ -1075,9 +1088,9 @@ async def _dispatch_shipment_to_carrier_and_bill(shipment: dict, user_doc: dict)
     cid = shipment["carrier_id"]
     code_used = shipment.get("carrier_code_used", "")
     source = shipment.get("contract_owner", "admin")
-    applied_fee = float(shipment.get("applied_fee") or 0.0)
-    reseller_cost = float(shipment.get("reseller_cost") or 0.0)
-    price = float(shipment.get("price") or 0.0)
+    applied_fee = round(float(shipment.get("applied_fee") or 0.0), 2)
+    reseller_transport = round(float(shipment.get("reseller_transport_cost") or shipment.get("reseller_cost") or 0.0), 2)
+    price = round(float(shipment.get("price") or 0.0), 2)
     rid = shipment.get("reseller_id")
     creator_role = shipment.get("created_by_role", user_doc.get("role", "user"))
     creator_name = shipment.get("user_company_name", user_doc.get("company_name", ""))
@@ -1150,7 +1163,6 @@ async def _dispatch_shipment_to_carrier_and_bill(shipment: dict, user_doc: dict)
     )
     shipment.update(updates)
 
-    # Addebito sub-cliente prepagato
     if creator_role == "user" and user_doc.get("billing_type") == "prepaid":
         await db.users.update_one({"id": user_doc["id"]}, {"$inc": {"credit_balance": -price}})
         await db.ledger.insert_one({
@@ -1160,11 +1172,12 @@ async def _dispatch_shipment_to_carrier_and_bill(shipment: dict, user_doc: dict)
             "shipment_id": shipment["id"], "created_at": now_iso(),
         })
 
-    # Addebito wallet reseller se il reseller è prepagato (es. su spedizioni proprie o sub-clienti non prepagati)
+    # Addebito Wallet Reseller (trasporto + Commissione Piattaforma se codici Admin; solo Commissione Piattaforma se codici propri)
     reseller_doc = await db.resellers.find_one({"id": rid}) if rid else None
-    admin_charge_to_reseller = reseller_cost if source == "admin" else applied_fee
+    admin_charge_to_reseller = round(reseller_transport + applied_fee, 2) if source == "admin" else applied_fee
     if reseller_doc and reseller_doc.get("billing_type") == "prepaid" and admin_charge_to_reseller > 0:
         origin_tag = f"Sub-cliente {creator_name}" if creator_role == "user" else "Spedizione Reseller"
+        fee_note = f" · incl. Comm. Piattaforma €{applied_fee:.2f}" if applied_fee > 0 else ""
         await db.resellers.update_one({"id": rid}, {"$inc": {"credit_balance": -admin_charge_to_reseller}})
         await db.users.update_many({"reseller_id": rid, "role": "reseller_admin"}, {"$inc": {"credit_balance": -admin_charge_to_reseller}})
         await db.reseller_ledger.insert_one({
@@ -1173,7 +1186,7 @@ async def _dispatch_shipment_to_carrier_and_bill(shipment: dict, user_doc: dict)
             "client_company_name": creator_name if creator_role == "user" else "",
             "type": "shipment_charge" if source == "admin" else "label_fee",
             "amount": -admin_charge_to_reseller,
-            "note": f"{origin_tag} · {tracking_num} ({shipment['carrier_name']})",
+            "note": f"{origin_tag} · {tracking_num} ({shipment['carrier_name']}){fee_note}",
             "created_at": now_iso(),
         })
 
@@ -1208,18 +1221,18 @@ async def create_shipment(inp: CreateShipmentInput, user=Depends(require_approve
 
     source = opt["owner"]
     code_used = opt["code"]
-    applied_fee = 0.0 if source == "admin" else opt.get("per_shipment_fee", 0.0)
+    applied_fee = round(float(chosen.get("platform_fee") or 0.0), 2)
 
     carrier_cost = chosen["carrier_cost"]
+    reseller_transport_cost = chosen["reseller_transport_cost"]
     reseller_cost = chosen["reseller_cost"]
     price = chosen["price"]
-    admin_charge_to_reseller = reseller_cost if source == "admin" else applied_fee
+    admin_charge_to_reseller = round(reseller_transport_cost + applied_fee, 2) if source == "admin" else applied_fee
 
     rid = user.get("reseller_id")
     reseller_doc = await db.resellers.find_one({"id": rid}) if rid else None
     billing_mode = _effective_user_billing_mode(user, reseller_doc)
 
-    # Verifica saldo se prepagato
     if user.get("role") == "user" and billing_mode == "prepaid":
         bal = float(user.get("credit_balance") or 0.0)
         if bal < price:
@@ -1284,6 +1297,8 @@ async def create_shipment(inp: CreateShipmentInput, user=Depends(require_approve
         "reseller_base_freight": chosen["reseller_base_freight"],
         "reseller_surcharges_total": chosen["reseller_surcharges_total"],
         "reseller_surcharge_items": chosen["reseller_surcharge_items"],
+        "reseller_transport_cost": reseller_transport_cost,
+        "platform_fee": applied_fee,
         "reseller_cost": reseller_cost,
         "reseller_markup_percent": chosen["reseller_markup_percent"],
         "cost": reseller_cost,
@@ -1296,7 +1311,6 @@ async def create_shipment(inp: CreateShipmentInput, user=Depends(require_approve
     }
     await db.shipments.insert_one(shipment)
 
-    # Flusso Pagamento Istantaneo (Pay-per-Shipment)
     if billing_mode == "instant":
         if not stripe.api_key:
             raise HTTPException(400, "Gateway di pagamento istantaneo (Stripe) non configurato su Render")
@@ -1351,7 +1365,6 @@ async def create_shipment(inp: CreateShipmentInput, user=Depends(require_approve
             "shipment": _sanitize_shipment_for_role(shipment, creator_role),
         }
 
-    # Flusso Prepagato / Fine Mese: invio immediato al corriere
     shipment = await _dispatch_shipment_to_carrier_and_bill(shipment, user)
     shipment.pop("_id", None)
     shipment.pop("label_pdf_base64", None)
@@ -1361,7 +1374,8 @@ async def create_shipment(inp: CreateShipmentInput, user=Depends(require_approve
 def _sanitize_shipment_for_role(s: dict, role: str) -> dict:
     if role == "user":
         for secret_k in (
-            "cost", "carrier_cost", "reseller_cost",
+            "cost", "carrier_cost", "reseller_cost", "reseller_transport_cost",
+            "platform_fee", "applied_fee",
             "reseller_base_freight", "reseller_surcharges_total", "reseller_surcharge_items",
             "admin_markup_percent", "reseller_markup_percent",
         ):
@@ -1403,13 +1417,13 @@ async def list_shipments(user=Depends(require_approved)):
     proj = {"_id": 0, "label_pdf_base64": 0, "_pending_etd_docs": 0}
     if user.get("role") == "user":
         proj.update({
-            "cost": 0, "carrier_cost": 0, "reseller_cost": 0,
+            "cost": 0, "carrier_cost": 0, "reseller_cost": 0, "reseller_transport_cost": 0,
+            "platform_fee": 0, "applied_fee": 0,
             "reseller_base_freight": 0, "reseller_surcharges_total": 0, "reseller_surcharge_items": 0,
             "admin_markup_percent": 0, "reseller_markup_percent": 0,
         })
     ships = await db.shipments.find(q, proj).sort("created_at", -1).to_list(1000)
 
-    # Risoluzione dinamica dell'origine (anche per record storici senza created_by_role)
     user_ids = list({s.get("user_id") for s in ships if s.get("user_id")})
     users_info: Dict[str, Dict[str, Any]] = {}
     if user_ids:
@@ -1628,7 +1642,9 @@ async def cancel_shipment(sid: str, user=Depends(require_approved)):
     reseller_doc = await db.resellers.find_one({"id": rid}) if rid else None
     if reseller_doc and reseller_doc.get("billing_type") == "prepaid":
         owner_contract = s.get("contract_owner", "admin" if s.get("on_master_codes", True) else "reseller")
-        res_refund = float(s.get("reseller_cost") or 0.0) if owner_contract == "admin" else float(s.get("applied_fee") or 0.0)
+        res_transport = float(s.get("reseller_transport_cost") or s.get("reseller_cost") or 0.0)
+        fee_paid = float(s.get("applied_fee") or 0.0)
+        res_refund = round(res_transport + fee_paid, 2) if owner_contract == "admin" else fee_paid
         if res_refund > 0:
             await db.resellers.update_one({"id": rid}, {"$inc": {"credit_balance": res_refund}})
             await db.users.update_many({"reseller_id": rid, "role": "reseller_admin"}, {"$inc": {"credit_balance": res_refund}})
@@ -1759,7 +1775,6 @@ async def wallet_balance(user=Depends(require_approved)):
         res = await db.resellers.find_one({"id": user["reseller_id"]}, {"_id": 0})
         ledger = await db.reseller_ledger.find({"reseller_id": user["reseller_id"]}, {"_id": 0}).sort("created_at", -1).limit(100).to_list(100)
 
-        # Arricchisce anche i movimenti storici collegati a spedizioni con l'origine reale (Reseller vs Nome Sub-Cliente)
         ship_ids = list({m.get("shipment_id") for m in ledger if m.get("shipment_id")})
         ship_map: Dict[str, Dict[str, Any]] = {}
         if ship_ids:
@@ -1968,3 +1983,61 @@ async def invoice_pdf(iid: str, user=Depends(require_approved)):
     c.drawString(17 * mm, y, "Data"); c.drawString(38 * mm, y, "Tracking"); c.drawString(72 * mm, y, "Corriere")
     c.drawString(100 * mm, y, "Destinatario"); c.drawRightString(W - 17 * mm, y, "Prezzo €"); y -= 6 * mm
     c.setFont("Helvetica", 8)
+    for s in ships:
+        if y < 40 * mm:
+            c.showPage(); y = H - 20 * mm
+        c.drawString(17 * mm, y, s.get("created_at", "")[:10])
+        c.drawString(38 * mm, y, s.get("tracking_number", ""))
+        c.drawString(72 * mm, y, s.get("carrier_name", "")[:14])
+        c.drawString(100 * mm, y, s.get("recipient", {}).get("company_name", "")[:28])
+        c.drawRightString(W - 17 * mm, y, f"{s.get('price', 0):.2f}"); y -= 5 * mm
+    y -= 4 * mm; c.setFont("Helvetica-Bold", 10)
+    c.drawRightString(W - 40 * mm, y, "Imponibile:"); c.drawRightString(W - 17 * mm, y, f"€ {inv['total']:.2f}"); y -= 5 * mm
+    c.drawRightString(W - 40 * mm, y, "IVA 22%:"); c.drawRightString(W - 17 * mm, y, f"€ {inv['vat']:.2f}"); y -= 5 * mm
+    c.setFont("Helvetica-Bold", 12); c.setFillColor(rl_colors.HexColor("#EA580C"))
+    c.drawRightString(W - 40 * mm, y, "TOTALE:"); c.drawRightString(W - 17 * mm, y, f"€ {inv['grand_total']:.2f}")
+    c.showPage(); c.save(); buf.seek(0)
+    return StreamingResponse(buf, media_type="application/pdf",
+        headers={"Content-Disposition": f"attachment; filename={inv['invoice_number']}.pdf"})
+
+@app.on_event("startup")
+async def bootstrap():
+    admin = await db.users.find_one({"email": "admin@spedportal.it"})
+    if not admin:
+        await db.users.insert_one({
+            "id": new_id(), "email": "admin@spedportal.it", "password": hash_pw("Admin@2026"),
+            "company_name": "SpedPortal Admin", "phone": "", "role": "super_admin",
+            "reseller_id": None, "status": "approved", "billing_type": "postpaid",
+            "rate_table_id": None, "credit_balance": 0.0, "created_at": now_iso(),
+        })
+        logger.info("Super Admin seeded: admin@spedportal.it / Admin@2026")
+    await bootstrap_multitenant()
+    all_resellers = await db.resellers.find({}, {"_id": 0, "id": 1}).to_list(1000)
+    for r in all_resellers:
+        await ensure_reseller_standard_rate_table(r["id"])
+
+@api_router.get("/")
+async def root():
+    return {"service": "SpedPortal API", "status": "ok", "fedex_live": is_fedex_configured()}
+
+app.include_router(api_router)
+from extras import extra_router
+from mail import (
+    mail_router, send_email, tpl_registration, tpl_approved,
+    tpl_new_client_admin_alert, get_reseller_notification_email, FRONTEND_URL,
+)
+from tenancy import super_router, reseller_router, bootstrap_multitenant
+app.include_router(extra_router)
+app.include_router(mail_router)
+app.include_router(super_router)
+app.include_router(reseller_router)
+
+app.add_middleware(
+    CORSMiddleware, allow_credentials=True,
+    allow_origins=os.environ.get('CORS_ORIGINS', '*').split(','),
+    allow_methods=["*"], allow_headers=["*"],
+)
+
+@app.on_event("shutdown")
+async def shutdown_db_client():
+    client.close()
