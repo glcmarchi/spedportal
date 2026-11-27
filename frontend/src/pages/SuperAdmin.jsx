@@ -20,7 +20,7 @@ const FEATURE_KEYS = [
   ["sub_clients", "Gestione Sub-Clienti (B2B2B)"],
   ["rate_tables", "Listini Clienti"],
   ["broadcasts", "Comunicazioni Clienti"],
-  ["client_prepaid", "Prepagato Sub-Clienti (solo se Reseller Fine Mese)"],
+  ["client_prepaid", "Prepagato Sub-Clienti (solo con Fine Mese)"],
   ["client_billing", "Fatturazione Clienti"],
 ];
 
@@ -94,7 +94,6 @@ export default function SuperAdmin() {
   const [open, setOpen] = useState(false);
   const [editing, setEditing] = useState(null);
 
-  // Contabilità Reseller
   const [billing, setBilling] = useState(null);
   const [billingResellerId, setBillingResellerId] = useState(null);
   const [billingFrom, setBillingFrom] = useState("");
@@ -190,13 +189,30 @@ export default function SuperAdmin() {
 
   const handlePlanChange = (newPlan) => {
     const preset = PLAN_PRESETS[newPlan] || PLAN_PRESETS.basic;
-    setForm({ ...form, plan: newPlan, features: { ...preset } });
+    const nextFeatures = { ...preset };
+    if (form.billing_type !== "postpaid") {
+      nextFeatures.client_prepaid = false;
+    }
+    setForm({ ...form, plan: newPlan, features: nextFeatures });
+  };
+
+  const handleBillingTypeChange = (newBilling) => {
+    const nextFeatures = { ...form.features };
+    if (newBilling !== "postpaid") {
+      nextFeatures.client_prepaid = false;
+    }
+    setForm({ ...form, billing_type: newBilling, features: nextFeatures });
   };
 
   const saveReseller = async () => {
     try {
+      const cleanFeatures = { ...form.features };
+      if (form.billing_type !== "postpaid") {
+        cleanFeatures.client_prepaid = false;
+      }
       const payload = {
         ...form,
+        features: cleanFeatures,
         fee_on_admin_codes: parseFloat(form.fee_on_admin_codes) || 0,
         per_shipment_fee: parseFloat(form.per_shipment_fee) || 0,
       };
@@ -269,14 +285,20 @@ export default function SuperAdmin() {
       const val = r.admin_carrier_markups?.[cid];
       cleanedMarkups[cid] = val !== undefined && val !== null ? normalizeRule(val, 5) : null;
     });
+    const bType = r.billing_type || "prepaid";
+    const mergedFeatures = { ...empty.features, ...(r.features || {}) };
+    if (bType !== "postpaid") {
+      mergedFeatures.client_prepaid = false;
+    }
     setForm({
       ...empty,
       ...r,
+      billing_type: bType,
       fee_on_admin_codes: r.fee_on_admin_codes ?? 0,
       per_shipment_fee: r.per_shipment_fee ?? 0,
       notification_email: r.notification_email || r.admin_email || "",
       allow_ddp: !!r.allow_ddp,
-      features: { ...empty.features, ...(r.features || {}) },
+      features: mergedFeatures,
       enabled_surcharges: { ...empty.enabled_surcharges, ...(r.enabled_surcharges || {}) },
       carrier_policies: { ...empty.carrier_policies, ...(r.carrier_policies || {}) },
       admin_carrier_markups: cleanedMarkups,
@@ -365,6 +387,8 @@ export default function SuperAdmin() {
       label: "Fatturazione Fine Mese",
     };
   };
+
+  const canEnableClientPrepaid = form.billing_type === "postpaid";
 
   return (
     <div className="min-h-screen bg-slate-50 p-6 lg:p-10 max-w-6xl mx-auto">
@@ -682,7 +706,7 @@ export default function SuperAdmin() {
               </div>
               <div>
                 <Label className="label-caps">Pagamento verso Piattaforma</Label>
-                <Select value={form.billing_type} onValueChange={(v) => setForm({ ...form, billing_type: v })}>
+                <Select value={form.billing_type} onValueChange={handleBillingTypeChange}>
                   <SelectTrigger className="mt-1 rounded-sm h-10"><SelectValue /></SelectTrigger>
                   <SelectContent>
                     <SelectItem value="prepaid">Prepagato (Wallet Reseller)</SelectItem>
@@ -862,11 +886,33 @@ export default function SuperAdmin() {
               <div>
                 <div className="label-caps mb-2 text-slate-900">Moduli Piattaforma Inclusi</div>
                 <div className="space-y-2">
-                  {FEATURE_KEYS.map(([k, l]) => (
-                    <label key={k} className="flex items-center gap-2 cursor-pointer text-sm">
-                      <Checkbox checked={!!form.features[k]} onCheckedChange={(v) => setForm({ ...form, features: { ...form.features, [k]: !!v } })} />{l}
-                    </label>
-                  ))}
+                  {FEATURE_KEYS.map(([k, l]) => {
+                    const isLockedClientPrepaid = k === "client_prepaid" && !canEnableClientPrepaid;
+                    return (
+                      <div key={k}>
+                        <label
+                          className={`flex items-center gap-2 text-sm ${
+                            isLockedClientPrepaid ? "opacity-50 cursor-not-allowed" : "cursor-pointer"
+                          }`}
+                        >
+                          <Checkbox
+                            checked={!isLockedClientPrepaid && !!form.features[k]}
+                            disabled={isLockedClientPrepaid}
+                            onCheckedChange={(v) => {
+                              if (isLockedClientPrepaid) return;
+                              setForm({ ...form, features: { ...form.features, [k]: !!v } });
+                            }}
+                          />
+                          <span>{l}</span>
+                        </label>
+                        {isLockedClientPrepaid && (
+                          <div className="text-[11px] text-amber-700 pl-6">
+                            Disponibile solo se il Reseller paga a Fine Mese.
+                          </div>
+                        )}
+                      </div>
+                    );
+                  })}
                 </div>
               </div>
               <div>
@@ -912,7 +958,6 @@ export default function SuperAdmin() {
                 </div>
               </DialogHeader>
 
-              {/* Filtro periodo */}
               <div className="bg-slate-50 border border-slate-200 rounded-sm p-3 flex flex-wrap items-end gap-3 text-xs">
                 <div>
                   <Label className="label-caps text-[10px]">Dal</Label>
@@ -932,152 +977,4 @@ export default function SuperAdmin() {
                 )}
               </div>
 
-              {/* KPI Sintesi */}
-              <div className="grid grid-cols-2 sm:grid-cols-4 gap-3 text-xs">
-                <div className="border border-slate-200 rounded-sm p-3 bg-white">
-                  <div className="label-caps text-slate-500">Modalità</div>
-                  <div className="font-bold uppercase text-sm mt-1">{billing.reseller.billing_type || "prepaid"}</div>
-                  {(billing.reseller.billing_type || "prepaid") === "prepaid" && (
-                    <div className="text-green-700 font-semibold mt-0.5">Wallet: € {Number(billing.reseller.credit_balance || 0).toFixed(2)}</div>
-                  )}
-                </div>
-                <div className="border border-slate-200 rounded-sm p-3 bg-white">
-                  <div className="label-caps text-slate-500">Trasporto Codici Admin</div>
-                  <div className="font-black font-mono text-lg mt-1">€ {Number(billing.amount_due_standard || 0).toFixed(2)}</div>
-                  <div className="text-green-700">Margine Admin: +€ {Number(billing.admin_margin_earned || 0).toFixed(2)}</div>
-                </div>
-                <div className="border border-slate-200 rounded-sm p-3 bg-white">
-                  <div className="label-caps text-slate-500">Commissioni Piattaforma</div>
-                  <div className="font-black font-mono text-lg mt-1">€ {Number(billing.fees_due_total || 0).toFixed(2)}</div>
-                  <div className="text-slate-500">
-                    Admin €{Number(billing.fees_due_master || 0).toFixed(2)} · Propri €{Number(billing.amount_due_premium || 0).toFixed(2)}
-                  </div>
-                </div>
-                <div className="border-2 border-slate-900 rounded-sm p-3 bg-slate-900 text-white">
-                  <div className="label-caps text-orange-400">Totale Imponibile</div>
-                  <div className="font-black font-mono text-xl mt-1">€ {Number(billing.amount_due_total || 0).toFixed(2)}</div>
-                  <div className="text-slate-400">{billing.shipments_total} spedizioni nel periodo</div>
-                </div>
-              </div>
-
-              {/* Riepilogo raggruppato: Reseller Diretto vs Singoli Sub-Clienti */}
-              {billing.breakdown_by_origin?.length > 0 && (
-                <div className="mt-3">
-                  <div className="label-caps text-orange-600 mb-2">Riepilogo per Origine (Spedizioni Dirette vs Sub-Clienti)</div>
-                  <div className="border rounded-sm overflow-hidden text-xs">
-                    <table className="w-full text-left">
-                      <thead className="bg-slate-100">
-                        <tr>
-                          <th className="p-2.5">Origine / Sub-Cliente</th>
-                          <th className="p-2.5 text-center">Spedizioni</th>
-                          <th className="p-2.5 text-right">Trasporto (€)</th>
-                          <th className="p-2.5 text-right">Comm. Piattaforma (€)</th>
-                          <th className="p-2.5 text-right">Totale Imponibile (€)</th>
-                        </tr>
-                      </thead>
-                      <tbody>
-                        {billing.breakdown_by_origin.map((row) => (
-                          <tr key={row.group_key} className="border-t">
-                            <td className="p-2.5 font-semibold">
-                              {row.company_name}
-                              {!row.is_reseller_direct && (
-                                <span className="ml-2 text-[10px] uppercase px-1.5 py-0.5 rounded-sm bg-slate-100 text-slate-600">
-                                  {row.client_billing_type}
-                                </span>
-                              )}
-                            </td>
-                            <td className="p-2.5 text-center font-mono">{row.shipments_count}</td>
-                            <td className="p-2.5 text-right font-mono">€ {row.transport_due.toFixed(2)}</td>
-                            <td className="p-2.5 text-right font-mono text-slate-600">€ {row.fees_due.toFixed(2)}</td>
-                            <td className="p-2.5 text-right font-mono font-bold text-slate-900">€ {row.total_due.toFixed(2)}</td>
-                          </tr>
-                        ))}
-                      </tbody>
-                    </table>
-                  </div>
-                </div>
-              )}
-
-              {/* Dettaglio spedizioni */}
-              {billing.recent_shipments?.length > 0 && (
-                <div className="mt-4">
-                  <div className="label-caps mb-2">Dettaglio spedizioni nel periodo</div>
-                  <div className="border rounded-sm overflow-hidden text-xs">
-                    <table className="w-full text-left">
-                      <thead className="bg-slate-100">
-                        <tr>
-                          <th className="p-2">Data</th>
-                          <th className="p-2">Tracking</th>
-                          <th className="p-2">Origine</th>
-                          <th className="p-2">Corriere</th>
-                          <th className="p-2">Contratto</th>
-                          <th className="p-2 text-right">Trasporto</th>
-                          <th className="p-2 text-right">Comm. Piatt.</th>
-                          <th className="p-2 text-right">Totale Reseller</th>
-                        </tr>
-                      </thead>
-                      <tbody>
-                        {billing.recent_shipments.map(s => {
-                          const isAdm = (s.contract_owner || (s.on_master_codes ? "admin" : "reseller")) === "admin";
-                          return (
-                            <tr key={s.id} className="border-t">
-                              <td className="p-2 font-mono text-slate-500">{(s.created_at || "").slice(0, 10)}</td>
-                              <td className="p-2 font-mono">{s.tracking_number}</td>
-                              <td className="p-2 font-semibold">{s.user_company_name || "Reseller"}</td>
-                              <td className="p-2">{s.carrier_name}</td>
-                              <td className="p-2">
-                                <span className={`px-1.5 py-0.5 rounded-sm font-bold ${isAdm ? "bg-orange-100 text-orange-800" : "bg-blue-100 text-blue-800"}`}>
-                                  {isAdm ? `Admin (+${s.admin_markup_percent ?? 0}%)` : "Reseller"}
-                                </span>
-                              </td>
-                              <td className="p-2 text-right font-mono">€ {Number(s._calc_transport_due || 0).toFixed(2)}</td>
-                              <td className="p-2 text-right font-mono text-slate-600">€ {Number(s._calc_fee_due || 0).toFixed(2)}</td>
-                              <td className="p-2 text-right font-mono font-bold">€ {Number(s._calc_admin_due || 0).toFixed(2)}</td>
-                            </tr>
-                          );
-                        })}
-                      </tbody>
-                    </table>
-                  </div>
-                </div>
-              )}
-
-              {billing.ledger?.length > 0 && (
-                <div className="mt-4">
-                  <div className="label-caps mb-2">Cronostoria Movimenti Wallet (Ricariche & Addebiti)</div>
-                  <div className="border rounded-sm overflow-hidden text-xs">
-                    <table className="w-full text-left">
-                      <thead className="bg-slate-100">
-                        <tr>
-                          <th className="p-2">Data</th>
-                          <th className="p-2">Tipo</th>
-                          <th className="p-2">Causale</th>
-                          <th className="p-2 text-right">Importo</th>
-                        </tr>
-                      </thead>
-                      <tbody>
-                        {billing.ledger.map((m, i) => {
-                          const amt = Number(m.amount || 0);
-                          return (
-                            <tr key={m.id || i} className="border-t">
-                              <td className="p-2 font-mono">{(m.created_at || "").replace("T", " ").slice(0, 16)}</td>
-                              <td className="p-2 font-semibold">{m.type}</td>
-                              <td className="p-2 text-slate-600">{m.note || "-"}</td>
-                              <td className={`p-2 text-right font-mono font-bold ${amt >= 0 ? "text-green-700" : "text-red-600"}`}>
-                                {amt >= 0 ? `+ € ${amt.toFixed(2)}` : `- € ${Math.abs(amt).toFixed(2)}`}
-                              </td>
-                            </tr>
-                          );
-                        })}
-                      </tbody>
-                    </table>
-                  </div>
-                </div>
-              )}
-            </>
-          )}
-        </DialogContent>
-      </Dialog>
-    </div>
-  );
-}
+              <div className="grid grid-cols-2 sm:grid-cols-
