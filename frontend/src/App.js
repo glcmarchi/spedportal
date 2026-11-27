@@ -81,6 +81,7 @@ export default function App() {
           <Route path="/admin/rates" element={<Protected><AdminRoute><AdminRates /></AdminRoute></Protected>} />
           <Route path="/admin/carriers" element={<Protected><AdminRoute><ResellerCarriers /></AdminRoute></Protected>} />
           <Route path="/admin/broadcasts" element={<Protected><AdminRoute><AdminBroadcast /></AdminRoute></Protected>} />
+          <Route path="/super-admin" element={<Protected><SuperRoute><SuperAdmin /></SuperRoute></Protected>} />
           <Route path="/super" element={<Protected><SuperRoute><SuperAdmin /></SuperRoute></Protected>} />
           <Route path="*" element={<Navigate to="/" replace />} />
         </Routes>
