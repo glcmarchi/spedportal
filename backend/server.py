@@ -2027,10 +2027,13 @@ from mail import (
     tpl_new_client_admin_alert, get_reseller_notification_email, FRONTEND_URL,
 )
 from tenancy import super_router, reseller_router, bootstrap_multitenant
+from health import health_router
+
 app.include_router(extra_router)
 app.include_router(mail_router)
 app.include_router(super_router)
 app.include_router(reseller_router)
+app.include_router(health_router)
 
 app.add_middleware(
     CORSMiddleware, allow_credentials=True,
