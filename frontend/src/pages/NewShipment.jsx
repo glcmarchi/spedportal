@@ -1,5 +1,5 @@
 import React, { useState, useEffect, useMemo } from "react";
-import { useNavigate } from "react-router-dom";
+import { useNavigate, useLocation } from "react-router-dom";
 import { api } from "@/lib/api";
 import { useAuth } from "@/lib/auth";
 import { Button } from "@/components/ui/button";
@@ -155,6 +155,9 @@ function fileToBase64(file) {
 
 export default function NewShipment() {
   const nav = useNavigate();
+  const location = useLocation();
+  const quickState = location.state?.fromQuickQuote ? location.state : null;
+
   const { user, refresh } = useAuth();
   const features = user?.features || {};
   const enabledSurcharges = user?.enabled_surcharges || {
@@ -164,15 +167,16 @@ export default function NewShipment() {
   const isResellerOrAdmin = ["reseller_admin", "super_admin", "admin"].includes(user?.role);
   const isInstantBilling = (user?.billing_type || "instant") === "instant" && user?.role !== "super_admin";
 
-  const [step, setStep] = useState(0);
-  const [sender, setSender] = useState({ ...emptyAddr });
-  const [recipient, setRecipient] = useState({ ...emptyAddr });
+  const [step, setStep] = useState(quickState ? 1 : 0);
+  const [sender, setSender] = useState(quickState?.sender ? { ...emptyAddr, ...quickState.sender } : { ...emptyAddr });
+  const [senderAutoLoaded, setSenderAutoLoaded] = useState(!!quickState?.sender);
+  const [recipient, setRecipient] = useState(quickState?.recipient ? { ...emptyAddr, ...quickState.recipient } : { ...emptyAddr });
 
-  const [shipmentCategory, setShipmentCategory] = useState("goods");
+  const [shipmentCategory, setShipmentCategory] = useState(quickState?.shipment_category || "goods");
   const [docSubType, setDocSubType] = useState(DOCUMENT_TYPES[0]);
-  const [parcelType, setParcelType] = useState("pacco");
-  const [parcels, setParcels] = useState([{ ...emptyParcel }]);
-  const [goods, setGoods] = useState("");
+  const [parcelType, setParcelType] = useState(quickState?.parcel_type || "pacco");
+  const [parcels, setParcels] = useState(quickState?.parcels?.length ? quickState.parcels : [{ ...emptyParcel }]);
+  const [goods, setGoods] = useState(quickState?.shipment_category === "documents" ? DOCUMENT_TYPES[0] : "");
 
   const [helperOpen, setHelperOpen] = useState(false);
   const [prohibitedOpen, setProhibitedOpen] = useState(false);
@@ -193,15 +197,17 @@ export default function NewShipment() {
     customs_value: "",
     customs_currency: "EUR",
   });
-  const [services, setServices] = useState({
-    insurance: false, insurance_value: 0,
-    neutral_delivery: false,
-    cod: false, cod_amount: 0,
-    saturday_delivery: false,
-    residential_delivery: false,
-  });
+  const [services, setServices] = useState(
+    quickState?.services || {
+      insurance: false, insurance_value: 0,
+      neutral_delivery: false,
+      cod: false, cod_amount: 0,
+      saturday_delivery: false,
+      residential_delivery: false,
+    }
+  );
   const [quotes, setQuotes] = useState(null);
-  const [chosen, setChosen] = useState(null);
+  const [chosen, setChosen] = useState(quickState?.preselectedQuote || null);
   const [addrCheck, setAddrCheck] = useState(null);
   const [checkingAddr, setCheckingAddr] = useState(false);
   const [loading, setLoading] = useState(false);
@@ -217,6 +223,26 @@ export default function NewShipment() {
     setCustoms(c => ({ ...c, required: isExtraEu, incoterms: allowDdp ? c.incoterms : "DAP" }));
   }, [isExtraEu, allowDdp]);
 
+  // Precompilazione automatica Mittente predefinito con l'indirizzo sede dell'utente
+  useEffect(() => {
+    if (senderAutoLoaded) return;
+    const ra = user?.reseller_address;
+    if (ra && (ra.company_name || ra.address || ra.postal_code || ra.city)) {
+      setSender({
+        ...emptyAddr,
+        company_name: ra.company_name || user?.company_name || "",
+        address: ra.address || "",
+        postal_code: ra.postal_code || "",
+        city: ra.city || "",
+        province: ra.province || "",
+        country: ra.country || "IT",
+        phone: ra.phone || user?.phone || "",
+        email: ra.email || user?.email || "",
+      });
+      setSenderAutoLoaded(true);
+    }
+  }, [user, senderAutoLoaded]);
+
   const reloadBook = () => {
     if (features.address_book !== false) {
       api.get("/addressbook").then(r => setAddressbook(r.data)).catch(() => {});
@@ -227,10 +253,12 @@ export default function NewShipment() {
     api.get("/parcels").then(r => {
       const list = r.data || [];
       setSavedParcels(list);
-      const def = list.find(p => p.is_default);
-      if (def) {
-        setParcelType("pacco");
-        setParcels([{ length: def.length, width: def.width, height: def.height, weight: def.weight }]);
+      if (!quickState?.parcels?.length) {
+        const def = list.find(p => p.is_default);
+        if (def) {
+          setParcelType("pacco");
+          setParcels([{ length: def.length, width: def.width, height: def.height, weight: def.weight }]);
+        }
       }
     }).catch(() => {});
   };
@@ -378,10 +406,19 @@ export default function NewShipment() {
       toast.error("Inserisci manualmente un valore doganale dichiarato maggiore di 0");
       return;
     }
-    setLoading(true); setChosen(null); setAddrCheck(null);
+    const prevKey = chosen ? getOptKey(chosen) : null;
+    setLoading(true); setAddrCheck(null);
     try {
       const r = await api.post("/shipments/quote", buildBody());
-      setQuotes(r.data); setStep(4);
+      setQuotes(r.data);
+      if (prevKey && r.data?.quotes?.length) {
+        const matched = r.data.quotes.find((item) => getOptKey(item) === prevKey);
+        setChosen(matched || null);
+        if (matched) handleSelectCarrier(matched);
+      } else {
+        setChosen(null);
+      }
+      setStep(4);
     } catch (err) { toast.error(err?.response?.data?.detail || "Errore preventivo"); }
     finally { setLoading(false); }
   };
