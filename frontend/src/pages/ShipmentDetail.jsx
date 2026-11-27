@@ -105,6 +105,7 @@ export default function ShipmentDetail() {
   const hasActivePickup = s.pickup?.status === "scheduled";
   const isClientShip = s.created_by_role === "user";
   const resellerCost = Number(s.reseller_cost ?? s.cost ?? 0);
+  const platformFee = Number(s.platform_fee ?? s.applied_fee ?? 0);
   const clientPrice = Number(s.price ?? 0);
   const marginEarned = Math.round((clientPrice - resellerCost) * 100) / 100;
 
@@ -256,6 +257,7 @@ export default function ShipmentDetail() {
                 {s.reseller_base_freight !== undefined && (
                   <div className="text-[11px] text-slate-500 mt-0.5">
                     Nolo € {Number(s.reseller_base_freight).toFixed(2)} + Suppl. € {Number(s.reseller_surcharges_total || 0).toFixed(2)}
+                    {platformFee > 0 ? ` + Comm. Piattaforma € ${platformFee.toFixed(2)}` : ""}
                   </div>
                 )}
               </div>
@@ -263,7 +265,7 @@ export default function ShipmentDetail() {
                 <div className="label-caps text-slate-500">Prezzo Applicato al Cliente</div>
                 <div className="text-xl font-black font-mono text-slate-900 mt-0.5">€ {clientPrice.toFixed(2)}</div>
                 {s.reseller_markup_percent !== undefined && (
-                  <div className="text-[11px] text-slate-500 mt-0.5">Ricarico: +{Number(s.reseller_markup_percent).toFixed(1)}%</div>
+                  <div className="text-[11px] text-slate-500 mt-0.5">Ricarico trasporto: +{Number(s.reseller_markup_percent).toFixed(1)}%</div>
                 )}
               </div>
               <div className="bg-white border border-green-200 rounded-sm p-3">
@@ -271,32 +273,45 @@ export default function ShipmentDetail() {
                 <div className={`text-xl font-black font-mono mt-0.5 ${marginEarned >= 0 ? "text-green-700" : "text-red-600"}`}>
                   {marginEarned >= 0 ? `+ € ${marginEarned.toFixed(2)}` : `- € ${Math.abs(marginEarned).toFixed(2)}`}
                 </div>
-                <div className="text-[11px] text-slate-500 mt-0.5">IVA esclusa</div>
+                <div className="text-[11px] text-slate-500 mt-0.5">Netto Commissione Piattaforma · IVA escl.</div>
               </div>
             </div>
-            {s.reseller_surcharge_items?.length > 0 && (
+            {(s.reseller_surcharge_items?.length > 0 || platformFee > 0) && (
               <div className="flex flex-wrap gap-x-4 gap-y-1 text-xs text-slate-600 pt-1">
-                {s.reseller_surcharge_items.map((sc, idx) => (
+                {s.reseller_surcharge_items?.map((sc, idx) => (
                   <span key={idx}>• {sc.label}: € {Number(sc.amount).toFixed(2)}</span>
                 ))}
+                {platformFee > 0 && (
+                  <span className="font-semibold text-orange-800">• Commissione Piattaforma: € {platformFee.toFixed(2)}</span>
+                )}
               </div>
             )}
           </div>
         )}
 
-        {/* Dettaglio nolo/supplementi per spedizioni dirette del Reseller */}
-        {isResellerOrAdmin && !isClientShip && s.reseller_base_freight !== undefined && (
+        {/* Dettaglio nolo/supplementi/commissione per spedizioni dirette del Reseller */}
+        {isResellerOrAdmin && !isClientShip && (s.reseller_base_freight !== undefined || platformFee > 0) && (
           <div className="mt-4 bg-slate-50 border border-slate-200 rounded-sm p-3.5 text-xs space-y-1.5">
             <div className="flex flex-wrap gap-x-6 gap-y-1 text-sm">
-              <span>Nolo base: <b className="text-slate-900">€ {Number(s.reseller_base_freight).toFixed(2)}</b></span>
-              <span>Supplementi totali: <b className="text-slate-900">€ {Number(s.reseller_surcharges_total || 0).toFixed(2)}</b></span>
-              <span>Costo / Totale: <b className="text-orange-600">€ {clientPrice.toFixed(2)}</b></span>
+              {s.reseller_base_freight !== undefined && (
+                <span>Nolo base: <b className="text-slate-900">€ {Number(s.reseller_base_freight).toFixed(2)}</b></span>
+              )}
+              {s.reseller_base_freight !== undefined && (
+                <span>Supplementi: <b className="text-slate-900">€ {Number(s.reseller_surcharges_total || 0).toFixed(2)}</b></span>
+              )}
+              {platformFee > 0 && (
+                <span>Commissione Piattaforma: <b className="text-orange-700">€ {platformFee.toFixed(2)}</b></span>
+              )}
+              <span>Totale spedizione: <b className="text-orange-600">€ {clientPrice.toFixed(2)}</b></span>
             </div>
-            {s.reseller_surcharge_items?.length > 0 && (
+            {(s.reseller_surcharge_items?.length > 0 || platformFee > 0) && (
               <div className="flex flex-wrap gap-x-4 gap-y-1 text-slate-500 pt-1 border-t border-slate-200">
-                {s.reseller_surcharge_items.map((sc, idx) => (
+                {s.reseller_surcharge_items?.map((sc, idx) => (
                   <span key={idx}>• {sc.label}: € {Number(sc.amount).toFixed(2)}</span>
                 ))}
+                {platformFee > 0 && (
+                  <span className="font-semibold text-orange-800">• Commissione Piattaforma: € {platformFee.toFixed(2)}</span>
+                )}
               </div>
             )}
           </div>
