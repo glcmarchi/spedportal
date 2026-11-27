@@ -3,7 +3,7 @@ import { BrowserRouter, Routes, Route, Navigate } from "react-router-dom";
 import { AuthProvider, useAuth } from "@/lib/auth";
 import { Toaster } from "@/components/ui/sonner";
 import Layout from "@/components/Layout";
-import Landing from "@/pages/Landing";
+
 import Login from "@/pages/Login";
 import Register from "@/pages/Register";
 import Pending from "@/pages/Pending";
@@ -56,7 +56,7 @@ export default function App() {
     <AuthProvider>
       <BrowserRouter>
         <Routes>
-          <Route path="/" element={<Landing />} />
+          <Route path="/" element={<Navigate to="/login" replace />} />
           <Route path="/login" element={<Login />} />
           <Route path="/register" element={<Register />} />
           <Route path="/pending" element={<Protected><Pending /></Protected>} />
