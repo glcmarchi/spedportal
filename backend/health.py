@@ -119,7 +119,7 @@ async def deep_diagnostic_check():
     t0 = time.time()
     try:
         async with httpx.AsyncClient(timeout=3.0) as client:
-            resp = await client.get("[suspicious link removed]")
+            resp = await client.get("https://api.zippopotam.us/IT/20121")
             results["geo_service"] = {
                 "status": "operational" if resp.status_code == 200 else "degraded",
                 "latency_ms": round((time.time() - t0) * 1000, 2),
