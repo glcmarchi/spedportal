@@ -895,11 +895,7 @@ export default function NewShipment() {
                   Tipologia: <b>{isDocs ? "Documenti" : "Merce"}</b> · Macro-Zona: <b>{quotes.zone}</b> · Peso tassato: <b>{quotes.billed_weight} kg</b>
                 </div>
               </div>
-              {chosen && (
-                <div className="text-xs bg-orange-50 border border-orange-300 text-orange-900 px-3 py-1.5 rounded-sm font-semibold">
-                  Selezionato: <b>{chosen.carrier_name}</b> (€ {chosen.price.toFixed(2)})
-                </div>
-              )}
+              <div className="text-xs text-slate-500">Clicca sul servizio desiderato per selezionarlo</div>
             </div>
 
             {quotes.warnings?.length > 0 && (
@@ -923,7 +919,7 @@ export default function NewShipment() {
                   onClick={() => handleSelectCarrier(q)}
                   className={`rounded-sm p-4 cursor-pointer transition-all ${
                     isSelected
-                      ? "bg-orange-50/70 border-2 border-orange-600 shadow-md ring-2 ring-orange-200/70"
+                      ? "bg-orange-50/45 border-2 border-orange-600 shadow-md ring-1 ring-orange-600/20"
                       : "bg-white border border-slate-200 hover:border-slate-400 hover:shadow-sm"
                   }`}
                 >
@@ -955,21 +951,17 @@ export default function NewShipment() {
                       {i === 0 && <div className="mt-1 label-caps text-orange-600">Miglior prezzo</div>}
                     </div>
                     <div className="text-right">
-                      <div className={`text-2xl font-black ${isSelected ? "text-orange-700" : "text-slate-900"}`} style={{ fontFamily: "Chivo" }}>
-                        € {q.price.toFixed(2)}
-                      </div>
+                      <div className="text-2xl font-black text-slate-900" style={{ fontFamily: "Chivo" }}>€ {q.price.toFixed(2)}</div>
                       <div className="text-[10px] text-slate-400">IVA esclusa</div>
                     </div>
                   </div>
 
                   {isResellerOrAdmin && q.reseller_base_freight !== undefined && (
-                    <div className="mt-3 pt-3 border-t border-slate-200/70 text-xs text-slate-600 bg-white/80 px-3 py-2 rounded-sm">
+                    <div className={`mt-3 pt-3 border-t text-xs text-slate-600 px-3 py-2 rounded-sm ${isSelected ? "border-orange-200 bg-white/80" : "border-slate-100 bg-slate-50/70"}`}>
                       <div className="flex flex-wrap gap-x-4 gap-y-1">
                         <span>Nolo base: <b className="text-slate-900">€ {q.reseller_base_freight.toFixed(2)}</b></span>
                         <span>Supplementi: <b className="text-slate-900">€ {(q.reseller_surcharges_total ?? 0).toFixed(2)}</b></span>
-                        {Number(q.platform_fee || 0) > 0 && (
-                          <span>Commissione Piattaforma: <b className="text-orange-700">€ {Number(q.platform_fee).toFixed(2)}</b></span>
-                        )}
+                        <span>Commissione Piattaforma: <b className="text-orange-700">€ {Number(q.platform_fee || 0).toFixed(2)}</b></span>
                         {q.reseller_surcharge_items?.map((sc, idx) => (
                           <span key={idx} className="text-slate-500">
                             • {sc.label}: € {sc.amount.toFixed(2)}
