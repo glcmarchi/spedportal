@@ -8,7 +8,6 @@ from server import db
 
 health_router = APIRouter(prefix="/api/health", tags=["Health & Diagnostics"])
 
-
 @health_router.api_route("", methods=["GET", "HEAD"], summary="Liveness Probe Rapido")
 async def liveness_check():
     """
