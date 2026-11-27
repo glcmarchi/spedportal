@@ -11,7 +11,7 @@ import { toast } from "sonner";
 import {
   Buildings, Plus, Receipt, Gear, Key, CheckCircle,
   WarningCircle, ShieldCheck, Wallet, EnvelopeSimple, PaperPlaneTilt, DownloadSimple,
-  Activity, ArrowsClockwise, HardDrives, Globe, Envelope, Check
+  Pulse, ArrowsClockwise, HardDrives, Globe, Envelope, Check
 } from "@phosphor-icons/react";
 
 const FEATURE_KEYS = [
@@ -87,7 +87,7 @@ const formatRuleShort = (rule) => {
 
 export default function SuperAdmin() {
   const { logout } = useAuth();
-  const [tab, setTab] = useState("resellers"); // "resellers" | "master_carriers" | "settings" | "health"
+  const [tab, setTab] = useState("resellers");
   const [resellers, setResellers] = useState([]);
   const [masterData, setMasterData] = useState({ schemas: {}, carriers: {} });
   const [masterDrafts, setMasterDrafts] = useState({});
@@ -472,7 +472,7 @@ export default function SuperAdmin() {
         </Button>
         <Button variant={tab === "health" ? "default" : "outline"} onClick={() => { setTab("health"); loadHealth(); }}
           className={`rounded-sm ${tab === "health" ? "bg-slate-900" : ""}`}>
-          <Activity size={16} className="mr-2" /> Stato Sistemi & Diagnostica
+          <Pulse size={16} className="mr-2" /> Stato Sistemi & Diagnostica
         </Button>
       </div>
 
@@ -499,7 +499,7 @@ export default function SuperAdmin() {
               healthData?.status === "operational" ? "bg-green-50 border-green-200 text-green-900" : "bg-amber-50 border-amber-200 text-amber-900"
             }`}>
               <div className="flex items-center gap-2">
-                <Activity size={20} weight="fill" className={healthData?.status === "operational" ? "text-green-600" : "text-amber-600"} />
+                <Pulse size={20} weight="fill" className={healthData?.status === "operational" ? "text-green-600" : "text-amber-600"} />
                 <span className="font-bold text-sm">
                   {healthData?.status === "operational" ? "Tutti i sistemi sono perfettamente operativi" : "Uno o più servizi segnalano latenza elevata o anomalie"}
                 </span>
@@ -509,7 +509,7 @@ export default function SuperAdmin() {
               </span>
             </div>
 
-            {/* Griglia a 4 Riqudri Servizi */}
+            {/* Griglia a 4 Riquadri Servizi */}
             <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-3 pt-2">
               {/* 1. Database MongoDB */}
               <div className="bg-slate-50 border border-slate-200 p-4 rounded-sm space-y-2">
@@ -568,7 +568,7 @@ export default function SuperAdmin() {
                   {renderHealthBadge(services.email_service?.status)}
                 </div>
                 <div className="text-xs text-slate-500">
-                  Provider: <b>Resend/Sender</b> · Latenza: <b>{services.email_service?.latency_ms != null ? `${services.email_service.latency_ms} ms` : "—"}</b>
+                  Provider: <b>Resend</b> · Latenza: <b>{services.email_service?.latency_ms != null ? `${services.email_service.latency_ms} ms` : "—"}</b>
                 </div>
                 {services.email_service?.error && (
                   <div className="text-[11px] text-red-600 bg-red-50 p-1.5 rounded-sm font-mono truncate">{services.email_service.error}</div>
@@ -695,7 +695,7 @@ export default function SuperAdmin() {
         </div>
       )}
 
-      {/* TAB CODICI MASTER SUPER ADMIN */}
+      {/* TAB MASTER CARRIERS */}
       {tab === "master_carriers" && (
         <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
           {CARRIERS.map(cid => {
@@ -1113,7 +1113,7 @@ export default function SuperAdmin() {
         </DialogContent>
       </Dialog>
 
-      {/* DIALOG REPORT CONTABILITA' & ESTRATTO CONTO RESELLER */}
+      {/* DIALOG REPORT CONTABILITA' */}
       <Dialog open={!!billing} onOpenChange={(o) => !o && setBilling(null)}>
         <DialogContent className="rounded-sm max-w-4xl max-h-[90vh] overflow-y-auto">
           {billing && (
@@ -1294,4 +1294,3 @@ export default function SuperAdmin() {
     </div>
   );
 }
-
