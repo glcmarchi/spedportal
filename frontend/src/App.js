@@ -1,7 +1,7 @@
 import React from "react";
 import { BrowserRouter, Routes, Route, Navigate } from "react-router-dom";
 import { AuthProvider, useAuth } from "@/lib/auth";
-import { Toaster } from "@/components/ui/sonner";
+import { Toaster } from "sonner";
 import Layout from "@/components/Layout";
 
 import Login from "@/pages/Login";
