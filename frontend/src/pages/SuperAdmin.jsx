@@ -11,6 +11,7 @@ import { toast } from "sonner";
 import {
   Buildings, Plus, Receipt, Gear, Key, CheckCircle,
   WarningCircle, ShieldCheck, Wallet, EnvelopeSimple, PaperPlaneTilt, DownloadSimple,
+  Activity, ArrowsClockwise, HardDrives, Globe, Envelope, Check
 } from "@phosphor-icons/react";
 
 const FEATURE_KEYS = [
@@ -86,7 +87,7 @@ const formatRuleShort = (rule) => {
 
 export default function SuperAdmin() {
   const { logout } = useAuth();
-  const [tab, setTab] = useState("resellers");
+  const [tab, setTab] = useState("resellers"); // "resellers" | "master_carriers" | "settings" | "health"
   const [resellers, setResellers] = useState([]);
   const [masterData, setMasterData] = useState({ schemas: {}, carriers: {} });
   const [masterDrafts, setMasterDrafts] = useState({});
@@ -94,19 +95,27 @@ export default function SuperAdmin() {
   const [open, setOpen] = useState(false);
   const [editing, setEditing] = useState(null);
 
+  // Contabilità Reseller
   const [billing, setBilling] = useState(null);
   const [billingResellerId, setBillingResellerId] = useState(null);
   const [billingFrom, setBillingFrom] = useState("");
   const [billingTo, setBillingTo] = useState("");
   const [billingLoading, setBillingLoading] = useState(false);
 
+  // Ricarica wallet Reseller
   const [topupTarget, setTopupTarget] = useState(null);
   const [topupAmount, setTopupAmount] = useState("250");
   const [topupNote, setTopupNote] = useState("");
 
+  // Impostazioni Email Notifiche Super Admin & Test
   const [superNotifEmail, setSuperNotifEmail] = useState("");
   const [testEmailTo, setTestEmailTo] = useState("");
   const [testingEmail, setTestingEmail] = useState(false);
+
+  // Monitoraggio Health & Diagnostica Sistemi
+  const [healthData, setHealthData] = useState(null);
+  const [healthLoading, setHealthLoading] = useState(false);
+  const [healthLastCheck, setHealthLastCheck] = useState(null);
 
   const empty = {
     company_name: "", admin_email: "", notification_email: "", admin_password: "",
@@ -123,6 +132,19 @@ export default function SuperAdmin() {
     active: true,
   };
   const [form, setForm] = useState(empty);
+
+  const loadHealth = async () => {
+    setHealthLoading(true);
+    try {
+      const resp = await api.get("/health/deep");
+      setHealthData(resp.data);
+      setHealthLastCheck(new Date().toLocaleTimeString());
+    } catch {
+      toast.error("Impossibile recuperare la diagnostica dei sistemi");
+    } finally {
+      setHealthLoading(false);
+    }
+  };
 
   const load = () => {
     api.get("/super/resellers").then(r => setResellers(r.data));
@@ -146,7 +168,11 @@ export default function SuperAdmin() {
       setMasterRules(rules);
     });
   };
-  useEffect(() => { load(); }, []);
+
+  useEffect(() => {
+    load();
+    loadHealth();
+  }, []);
 
   const saveSuperNotifEmail = async () => {
     try {
@@ -390,7 +416,30 @@ export default function SuperAdmin() {
     };
   };
 
+  const renderHealthBadge = (status) => {
+    if (status === "operational") {
+      return (
+        <span className="inline-flex items-center gap-1 text-[11px] font-bold bg-green-100 text-green-800 px-2 py-0.5 rounded-sm">
+          <CheckCircle size={13} weight="fill" /> Operativo
+        </span>
+      );
+    }
+    if (status === "degraded") {
+      return (
+        <span className="inline-flex items-center gap-1 text-[11px] font-bold bg-amber-100 text-amber-800 px-2 py-0.5 rounded-sm">
+          <WarningCircle size={13} weight="fill" /> Rallentato
+        </span>
+      );
+    }
+    return (
+      <span className="inline-flex items-center gap-1 text-[11px] font-bold bg-red-100 text-red-800 px-2 py-0.5 rounded-sm">
+        <WarningCircle size={13} weight="fill" /> Problema Rilevato
+      </span>
+    );
+  };
+
   const canEnableClientPrepaid = form.billing_type === "postpaid";
+  const services = healthData?.services || {};
 
   return (
     <div className="min-h-screen bg-slate-50 p-6 lg:p-10 max-w-6xl mx-auto">
@@ -407,6 +456,7 @@ export default function SuperAdmin() {
         </div>
       </header>
 
+      {/* Navigazione Tab Super Admin */}
       <div className="flex gap-2 mb-6 border-b border-slate-200 pb-3 flex-wrap">
         <Button variant={tab === "resellers" ? "default" : "outline"} onClick={() => setTab("resellers")}
           className={`rounded-sm ${tab === "resellers" ? "bg-slate-900" : ""}`}>
@@ -420,8 +470,129 @@ export default function SuperAdmin() {
           className={`rounded-sm ${tab === "settings" ? "bg-slate-900" : ""}`}>
           <EnvelopeSimple size={16} className="mr-2" /> Notifiche & Email
         </Button>
+        <Button variant={tab === "health" ? "default" : "outline"} onClick={() => { setTab("health"); loadHealth(); }}
+          className={`rounded-sm ${tab === "health" ? "bg-slate-900" : ""}`}>
+          <Activity size={16} className="mr-2" /> Stato Sistemi & Diagnostica
+        </Button>
       </div>
 
+      {/* TAB STATO SISTEMI & SALUTE */}
+      {tab === "health" && (
+        <div className="space-y-4">
+          <div className="bg-white border border-slate-200 rounded-sm p-5 space-y-4">
+            <div className="flex items-center justify-between flex-wrap gap-2">
+              <div>
+                <h3 className="text-xl font-bold tracking-tight" style={{ fontFamily: "Chivo" }}>Diagnostica Infrastruttura</h3>
+                <p className="text-xs text-slate-500 mt-0.5">Stato di salute in tempo reale di Database Atlas, Corrieri, Lookup CAP ed Email</p>
+              </div>
+              <div className="flex items-center gap-3">
+                <span className="text-xs text-slate-400">Ultimo controllo: <b>{healthLastCheck || "Caricamento…"}</b></span>
+                <Button size="sm" onClick={loadHealth} disabled={healthLoading} className="bg-slate-900 hover:bg-slate-800 rounded-sm h-9">
+                  <ArrowsClockwise size={14} className={`mr-1.5 ${healthLoading ? "animate-spin" : ""}`} />
+                  {healthLoading ? "Verifica in corso…" : "Verifica Ora"}
+                </Button>
+              </div>
+            </div>
+
+            {/* Banner Stato Generale */}
+            <div className={`p-4 rounded-sm border flex items-center justify-between flex-wrap gap-2 ${
+              healthData?.status === "operational" ? "bg-green-50 border-green-200 text-green-900" : "bg-amber-50 border-amber-200 text-amber-900"
+            }`}>
+              <div className="flex items-center gap-2">
+                <Activity size={20} weight="fill" className={healthData?.status === "operational" ? "text-green-600" : "text-amber-600"} />
+                <span className="font-bold text-sm">
+                  {healthData?.status === "operational" ? "Tutti i sistemi sono perfettamente operativi" : "Uno o più servizi segnalano latenza elevata o anomalie"}
+                </span>
+              </div>
+              <span className="text-xs uppercase font-mono px-2 py-0.5 rounded-sm bg-white/70 border border-current">
+                Ambiente: <b>{healthData?.environment || "prod"}</b>
+              </span>
+            </div>
+
+            {/* Griglia a 4 Riqudri Servizi */}
+            <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-3 pt-2">
+              {/* 1. Database MongoDB */}
+              <div className="bg-slate-50 border border-slate-200 p-4 rounded-sm space-y-2">
+                <div className="flex items-center justify-between">
+                  <span className="font-bold text-sm text-slate-900 flex items-center gap-1.5">
+                    <HardDrives size={16} className="text-slate-600" /> MongoDB Atlas
+                  </span>
+                  {renderHealthBadge(services.database?.status)}
+                </div>
+                <div className="text-xs text-slate-500">
+                  Latenza Ping: <b>{services.database?.latency_ms != null ? `${services.database.latency_ms} ms` : "—"}</b>
+                </div>
+                {services.database?.error && (
+                  <div className="text-[11px] text-red-600 bg-red-50 p-1.5 rounded-sm font-mono truncate">{services.database.error}</div>
+                )}
+              </div>
+
+              {/* 2. Connettore FedEx */}
+              <div className="bg-slate-50 border border-slate-200 p-4 rounded-sm space-y-2">
+                <div className="flex items-center justify-between">
+                  <span className="font-bold text-sm text-slate-900 flex items-center gap-1.5">
+                    <Globe size={16} className="text-slate-600" /> FedEx API
+                  </span>
+                  {renderHealthBadge(services.fedex_carrier?.status)}
+                </div>
+                <div className="text-xs text-slate-500">
+                  Modo: <b className="uppercase">{services.fedex_carrier?.mode || "sandbox"}</b> · Latenza: <b>{services.fedex_carrier?.latency_ms != null ? `${services.fedex_carrier.latency_ms} ms` : "—"}</b>
+                </div>
+                {services.fedex_carrier?.error && (
+                  <div className="text-[11px] text-red-600 bg-red-50 p-1.5 rounded-sm font-mono truncate">{services.fedex_carrier.error}</div>
+                )}
+              </div>
+
+              {/* 3. Lookup CAP Zippopotam */}
+              <div className="bg-slate-50 border border-slate-200 p-4 rounded-sm space-y-2">
+                <div className="flex items-center justify-between">
+                  <span className="font-bold text-sm text-slate-900 flex items-center gap-1.5">
+                    <Check size={16} className="text-slate-600" /> Lookup CAP (Geo)
+                  </span>
+                  {renderHealthBadge(services.geo_service?.status)}
+                </div>
+                <div className="text-xs text-slate-500">
+                  Provider: <b>Zippopotam</b> · Latenza: <b>{services.geo_service?.latency_ms != null ? `${services.geo_service.latency_ms} ms` : "—"}</b>
+                </div>
+                {services.geo_service?.error && (
+                  <div className="text-[11px] text-red-600 bg-red-50 p-1.5 rounded-sm font-mono truncate">{services.geo_service.error}</div>
+                )}
+              </div>
+
+              {/* 4. Servizio Notifiche Email */}
+              <div className="bg-slate-50 border border-slate-200 p-4 rounded-sm space-y-2">
+                <div className="flex items-center justify-between">
+                  <span className="font-bold text-sm text-slate-900 flex items-center gap-1.5">
+                    <Envelope size={16} className="text-slate-600" /> Servizio Email
+                  </span>
+                  {renderHealthBadge(services.email_service?.status)}
+                </div>
+                <div className="text-xs text-slate-500">
+                  Provider: <b>Resend/Sender</b> · Latenza: <b>{services.email_service?.latency_ms != null ? `${services.email_service.latency_ms} ms` : "—"}</b>
+                </div>
+                {services.email_service?.error && (
+                  <div className="text-[11px] text-red-600 bg-red-50 p-1.5 rounded-sm font-mono truncate">{services.email_service.error}</div>
+                )}
+              </div>
+            </div>
+
+            {/* Informazioni Keep-Alive & UptimeRobot */}
+            <div className="bg-slate-900 text-white p-4 rounded-sm text-xs flex flex-col sm:flex-row sm:items-center justify-between gap-3 mt-4">
+              <div>
+                <div className="font-bold text-sm text-orange-400">Keep-Alive & Sleep Prevention (UptimeRobot)</div>
+                <div className="text-slate-300 mt-0.5">
+                  Il monitor esterno interroga periodicamente l'endpoint <code>/api/health</code> evitando il cold start su Render.
+                </div>
+              </div>
+              <span className="inline-flex items-center gap-1 bg-green-900/60 text-green-300 border border-green-700 px-3 py-1 rounded-sm font-semibold shrink-0">
+                ● Monitoraggio Attivo ogni 5m
+              </span>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* TAB NOTIFICHE & EMAIL */}
       {tab === "settings" && (
         <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
           <div className="bg-white border border-slate-200 rounded-sm p-5 space-y-4">
@@ -466,6 +637,7 @@ export default function SuperAdmin() {
         </div>
       )}
 
+      {/* TAB RESELLER & PERMESSI */}
       {tab === "resellers" && (
         <div className="grid gap-4">
           {resellers.map(r => {
@@ -523,6 +695,7 @@ export default function SuperAdmin() {
         </div>
       )}
 
+      {/* TAB CODICI MASTER SUPER ADMIN */}
       {tab === "master_carriers" && (
         <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
           {CARRIERS.map(cid => {
