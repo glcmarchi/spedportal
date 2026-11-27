@@ -1,87 +1,87 @@
-import "@/App.css";
+import React from "react";
 import { BrowserRouter, Routes, Route, Navigate } from "react-router-dom";
-import { Toaster } from "sonner";
 import { AuthProvider, useAuth } from "@/lib/auth";
+import { Toaster } from "@/components/ui/sonner";
+import Layout from "@/components/Layout";
+import Landing from "@/pages/Landing";
 import Login from "@/pages/Login";
 import Register from "@/pages/Register";
-import ForgotPassword from "@/pages/ForgotPassword";
-import ResetPassword from "@/pages/ResetPassword";
-import Layout from "@/components/Layout";
+import Pending from "@/pages/Pending";
 import Dashboard from "@/pages/Dashboard";
+import QuickQuote from "@/pages/QuickQuote";
 import NewShipment from "@/pages/NewShipment";
 import Shipments from "@/pages/Shipments";
 import ShipmentDetail from "@/pages/ShipmentDetail";
+import AddressBook from "@/pages/AddressBook";
+import Parcels from "@/pages/Parcels";
+import Manifests from "@/pages/Manifests";
 import Billing from "@/pages/Billing";
 import TopUp from "@/pages/TopUp";
 import PaymentSuccess from "@/pages/PaymentSuccess";
 import PaymentCancel from "@/pages/PaymentCancel";
+import Support from "@/pages/Support";
 import AdminUsers from "@/pages/AdminUsers";
 import AdminRates from "@/pages/AdminRates";
-import AdminBroadcast from "@/pages/AdminBroadcast";
-import AddressBook from "@/pages/AddressBook";
-import MyParcels from "@/pages/MyParcels";
-import Support from "@/pages/Support";
-import Manifests from "@/pages/Manifests";
-import PendingApproval from "@/pages/PendingApproval";
+import AdminBroadcasts from "@/pages/AdminBroadcasts";
 import SuperAdmin from "@/pages/SuperAdmin";
 import ResellerCarriers from "@/pages/ResellerCarriers";
 
-const ADMIN_ROLES = ["admin", "reseller_admin", "super_admin"];
-
-function SuperOnly({ children }) {
+function Protected({ children }) {
   const { user, loading } = useAuth();
-  if (loading) return <div className="p-8 text-slate-500">Caricamento…</div>;
+  if (loading) return <div className="min-h-screen flex items-center justify-center text-slate-500">Caricamento…</div>;
   if (!user) return <Navigate to="/login" replace />;
-  if (user.role !== "super_admin") return <Navigate to="/dashboard" replace />;
   return children;
 }
 
-function Protected({ children, adminOnly = false }) {
-  const { user, loading } = useAuth();
-  if (loading) return <div className="p-8 text-slate-500">Caricamento…</div>;
-  if (!user) return <Navigate to="/login" replace />;
-  if (user.role === "super_admin" && !adminOnly) return <Navigate to="/super-admin" replace />;
-  const isAdmin = ADMIN_ROLES.includes(user.role);
-  if (adminOnly && !isAdmin) return <Navigate to="/dashboard" replace />;
-  if (user.role === "user" && user.status !== "approved") return <PendingApproval />;
+function ApprovedRoute({ children }) {
+  const { user } = useAuth();
+  if (user?.role === "user" && user?.status !== "approved") return <Navigate to="/pending" replace />;
+  return <Layout>{children}</Layout>;
+}
+
+function AdminRoute({ children }) {
+  const { user } = useAuth();
+  if (!["reseller_admin", "super_admin", "admin"].includes(user?.role)) return <Navigate to="/dashboard" replace />;
+  return <Layout>{children}</Layout>;
+}
+
+function SuperRoute({ children }) {
+  const { user } = useAuth();
+  if (user?.role !== "super_admin") return <Navigate to="/dashboard" replace />;
   return children;
 }
 
-function App() {
+export default function App() {
   return (
-    <div className="App">
+    <AuthProvider>
       <BrowserRouter>
-        <AuthProvider>
-          <Toaster position="top-right" richColors />
-          <Routes>
-            <Route path="/login" element={<Login />} />
-            <Route path="/register" element={<Register />} />
-            <Route path="/forgot-password" element={<ForgotPassword />} />
-            <Route path="/reset-password" element={<ResetPassword />} />
-            <Route path="/super-admin" element={<SuperOnly><SuperAdmin /></SuperOnly>} />
-            <Route path="/payment/success" element={<PaymentSuccess />} />
-            <Route path="/payment/cancel" element={<PaymentCancel />} />
-            <Route element={<Protected><Layout /></Protected>}>
-              <Route path="/" element={<Navigate to="/dashboard" replace />} />
-              <Route path="/dashboard" element={<Dashboard />} />
-              <Route path="/shipments/new" element={<NewShipment />} />
-              <Route path="/shipments" element={<Shipments />} />
-              <Route path="/shipments/:id" element={<ShipmentDetail />} />
-              <Route path="/billing" element={<Billing />} />
-              <Route path="/topup" element={<TopUp />} />
-              <Route path="/addressbook" element={<AddressBook />} />
-              <Route path="/parcels" element={<MyParcels />} />
-              <Route path="/support" element={<Support />} />
-              <Route path="/manifests" element={<Manifests />} />
-              <Route path="/admin/users" element={<Protected adminOnly><AdminUsers /></Protected>} />
-              <Route path="/admin/rates" element={<Protected adminOnly><AdminRates /></Protected>} />
-              <Route path="/admin/carriers" element={<Protected adminOnly><ResellerCarriers /></Protected>} />
-              <Route path="/admin/broadcast" element={<Protected adminOnly><AdminBroadcast /></Protected>} />
-            </Route>
-          </Routes>
-        </AuthProvider>
+        <Routes>
+          <Route path="/" element={<Landing />} />
+          <Route path="/login" element={<Login />} />
+          <Route path="/register" element={<Register />} />
+          <Route path="/pending" element={<Protected><Pending /></Protected>} />
+          <Route path="/dashboard" element={<Protected><ApprovedRoute><Dashboard /></ApprovedRoute></Protected>} />
+          <Route path="/quote" element={<Protected><ApprovedRoute><QuickQuote /></ApprovedRoute></Protected>} />
+          <Route path="/shipments/new" element={<Protected><ApprovedRoute><NewShipment /></ApprovedRoute></Protected>} />
+          <Route path="/shipments" element={<Protected><ApprovedRoute><Shipments /></ApprovedRoute></Protected>} />
+          <Route path="/shipments/:id" element={<Protected><ApprovedRoute><ShipmentDetail /></ApprovedRoute></Protected>} />
+          <Route path="/address-book" element={<Protected><ApprovedRoute><AddressBook /></ApprovedRoute></Protected>} />
+          <Route path="/parcels" element={<Protected><ApprovedRoute><Parcels /></ApprovedRoute></Protected>} />
+          <Route path="/manifests" element={<Protected><ApprovedRoute><Manifests /></ApprovedRoute></Protected>} />
+          <Route path="/billing" element={<Protected><ApprovedRoute><Billing /></ApprovedRoute></Protected>} />
+          <Route path="/billing/topup" element={<Protected><ApprovedRoute><TopUp /></ApprovedRoute></Protected>} />
+          <Route path="/payment/success" element={<Protected><PaymentSuccess /></Protected>} />
+          <Route path="/payment/cancel" element={<Protected><PaymentCancel /></Protected>} />
+          <Route path="/support" element={<Protected><ApprovedRoute><Support /></ApprovedRoute></Protected>} />
+          <Route path="/admin/users" element={<Protected><AdminRoute><AdminUsers /></AdminRoute></Protected>} />
+          <Route path="/admin/rates" element={<Protected><AdminRoute><AdminRates /></AdminRoute></Protected>} />
+          <Route path="/admin/carriers" element={<Protected><AdminRoute><ResellerCarriers /></AdminRoute></Protected>} />
+          <Route path="/admin/broadcasts" element={<Protected><AdminRoute><AdminBroadcasts /></AdminRoute></Protected>} />
+          <Route path="/super" element={<Protected><SuperRoute><SuperAdmin /></SuperRoute></Protected>} />
+          <Route path="*" element={<Navigate to="/" replace />} />
+        </Routes>
       </BrowserRouter>
-    </div>
+      <Toaster richColors position="top-right" />
+    </AuthProvider>
   );
 }
-export default App;
