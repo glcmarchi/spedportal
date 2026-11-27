@@ -256,8 +256,7 @@ export default function ShipmentDetail() {
                 <div className="text-xl font-black font-mono text-slate-900 mt-0.5">€ {resellerCost.toFixed(2)}</div>
                 {s.reseller_base_freight !== undefined && (
                   <div className="text-[11px] text-slate-500 mt-0.5">
-                    Nolo € {Number(s.reseller_base_freight).toFixed(2)} + Suppl. € {Number(s.reseller_surcharges_total || 0).toFixed(2)}
-                    {platformFee > 0 ? ` + Comm. Piattaforma € ${platformFee.toFixed(2)}` : ""}
+                    Nolo € {Number(s.reseller_base_freight).toFixed(2)} + Suppl. € {Number(s.reseller_surcharges_total || 0).toFixed(2)} + Comm. Piatt. € {platformFee.toFixed(2)}
                   </div>
                 )}
               </div>
@@ -276,42 +275,30 @@ export default function ShipmentDetail() {
                 <div className="text-[11px] text-slate-500 mt-0.5">Netto Commissione Piattaforma · IVA escl.</div>
               </div>
             </div>
-            {(s.reseller_surcharge_items?.length > 0 || platformFee > 0) && (
-              <div className="flex flex-wrap gap-x-4 gap-y-1 text-xs text-slate-600 pt-1">
-                {s.reseller_surcharge_items?.map((sc, idx) => (
-                  <span key={idx}>• {sc.label}: € {Number(sc.amount).toFixed(2)}</span>
-                ))}
-                {platformFee > 0 && (
-                  <span className="font-semibold text-orange-800">• Commissione Piattaforma: € {platformFee.toFixed(2)}</span>
-                )}
-              </div>
-            )}
+            <div className="flex flex-wrap gap-x-4 gap-y-1 text-xs text-slate-600 pt-1">
+              {s.reseller_surcharge_items?.map((sc, idx) => (
+                <span key={idx}>• {sc.label}: € {Number(sc.amount).toFixed(2)}</span>
+              ))}
+              <span className="font-semibold text-orange-800">• Commissione Piattaforma: € {platformFee.toFixed(2)}</span>
+            </div>
           </div>
         )}
 
         {/* Dettaglio nolo/supplementi/commissione per spedizioni dirette del Reseller */}
-        {isResellerOrAdmin && !isClientShip && (s.reseller_base_freight !== undefined || platformFee > 0) && (
+        {isResellerOrAdmin && !isClientShip && s.reseller_base_freight !== undefined && (
           <div className="mt-4 bg-slate-50 border border-slate-200 rounded-sm p-3.5 text-xs space-y-1.5">
             <div className="flex flex-wrap gap-x-6 gap-y-1 text-sm">
-              {s.reseller_base_freight !== undefined && (
-                <span>Nolo base: <b className="text-slate-900">€ {Number(s.reseller_base_freight).toFixed(2)}</b></span>
-              )}
-              {s.reseller_base_freight !== undefined && (
-                <span>Supplementi: <b className="text-slate-900">€ {Number(s.reseller_surcharges_total || 0).toFixed(2)}</b></span>
-              )}
-              {platformFee > 0 && (
-                <span>Commissione Piattaforma: <b className="text-orange-700">€ {platformFee.toFixed(2)}</b></span>
-              )}
-              <span>Totale spedizione: <b className="text-orange-600">€ {clientPrice.toFixed(2)}</b></span>
+              <span>Nolo base: <b className="text-slate-900">€ {Number(s.reseller_base_freight).toFixed(2)}</b></span>
+              <span>Supplementi corriere: <b className="text-slate-900">€ {Number(s.reseller_surcharges_total || 0).toFixed(2)}</b></span>
+              <span>Commissione Piattaforma: <b className="text-orange-700">€ {platformFee.toFixed(2)}</b></span>
+              <span>Totale Spedizione: <b className="text-orange-600">€ {clientPrice.toFixed(2)}</b></span>
             </div>
             {(s.reseller_surcharge_items?.length > 0 || platformFee > 0) && (
               <div className="flex flex-wrap gap-x-4 gap-y-1 text-slate-500 pt-1 border-t border-slate-200">
                 {s.reseller_surcharge_items?.map((sc, idx) => (
                   <span key={idx}>• {sc.label}: € {Number(sc.amount).toFixed(2)}</span>
                 ))}
-                {platformFee > 0 && (
-                  <span className="font-semibold text-orange-800">• Commissione Piattaforma: € {platformFee.toFixed(2)}</span>
-                )}
+                <span className="text-orange-800 font-semibold">• Commissione Piattaforma: € {platformFee.toFixed(2)}</span>
               </div>
             )}
           </div>
