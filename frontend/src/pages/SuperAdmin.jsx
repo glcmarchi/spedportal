@@ -59,9 +59,9 @@ const POLICY_OPTIONS = [
   { value: "disabled", label: "Disabilitato" },
 ];
 
-const normalizeRule = (raw, fallback = 5) => {
+const normalizeRule = (raw, fallback = 5, fallbackSurcharge = 0) => {
   if (typeof raw === "number") {
-    return { mode: "flat", flat: raw, domestic: raw, europe: raw, world: raw };
+    return { mode: "flat", flat: raw, domestic: raw, europe: raw, world: raw, surcharge_percent: fallbackSurcharge };
   }
   if (raw && typeof raw === "object") {
     const flat = Number(raw.flat ?? fallback) || 0;
@@ -71,18 +71,20 @@ const normalizeRule = (raw, fallback = 5) => {
       domestic: Number(raw.domestic ?? flat) || 0,
       europe: Number(raw.europe ?? flat) || 0,
       world: Number(raw.world ?? flat) || 0,
+      surcharge_percent: Number(raw.surcharge_percent ?? fallbackSurcharge) || 0,
     };
   }
-  return { mode: "flat", flat: fallback, domestic: fallback, europe: fallback, world: fallback };
+  return { mode: "flat", flat: fallback, domestic: fallback, europe: fallback, world: fallback, surcharge_percent: fallbackSurcharge };
 };
 
 const formatRuleShort = (rule) => {
-  if (!rule) return "+5%";
-  const r = normalizeRule(rule, 5);
+  if (!rule) return "Nolo +5% · Suppl +0%";
+  const r = normalizeRule(rule, 5, 0);
+  const surch = r.surcharge_percent ?? 0;
   if (r.mode === "area") {
-    return `IT +${r.domestic}% · UE +${r.europe}% · Mondo +${r.world}%`;
+    return `Nolo IT +${r.domestic}% · UE +${r.europe}% · Mondo +${r.world}% · Suppl +${surch}%`;
   }
-  return `+${r.flat}%`;
+  return `Nolo +${r.flat}% · Suppl +${surch}%`;
 };
 
 export default function SuperAdmin() {
@@ -161,7 +163,8 @@ export default function SuperAdmin() {
         drafts[cid] = { ...(r.data.carriers?.[cid]?.values || {}) };
         rules[cid] = normalizeRule(
           r.data.carriers?.[cid]?.default_markup_rule,
-          r.data.carriers?.[cid]?.default_markup_percent ?? 5
+          r.data.carriers?.[cid]?.default_markup_percent ?? 5,
+          0
         );
       });
       setMasterDrafts(drafts);
@@ -276,7 +279,7 @@ export default function SuperAdmin() {
 
   const saveMasterCarrier = async (cid) => {
     try {
-      const rule = normalizeRule(masterRules[cid], 5);
+      const rule = normalizeRule(masterRules[cid], 5, 0);
       await api.put(`/super/master-carriers/${cid}`, {
         values: masterDrafts[cid] || {},
         default_markup_percent: rule.flat,
@@ -291,7 +294,7 @@ export default function SuperAdmin() {
 
   const authMasterCarrier = async (cid) => {
     try {
-      const rule = normalizeRule(masterRules[cid], 5);
+      const rule = normalizeRule(masterRules[cid], 5, 0);
       await api.put(`/super/master-carriers/${cid}`, {
         values: masterDrafts[cid] || {},
         default_markup_percent: rule.flat,
@@ -311,7 +314,7 @@ export default function SuperAdmin() {
     const cleanedMarkups = {};
     CARRIERS.forEach((cid) => {
       const val = r.admin_carrier_markups?.[cid];
-      cleanedMarkups[cid] = val !== undefined && val !== null ? normalizeRule(val, 5) : null;
+      cleanedMarkups[cid] = val !== undefined && val !== null ? normalizeRule(val, 5, 0) : null;
     });
     const effBilling = r.billing_type || "prepaid";
     const mergedFeatures = { ...empty.features, ...(r.features || {}) };
@@ -382,7 +385,7 @@ export default function SuperAdmin() {
   const updateMasterRule = (cid, patch) => {
     setMasterRules((prev) => ({
       ...prev,
-      [cid]: { ...normalizeRule(prev[cid], 5), ...patch },
+      [cid]: { ...normalizeRule(prev[cid], 5, 0), ...patch },
     }));
   };
 
@@ -483,7 +486,7 @@ export default function SuperAdmin() {
             <div className="flex items-center justify-between flex-wrap gap-2">
               <div>
                 <h3 className="text-xl font-bold tracking-tight" style={{ fontFamily: "Chivo" }}>Diagnostica Infrastruttura</h3>
-                <p className="text-xs text-slate-500 mt-0.5">Stato di salute in tempo reale di Database Atlas, Corrieri, Lookup CAP ed Email</p>
+                <p className="text-xs text-slate-500 mt-0.5">Stato di salute in tempo reale di Database Atlas, Corrieri, Lookup CAP, Stradario, Bandierine ed Email</p>
               </div>
               <div className="flex items-center gap-3">
                 <span className="text-xs text-slate-400">Ultimo controllo: <b>{healthLastCheck || "Caricamento…"}</b></span>
@@ -509,8 +512,8 @@ export default function SuperAdmin() {
               </span>
             </div>
 
-            {/* Griglia a 4 Riquadri Servizi */}
-            <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-3 pt-2">
+            {/* Griglia a 6 Riquadri Fonti Esterne */}
+            <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-3 pt-2">
               {/* 1. Database MongoDB */}
               <div className="bg-slate-50 border border-slate-200 p-4 rounded-sm space-y-2">
                 <div className="flex items-center justify-between">
@@ -559,7 +562,39 @@ export default function SuperAdmin() {
                 )}
               </div>
 
-              {/* 4. Servizio Notifiche Email */}
+              {/* 4. Validazione Vie Nominatim */}
+              <div className="bg-slate-50 border border-slate-200 p-4 rounded-sm space-y-2">
+                <div className="flex items-center justify-between">
+                  <span className="font-bold text-sm text-slate-900 flex items-center gap-1.5">
+                    <Globe size={16} className="text-slate-600" /> Stradario & Vie
+                  </span>
+                  {renderHealthBadge(services.address_validator?.status)}
+                </div>
+                <div className="text-xs text-slate-500">
+                  Provider: <b>OSM Nominatim</b> · Latenza: <b>{services.address_validator?.latency_ms != null ? `${services.address_validator.latency_ms} ms` : "—"}</b>
+                </div>
+                {services.address_validator?.error && (
+                  <div className="text-[11px] text-red-600 bg-red-50 p-1.5 rounded-sm font-mono truncate">{services.address_validator.error}</div>
+                )}
+              </div>
+
+              {/* 5. Asset Bandierine FlagCDN */}
+              <div className="bg-slate-50 border border-slate-200 p-4 rounded-sm space-y-2">
+                <div className="flex items-center justify-between">
+                  <span className="font-bold text-sm text-slate-900 flex items-center gap-1.5">
+                    <Globe size={16} className="text-slate-600" /> Asset Bandierine
+                  </span>
+                  {renderHealthBadge(services.flag_cdn?.status)}
+                </div>
+                <div className="text-xs text-slate-500">
+                  Provider: <b>FlagCDN</b> · Latenza: <b>{services.flag_cdn?.latency_ms != null ? `${services.flag_cdn.latency_ms} ms` : "—"}</b>
+                </div>
+                {services.flag_cdn?.error && (
+                  <div className="text-[11px] text-red-600 bg-red-50 p-1.5 rounded-sm font-mono truncate">{services.flag_cdn.error}</div>
+                )}
+              </div>
+
+              {/* 6. Servizio Notifiche Email */}
               <div className="bg-slate-50 border border-slate-200 p-4 rounded-sm space-y-2">
                 <div className="flex items-center justify-between">
                   <span className="font-bold text-sm text-slate-900 flex items-center gap-1.5">
@@ -703,7 +738,7 @@ export default function SuperAdmin() {
             if (!schema) return null;
             const saved = masterData.carriers?.[cid] || {};
             const draft = masterDrafts[cid] || {};
-            const rule = normalizeRule(masterRules[cid], 5);
+            const rule = normalizeRule(masterRules[cid], 5, 0);
             const isVerified = saved.status === "verified";
             return (
               <div key={cid} className="bg-white border border-slate-200 rounded-sm p-5 space-y-4">
@@ -741,23 +776,23 @@ export default function SuperAdmin() {
                       />
                     </div>
                   ))}
-                  <div className="sm:col-span-2 bg-orange-50/60 border border-orange-200 p-3 rounded-sm space-y-2.5">
+                  <div className="sm:col-span-2 bg-orange-50/60 border border-orange-200 p-3 rounded-sm space-y-3">
                     <div className="flex items-center justify-between gap-2 flex-wrap">
                       <div className="label-caps text-orange-800">Margine Admin Default (%)</div>
                       <Select value={rule.mode} onValueChange={(m) => updateMasterRule(cid, { mode: m })}>
-                        <SelectTrigger className="w-52 h-8 rounded-sm text-xs bg-white">
+                        <SelectTrigger className="w-56 h-8 rounded-sm text-xs bg-white">
                           <SelectValue />
                         </SelectTrigger>
                         <SelectContent>
-                          <SelectItem value="flat">Margine unico (tutte le aree)</SelectItem>
-                          <SelectItem value="area">Differenziato per Macro-Area</SelectItem>
+                          <SelectItem value="flat">Nolo: Margine unico (tutte le aree)</SelectItem>
+                          <SelectItem value="area">Nolo: Differenziato per Macro-Area</SelectItem>
                         </SelectContent>
                       </Select>
                     </div>
 
                     {rule.mode === "flat" ? (
                       <div className="flex items-center justify-between gap-2">
-                        <span className="text-[11px] text-slate-600">Ricarico applicato su Italia, Europa e Mondo</span>
+                        <span className="text-[11px] text-slate-600">Margine Nolo Base (Italia, Europa, Mondo)</span>
                         <div className="flex items-center gap-1">
                           <Input
                             type="number"
@@ -776,7 +811,7 @@ export default function SuperAdmin() {
                     ) : (
                       <div className="grid grid-cols-3 gap-2">
                         <div>
-                          <Label className="label-caps text-[10px]">Italia %</Label>
+                          <Label className="label-caps text-[10px]">Nolo Italia %</Label>
                           <Input
                             type="number"
                             step="0.5"
@@ -787,7 +822,7 @@ export default function SuperAdmin() {
                           />
                         </div>
                         <div>
-                          <Label className="label-caps text-[10px]">Europa %</Label>
+                          <Label className="label-caps text-[10px]">Nolo Europa %</Label>
                           <Input
                             type="number"
                             step="0.5"
@@ -798,7 +833,7 @@ export default function SuperAdmin() {
                           />
                         </div>
                         <div>
-                          <Label className="label-caps text-[10px]">Mondo %</Label>
+                          <Label className="label-caps text-[10px]">Nolo Mondo %</Label>
                           <Input
                             type="number"
                             step="0.5"
@@ -810,6 +845,21 @@ export default function SuperAdmin() {
                         </div>
                       </div>
                     )}
+
+                    <div className="pt-2 border-t border-orange-200/80 flex items-center justify-between gap-2">
+                      <span className="text-[11px] font-semibold text-orange-900">Margine Supplementi % (unico su tutti i supplementi)</span>
+                      <div className="flex items-center gap-1">
+                        <Input
+                          type="number"
+                          step="0.5"
+                          min="0"
+                          value={rule.surcharge_percent ?? 0}
+                          onChange={(e) => updateMasterRule(cid, { surcharge_percent: Math.max(0, parseFloat(e.target.value) || 0) })}
+                          className="w-24 rounded-sm h-8 text-xs font-bold text-right bg-white"
+                        />
+                        <span className="text-xs font-bold text-slate-600">%</span>
+                      </div>
+                    </div>
                   </div>
                 </div>
 
@@ -937,18 +987,19 @@ export default function SuperAdmin() {
             <div className="border-t pt-4">
               <div className="label-caps text-orange-600 mb-1">Assegnazione Codici Corrieri & Margine Admin</div>
               <p className="text-xs text-slate-500 mb-3">
-                Per <b>Codice Admin (Master)</b> puoi lasciare il margine default dei tuoi codici Master oppure personalizzarlo (Unico o per Macro-Area). In aggiunta verrà applicata la rispettiva Commissione Piattaforma impostata sopra.
+                Per <b>Codice Admin (Master)</b> puoi lasciare il margine default dei tuoi codici Master oppure personalizzarlo separando Nolo Base (Unico o Macro-Area) e Supplementi (Unico %).
               </p>
               <div className="space-y-2.5">
                 {CARRIERS.map(cid => {
                   const pol = form.carrier_policies?.[cid] || "admin_only";
                   const defRule = normalizeRule(
                     masterData.carriers?.[cid]?.default_markup_rule,
-                    masterData.carriers?.[cid]?.default_markup_percent ?? 5
+                    masterData.carriers?.[cid]?.default_markup_percent ?? 5,
+                    0
                   );
                   const customVal = form.admin_carrier_markups?.[cid];
                   const hasCustom = customVal !== undefined && customVal !== null;
-                  const activeRule = hasCustom ? normalizeRule(customVal, defRule.flat) : defRule;
+                  const activeRule = hasCustom ? normalizeRule(customVal, defRule.flat, defRule.surcharge_percent ?? 0) : defRule;
 
                   return (
                     <div key={cid} className="bg-slate-50 p-3 rounded-sm border border-slate-200 space-y-2">
@@ -982,8 +1033,8 @@ export default function SuperAdmin() {
                               </SelectTrigger>
                               <SelectContent>
                                 <SelectItem value="default">Usa Default ({formatRuleShort(defRule)})</SelectItem>
-                                <SelectItem value="flat">Personalizza · Unico %</SelectItem>
-                                <SelectItem value="area">Personalizza · Macro-Area</SelectItem>
+                                <SelectItem value="flat">Personalizza · Nolo Unico %</SelectItem>
+                                <SelectItem value="area">Personalizza · Nolo Macro-Area</SelectItem>
                               </SelectContent>
                             </Select>
                           ) : (
@@ -995,60 +1046,75 @@ export default function SuperAdmin() {
                       </div>
 
                       {pol === "admin_only" && hasCustom && (
-                        <div className="pt-2 border-t border-slate-200 flex justify-end">
-                          {activeRule.mode === "flat" ? (
-                            <div className="flex items-center gap-2">
-                              <span className="text-xs text-slate-600">Margine unico:</span>
-                              <Input
-                                type="number"
-                                step="0.5"
-                                min="0"
-                                value={activeRule.flat}
-                                onChange={(e) => {
-                                  const num = Math.max(0, parseFloat(e.target.value) || 0);
-                                  updateResellerCarrierMarkup(cid, { mode: "flat", flat: num, domestic: num, europe: num, world: num });
-                                }}
-                                className="h-8 w-24 rounded-sm bg-white text-xs text-right font-mono"
-                              />
-                              <span className="text-xs font-bold">%</span>
-                            </div>
-                          ) : (
-                            <div className="grid grid-cols-3 gap-2 w-full sm:w-auto">
-                              <div>
-                                <Label className="label-caps text-[10px]">Italia %</Label>
+                        <div className="pt-2 border-t border-slate-200 flex flex-wrap items-end justify-between gap-3">
+                          <div>
+                            {activeRule.mode === "flat" ? (
+                              <div className="flex items-center gap-2">
+                                <span className="text-xs text-slate-600">Margine Nolo unico:</span>
                                 <Input
                                   type="number"
                                   step="0.5"
                                   min="0"
-                                  value={activeRule.domestic}
-                                  onChange={(e) => updateResellerCarrierMarkup(cid, { ...activeRule, mode: "area", domestic: Math.max(0, parseFloat(e.target.value) || 0) })}
+                                  value={activeRule.flat}
+                                  onChange={(e) => {
+                                    const num = Math.max(0, parseFloat(e.target.value) || 0);
+                                    updateResellerCarrierMarkup(cid, { ...activeRule, mode: "flat", flat: num, domestic: num, europe: num, world: num });
+                                  }}
                                   className="h-8 w-24 rounded-sm bg-white text-xs text-right font-mono"
                                 />
+                                <span className="text-xs font-bold">%</span>
                               </div>
-                              <div>
-                                <Label className="label-caps text-[10px]">Europa %</Label>
-                                <Input
-                                  type="number"
-                                  step="0.5"
-                                  min="0"
-                                  value={activeRule.europe}
-                                  onChange={(e) => updateResellerCarrierMarkup(cid, { ...activeRule, mode: "area", europe: Math.max(0, parseFloat(e.target.value) || 0) })}
-                                  className="h-8 w-24 rounded-sm bg-white text-xs text-right font-mono"
-                                />
+                            ) : (
+                              <div className="grid grid-cols-3 gap-2">
+                                <div>
+                                  <Label className="label-caps text-[10px]">Nolo Italia %</Label>
+                                  <Input
+                                    type="number"
+                                    step="0.5"
+                                    min="0"
+                                    value={activeRule.domestic}
+                                    onChange={(e) => updateResellerCarrierMarkup(cid, { ...activeRule, mode: "area", domestic: Math.max(0, parseFloat(e.target.value) || 0) })}
+                                    className="h-8 w-24 rounded-sm bg-white text-xs text-right font-mono"
+                                  />
+                                </div>
+                                <div>
+                                  <Label className="label-caps text-[10px]">Nolo Europa %</Label>
+                                  <Input
+                                    type="number"
+                                    step="0.5"
+                                    min="0"
+                                    value={activeRule.europe}
+                                    onChange={(e) => updateResellerCarrierMarkup(cid, { ...activeRule, mode: "area", europe: Math.max(0, parseFloat(e.target.value) || 0) })}
+                                    className="h-8 w-24 rounded-sm bg-white text-xs text-right font-mono"
+                                  />
+                                </div>
+                                <div>
+                                  <Label className="label-caps text-[10px]">Nolo Mondo %</Label>
+                                  <Input
+                                    type="number"
+                                    step="0.5"
+                                    min="0"
+                                    value={activeRule.world}
+                                    onChange={(e) => updateResellerCarrierMarkup(cid, { ...activeRule, mode: "area", world: Math.max(0, parseFloat(e.target.value) || 0) })}
+                                    className="h-8 w-24 rounded-sm bg-white text-xs text-right font-mono"
+                                  />
+                                </div>
                               </div>
-                              <div>
-                                <Label className="label-caps text-[10px]">Mondo %</Label>
-                                <Input
-                                  type="number"
-                                  step="0.5"
-                                  min="0"
-                                  value={activeRule.world}
-                                  onChange={(e) => updateResellerCarrierMarkup(cid, { ...activeRule, mode: "area", world: Math.max(0, parseFloat(e.target.value) || 0) })}
-                                  className="h-8 w-24 rounded-sm bg-white text-xs text-right font-mono"
-                                />
-                              </div>
-                            </div>
-                          )}
+                            )}
+                          </div>
+
+                          <div className="flex items-center gap-2 bg-orange-50 border border-orange-200 px-2.5 py-1.5 rounded-sm">
+                            <span className="text-xs font-semibold text-orange-900">Supplementi:</span>
+                            <Input
+                              type="number"
+                              step="0.5"
+                              min="0"
+                              value={activeRule.surcharge_percent ?? 0}
+                              onChange={(e) => updateResellerCarrierMarkup(cid, { ...activeRule, surcharge_percent: Math.max(0, parseFloat(e.target.value) || 0) })}
+                              className="h-8 w-20 rounded-sm bg-white text-xs text-right font-mono"
+                            />
+                            <span className="text-xs font-bold">%</span>
+                          </div>
                         </div>
                       )}
                     </div>
