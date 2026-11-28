@@ -62,7 +62,6 @@ FEDEX_STATUS_MAP = {
 
 
 def resolve_fedex_packaging(parcel_type: str, parcels: List[Dict[str, Any]]) -> str:
-    """Mappa in sicurezza la tipologia di imballaggio neutrale sul packagingType FedEx."""
     pt = (parcel_type or "pacco").lower().strip()
     max_w = max((float(p.get("weight", 1.0)) for p in parcels), default=1.0)
     if pt in ("busta", "documenti", "busta_documenti"):
@@ -252,7 +251,7 @@ async def get_fedex_transit_times(
                 "description": "Commercial Goods",
                 "numberOfPieces": max(1, len(parcels)),
                 "weight": {"units": "KG", "value": max(0.1, total_w)},
-                "customsValue": {"amount": 50.0, "currency": "EUR"},
+                "customsValue": {"amount": 1.0, "currency": "EUR"},
             }]
         }
 
@@ -412,18 +411,22 @@ def _extract_net_charge(rated_details: List[Dict[str, Any]]) -> Dict[str, Any]:
             amt = round(float(sc.get("amount") or 0.0) * rate, 2)
             if amt <= 0:
                 continue
-            sc_type = sc.get("type") or sc.get("surchargeType") or "SURCHARGE"
-            sc_label = sc.get("description") or sc.get("name") or sc_type
-            key = f"{sc_type}:{sc_label}"
+            sc_type = (sc.get("type") or sc.get("surchargeType") or "SURCHARGE").upper()
+            sc_label = (sc.get("description") or sc.get("name") or sc_type).strip()
+            key = f"{sc_type}:{sc_label.lower()}"
             if key in agg_surcharges:
                 agg_surcharges[key]["amount"] = round(agg_surcharges[key]["amount"] + amt, 2)
             else:
                 agg_surcharges[key] = {"type": sc_type, "label": sc_label, "amount": amt}
 
-    _collect(srd.get("surCharges") or [])
-    for rpd in chosen.get("ratedPackageDetails") or []:
-        prd = rpd.get("packageRateDetail") or {}
-        _collect(prd.get("surCharges") or [])
+    # Evita doppio conteggio quando FedEx restituisce sia shipmentRateDetail.surCharges sia packageRateDetail.surCharges
+    ship_sc = srd.get("surCharges") or []
+    if ship_sc:
+        _collect(ship_sc)
+    else:
+        for rpd in chosen.get("ratedPackageDetails") or []:
+            prd = rpd.get("packageRateDetail") or {}
+            _collect(prd.get("surCharges") or [])
 
     clean_surcharges = list(agg_surcharges.values())
     sum_items = round(sum(x["amount"] for x in clean_surcharges), 2)
@@ -472,10 +475,10 @@ def _build_commodity_item(
     currency: str = "EUR",
     hs_code: str = "",
 ) -> Dict[str, Any]:
-    val = round(max(1.0, float(customs_value or 50.0)), 2)
+    val = round(max(1.0, float(customs_value or 1.0)), 2)
     curr = (currency or "EUR").upper()
     item: Dict[str, Any] = {
-        "description": (goods_description or "Commercial Goods Sample")[:400],
+        "description": (goods_description or "Commercial Goods")[:400],
         "countryOfManufacture": origin_country,
         "numberOfPieces": max(1, int(pkg_count)),
         "quantity": 1,
@@ -542,10 +545,10 @@ async def get_fedex_rates(
 
     if is_intl or customs_required:
         total_w = round(sum(float(p["weight"]) for p in parcels), 2)
-        val = round(max(1.0, float(customs_value or insured_value or 50.0)), 2)
+        val = round(max(1.0, float(customs_value or insured_value or 1.0)), 2)
         curr = (customs_currency or "EUR").upper()
         comm: Dict[str, Any] = {
-            "description": (goods_description or "Documents" if parcel_type == "documenti" else "Commercial Goods")[:400],
+            "description": (goods_description or ("Documents" if parcel_type in ("documenti", "busta_documenti") else "Commercial Goods"))[:400],
             "quantity": 1,
             "quantityUnits": "PCS",
             "weight": {"units": "KG", "value": max(0.1, total_w)},
@@ -661,6 +664,7 @@ async def create_fedex_shipment(
     ship_date = datetime.now(timezone.utc).strftime("%Y-%m-%d")
     s_country = (sender.get("country") or "IT").upper()
     r_country = (recipient.get("country") or "IT").upper()
+    is_intl = s_country != r_country
     total_w = round(sum(float(p["weight"]) for p in parcels), 2)
     pkg_type = resolve_fedex_packaging(parcel_type, parcels)
     is_env = pkg_type == "FEDEX_ENVELOPE"
@@ -742,24 +746,30 @@ async def create_fedex_shipment(
         special_block["specialServiceTypes"] = special_types
         requested_shipment["shipmentSpecialServices"] = special_block
 
-    if customs_required:
-        duties_payor = "SENDER" if (incoterms or "DAP").upper() == "DDP" else "RECIPIENT"
+    # FedEx REST richiede customsClearanceDetail per qualsiasi spedizione internazionale (anche intra-UE).
+    # Per destinazioni intra-UE passa automaticamente behind-the-scenes 1.00 EUR e DAP.
+    if is_intl or customs_required:
+        effective_incoterms = (incoterms or "DAP").upper() if customs_required else "DAP"
+        duties_payor = "SENDER" if effective_incoterms == "DDP" else "RECIPIENT"
         duties_block: Dict[str, Any] = {"paymentType": duties_payor}
         if duties_payor == "SENDER":
             duties_block["payor"] = {"responsibleParty": {"accountNumber": {"value": str(account_number).strip()}}}
+
+        declared_val = (customs_value or insured_value or 1.0) if customs_required else 1.0
+        default_desc = "Documents" if parcel_type in ("documenti", "busta_documenti") else "Commercial Goods"
 
         requested_shipment["customsClearanceDetail"] = {
             "dutiesPayment": duties_block,
             "commercialInvoice": {"shipmentPurpose": "SOLD"},
             "commodities": [
                 _build_commodity_item(
-                    goods_description=goods_description,
+                    goods_description=goods_description or default_desc,
                     origin_country=s_country,
                     total_weight=total_w,
                     pkg_count=len(parcels),
-                    customs_value=customs_value or insured_value or 50.0,
-                    currency=customs_currency,
-                    hs_code=hs_code,
+                    customs_value=declared_val,
+                    currency=customs_currency if customs_required else "EUR",
+                    hs_code=hs_code if customs_required else "",
                 )
             ],
         }
