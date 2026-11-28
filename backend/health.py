@@ -8,23 +8,15 @@ health_router = APIRouter(prefix="/api/health", tags=["Health & Diagnostics"])
 
 
 def get_database():
-    """
-    Risolve il database MongoDB in modo lazy all'esecuzione della richiesta.
-    Evita qualsiasi potenziale blocco di import circolare tra server.py e health.py.
-    """
     import server
     return getattr(server, "db", None)
 
 
 @health_router.api_route("", methods=["GET", "HEAD"], summary="Liveness Probe Rapido")
 async def liveness_check():
-    """
-    Check rapido per UptimeRobot, Render e monitor esterni.
-    Supporta nativamente sia chiamate GET che HEAD restituendo 200 OK.
-    """
     start_time = time.time()
     db_status = "down"
-    
+
     db = get_database()
     if db is not None:
         try:
@@ -46,16 +38,12 @@ async def liveness_check():
     }
 
 
-@health_router.get("/deep", summary="Diagnostica Approfondita")
+@health_router.get("/deep", summary="Diagnostica Approfondita Fonti Esterne")
 async def deep_diagnostic_check():
-    """
-    Diagnostica completa per il pannello Super Admin di SpedPortal.
-    Misura le latenze di MongoDB, FedEx, servizio CAP (Zippopotam) e servizio Email (Resend).
-    """
     results: Dict[str, Any] = {}
     is_degraded = False
 
-    # 1. Test Connessione MongoDB Atlas
+    # 1. MongoDB Atlas
     t0 = time.time()
     db = get_database()
     if db is not None:
@@ -80,7 +68,7 @@ async def deep_diagnostic_check():
             "latency_ms": round((time.time() - t0) * 1000, 2),
         }
 
-    # 2. Test Connettore FedEx (Handshake endpoint OAuth)
+    # 2. FedEx API
     t0 = time.time()
     fedex_base_url = os.getenv("FEDEX_BASE_URL", "https://apis-sandbox.fedex.com").rstrip("/")
     fedex_mode = "production" if ("apis.fedex.com" in fedex_base_url and "sandbox" not in fedex_base_url) else "sandbox"
@@ -90,7 +78,6 @@ async def deep_diagnostic_check():
                 f"{fedex_base_url}/oauth/token",
                 data={"grant_type": "client_credentials"},
             )
-            # 200, 400, 401 indicano che i server FedEx rispondono regolarmente alla connessione
             if resp.status_code in [200, 400, 401]:
                 results["fedex_carrier"] = {
                     "status": "operational",
@@ -115,7 +102,7 @@ async def deep_diagnostic_check():
             "latency_ms": round((time.time() - t0) * 1000, 2),
         }
 
-    # 3. Test Lookup Territoriale CAP (Zippopotam)
+    # 3. Lookup CAP Zippopotam
     t0 = time.time()
     try:
         async with httpx.AsyncClient(timeout=3.0) as client:
@@ -131,7 +118,43 @@ async def deep_diagnostic_check():
             "latency_ms": round((time.time() - t0) * 1000, 2),
         }
 
-    # 4. Test Servizio Notifiche / Email (Resend)
+    # 4. Validazione Vie & Civici (OpenStreetMap Nominatim)
+    t0 = time.time()
+    try:
+        async with httpx.AsyncClient(timeout=4.0) as client:
+            resp = await client.get(
+                "https://nominatim.openstreetmap.org/search",
+                params={"q": "Via Roma 1, 20121 Milano, IT", "format": "json", "limit": 1},
+                headers={"User-Agent": "SpedPortal-Diagnostics/1.0"},
+            )
+            results["address_validator"] = {
+                "status": "operational" if resp.status_code == 200 else "degraded",
+                "latency_ms": round((time.time() - t0) * 1000, 2),
+            }
+    except Exception as e:
+        results["address_validator"] = {
+            "status": "down",
+            "error": str(e),
+            "latency_ms": round((time.time() - t0) * 1000, 2),
+        }
+
+    # 5. CDN Bandierine Nazioni (FlagCDN)
+    t0 = time.time()
+    try:
+        async with httpx.AsyncClient(timeout=3.0) as client:
+            resp = await client.head("https://flagcdn.com/w20/it.png")
+            results["flags_cdn"] = {
+                "status": "operational" if resp.status_code in [200, 304] else "degraded",
+                "latency_ms": round((time.time() - t0) * 1000, 2),
+            }
+    except Exception as e:
+        results["flags_cdn"] = {
+            "status": "down",
+            "error": str(e),
+            "latency_ms": round((time.time() - t0) * 1000, 2),
+        }
+
+    # 6. Servizio Email (Resend)
     t0 = time.time()
     resend_api_key = os.getenv("RESEND_API_KEY", "")
     if not resend_api_key:
