@@ -6,9 +6,10 @@ import {
   Lifebuoy, Users, CurrencyEur, Megaphone, SignOut, List, X, House, Key, Lightning,
 } from "@phosphor-icons/react";
 
-const NavItem = ({ to, icon: Icon, label, onClick }) => (
+const NavItem = ({ to, icon: Icon, label, end, onClick }) => (
   <NavLink
     to={to}
+    end={end}
     onClick={onClick}
     className={({ isActive }) =>
       `flex items-center gap-3 px-4 py-2.5 text-sm font-medium rounded-sm transition-colors ${
@@ -37,7 +38,7 @@ export default function Layout({ children }) {
     { to: "/dashboard", icon: House, label: "Dashboard", ok: true },
     { to: "/shipments/new", icon: Package, label: "Nuova Spedizione", ok: true },
     { to: "/quote", icon: Lightning, label: "Preventivo Rapido", ok: true },
-    { to: "/shipments", icon: Truck, label: "Spedizioni", ok: true },
+    { to: "/shipments", icon: Truck, label: "Spedizioni", end: true, ok: true },
     { to: "/address-book", icon: AddressBook, label: "Rubrica", ok: show("address_book") },
     { to: "/parcels", icon: Cube, label: "I miei pacchi", ok: show("parcels") },
     { to: "/manifests", icon: ClipboardText, label: "Manifest", ok: show("manifests") },
