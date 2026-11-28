@@ -120,10 +120,17 @@ def tenant_filter(user, extra=None):
     return f
 
 
-def _normalize_rule(raw: Any, fallback_flat: float = 0.0) -> Dict[str, Any]:
+def _normalize_rule(raw: Any, fallback_flat: float = 0.0, fallback_surcharge: float = 0.0) -> Dict[str, Any]:
     if isinstance(raw, (int, float)):
         v = round(float(raw), 2)
-        return {"mode": "flat", "flat": v, "domestic": v, "europe": v, "world": v}
+        return {
+            "mode": "flat",
+            "flat": v,
+            "domestic": v,
+            "europe": v,
+            "world": v,
+            "surcharge_percent": round(float(fallback_surcharge), 2),
+        }
     if isinstance(raw, dict):
         mode = "area" if raw.get("mode") == "area" else "flat"
         flat = round(float(raw.get("flat", fallback_flat) or 0.0), 2)
@@ -133,20 +140,33 @@ def _normalize_rule(raw: Any, fallback_flat: float = 0.0) -> Dict[str, Any]:
             "domestic": round(float(raw.get("domestic", flat) or 0.0), 2),
             "europe": round(float(raw.get("europe", flat) or 0.0), 2),
             "world": round(float(raw.get("world", flat) or 0.0), 2),
+            "surcharge_percent": round(float(raw.get("surcharge_percent", fallback_surcharge) or 0.0), 2),
         }
     v = round(float(fallback_flat), 2)
-    return {"mode": "flat", "flat": v, "domestic": v, "europe": v, "world": v}
+    return {
+        "mode": "flat",
+        "flat": v,
+        "domestic": v,
+        "europe": v,
+        "world": v,
+        "surcharge_percent": round(float(fallback_surcharge), 2),
+    }
 
 
-def _eval_markup_rule(rule: Dict[str, Any], zone_macro: str) -> float:
-    norm = _normalize_rule(rule, 0.0)
+def _eval_markup_pair(rule: Any, zone_macro: str, fallback_surcharge: float = 0.0) -> Dict[str, float]:
+    norm = _normalize_rule(rule, 0.0, fallback_surcharge)
     if norm["mode"] == "flat":
-        return norm["flat"]
-    if zone_macro == "NAZ":
-        return norm["domestic"]
-    if zone_macro in ("UE", "EUR-EXTRA"):
-        return norm["europe"]
-    return norm["world"]
+        freight_pct = norm["flat"]
+    elif zone_macro == "NAZ":
+        freight_pct = norm["domestic"]
+    elif zone_macro in ("UE", "EUR-EXTRA"):
+        freight_pct = norm["europe"]
+    else:
+        freight_pct = norm["world"]
+    return {
+        "freight_pct": round(freight_pct, 2),
+        "surcharge_pct": round(norm.get("surcharge_percent", 0.0), 2),
+    }
 
 
 async def ensure_reseller_standard_rate_table(reseller_id: Optional[str]) -> Optional[Dict[str, Any]]:
@@ -160,7 +180,7 @@ async def ensure_reseller_standard_rate_table(reseller_id: Optional[str]) -> Opt
         "reseller_id": reseller_id,
         "name": "Listino Standard",
         "is_default": True,
-        "carrier_markups": {cid: _normalize_rule(20.0) for cid in ALL_CARRIER_IDS},
+        "carrier_markups": {cid: _normalize_rule(20.0, 20.0, 0.0) for cid in ALL_CARRIER_IDS},
         "created_at": now_iso(),
     }
     await db.rate_tables.insert_one(doc)
@@ -169,7 +189,6 @@ async def ensure_reseller_standard_rate_table(reseller_id: Optional[str]) -> Opt
 
 
 async def _validate_client_billing_allowed(reseller_id: Optional[str], requested_billing: str):
-    """Un sub-cliente può avere modalità 'prepaid' SOLO se il Reseller ha modalità 'postpaid' (Fine Mese)."""
     if requested_billing != "prepaid":
         return
     if not reseller_id:
@@ -593,7 +612,7 @@ def _normalize_rate_table_doc(doc: Dict[str, Any]) -> Dict[str, Any]:
     norm_cm = {}
     for cid in ALL_CARRIER_IDS:
         if cid in raw_cm and raw_cm[cid] is not None:
-            norm_cm[cid] = _normalize_rule(raw_cm[cid], 20.0)
+            norm_cm[cid] = _normalize_rule(raw_cm[cid], 20.0, 0.0)
         else:
             bands = doc.get("bands") or []
             if bands:
@@ -602,11 +621,11 @@ def _normalize_rate_table_doc(doc: Dict[str, Any]) -> Dict[str, Any]:
                 eur = by_z.get("UE", dom)
                 wld = by_z.get("WORLD", eur)
                 if dom == eur == wld:
-                    norm_cm[cid] = {"mode": "flat", "flat": dom, "domestic": dom, "europe": eur, "world": wld}
+                    norm_cm[cid] = {"mode": "flat", "flat": dom, "domestic": dom, "europe": eur, "world": wld, "surcharge_percent": 0.0}
                 else:
-                    norm_cm[cid] = {"mode": "area", "flat": dom, "domestic": dom, "europe": eur, "world": wld}
+                    norm_cm[cid] = {"mode": "area", "flat": dom, "domestic": dom, "europe": eur, "world": wld, "surcharge_percent": 0.0}
             else:
-                norm_cm[cid] = _normalize_rule(20.0)
+                norm_cm[cid] = _normalize_rule(20.0, 20.0, 0.0)
     doc["carrier_markups"] = norm_cm
     return doc
 
@@ -622,7 +641,7 @@ async def list_rate_tables(user=Depends(require_admin)):
 
 @api_router.post("/admin/rate-tables")
 async def create_rate_table(inp: RateTableInput, user=Depends(require_admin)):
-    clean_cm = {cid: _normalize_rule(inp.carrier_markups.get(cid, 20.0), 20.0) for cid in ALL_CARRIER_IDS}
+    clean_cm = {cid: _normalize_rule(inp.carrier_markups.get(cid, 20.0), 20.0, 0.0) for cid in ALL_CARRIER_IDS}
     doc = {
         "id": new_id(),
         "reseller_id": user.get("reseller_id"),
@@ -636,7 +655,7 @@ async def create_rate_table(inp: RateTableInput, user=Depends(require_admin)):
 
 @api_router.put("/admin/rate-tables/{tid}")
 async def update_rate_table(tid: str, inp: RateTableInput, user=Depends(require_admin)):
-    clean_cm = {cid: _normalize_rule(inp.carrier_markups.get(cid, 20.0), 20.0) for cid in ALL_CARRIER_IDS}
+    clean_cm = {cid: _normalize_rule(inp.carrier_markups.get(cid, 20.0), 20.0, 0.0) for cid in ALL_CARRIER_IDS}
     q = {"id": tid} if user.get("role") == "super_admin" else {"id": tid, "reseller_id": user.get("reseller_id")}
     r = await db.rate_tables.update_one(q, {"$set": {"name": inp.name, "carrier_markups": clean_cm}})
     if r.matched_count == 0:
@@ -728,9 +747,9 @@ def _mock_carrier_breakdown(
     }
 
 
-async def _reseller_markup_for_carrier(user: dict, carrier_id: str, zone_macro: str) -> float:
+async def _reseller_markup_for_carrier(user: dict, carrier_id: str, zone_macro: str) -> Dict[str, float]:
     if user.get("role") in ("reseller_admin", "super_admin", "admin"):
-        return 0.0
+        return {"freight_pct": 0.0, "surcharge_pct": 0.0}
 
     rid = user.get("reseller_id")
     rate_table_id = user.get("rate_table_id")
@@ -743,8 +762,8 @@ async def _reseller_markup_for_carrier(user: dict, carrier_id: str, zone_macro: 
         norm = _normalize_rate_table_doc(table)
         rule = (norm.get("carrier_markups") or {}).get(carrier_id)
         if rule:
-            return _eval_markup_rule(rule, zone_macro)
-    return 20.0
+            return _eval_markup_pair(rule, zone_macro, 0.0)
+    return {"freight_pct": 20.0, "surcharge_pct": 0.0}
 
 
 async def _resolve_tenant_carrier_options(user: dict, zone_macro: str = "NAZ") -> dict:
@@ -766,6 +785,7 @@ async def _resolve_tenant_carrier_options(user: dict, zone_macro: str = "NAZ") -
                     "owner": "admin",
                     "code": m.get("primary_code", ""),
                     "admin_markup_percent": 0.0,
+                    "admin_surcharge_markup_percent": 0.0,
                     "platform_fee": 0.0,
                 }
         return out
@@ -795,14 +815,15 @@ async def _resolve_tenant_carrier_options(user: dict, zone_macro: str = "NAZ") -
             if m.get("status") == "verified":
                 override = custom_markups.get(cid)
                 if override is not None:
-                    admin_mk = _eval_markup_rule(override, zone_macro)
+                    pair = _eval_markup_pair(override, zone_macro, 0.0)
                 else:
                     master_rule = m.get("default_markup_rule") if m.get("default_markup_rule") is not None else float(m.get("default_markup_percent", 0.0))
-                    admin_mk = _eval_markup_rule(master_rule, zone_macro)
+                    pair = _eval_markup_pair(master_rule, zone_macro, 0.0)
                 out[cid] = {
                     "owner": "admin",
                     "code": m.get("primary_code", ""),
-                    "admin_markup_percent": round(admin_mk, 2),
+                    "admin_markup_percent": pair["freight_pct"],
+                    "admin_surcharge_markup_percent": pair["surcharge_pct"],
                     "platform_fee": fee_admin,
                 }
         elif pol == "reseller_only":
@@ -812,6 +833,7 @@ async def _resolve_tenant_carrier_options(user: dict, zone_macro: str = "NAZ") -
                     "owner": "reseller",
                     "code": o.get("primary_code", ""),
                     "admin_markup_percent": 0.0,
+                    "admin_surcharge_markup_percent": 0.0,
                     "platform_fee": fee_own,
                 }
     return out
@@ -842,29 +864,30 @@ def _build_quote_option(
     billed_weight: float,
     zone_macro: str,
     opt: dict,
-    reseller_mk_pct: float,
+    reseller_mk_pair: Dict[str, float],
 ) -> dict:
-    """Calcolo Opzione B:
-    - Il ricarico % Reseller si applica solo al trasporto (nolo + supplementi),
-      mentre la Commissione Piattaforma (platform_fee) viene aggiunta netta senza ulteriore ricarico.
-    """
-    admin_mk_pct = opt["admin_markup_percent"] if opt["owner"] == "admin" else 0.0
-    mult_admin = 1 + admin_mk_pct / 100.0
+    """Calcolo separato Nolo Base vs Supplementi + Commissione Piattaforma netta."""
+    admin_freight_pct = opt["admin_markup_percent"] if opt["owner"] == "admin" else 0.0
+    admin_surch_pct = opt.get("admin_surcharge_markup_percent", 0.0) if opt["owner"] == "admin" else 0.0
+
+    mult_admin_freight = 1 + admin_freight_pct / 100.0
+    mult_admin_surch = 1 + admin_surch_pct / 100.0
     platform_fee = round(float(opt.get("platform_fee") or 0.0), 2)
 
-    reseller_base_freight = round(raw_freight * mult_admin, 2)
+    reseller_base_freight = round(raw_freight * mult_admin_freight, 2)
     reseller_surcharge_items = [
-        {**item, "amount": round(item["amount"] * mult_admin, 2)}
+        {**item, "amount": round(item["amount"] * mult_admin_surch, 2)}
         for item in raw_surcharge_items
     ]
     reseller_surcharges_total = round(sum(x["amount"] for x in reseller_surcharge_items), 2)
     reseller_transport_cost = round(reseller_base_freight + reseller_surcharges_total, 2)
-
-    # Costo totale sostenuto dal Reseller (trasporto + Commissione Piattaforma)
     reseller_cost = round(reseller_transport_cost + platform_fee, 2)
 
-    # Opzione B: ricarico % Reseller solo sul trasporto + Commissione Piattaforma netta
-    client_price = round(reseller_transport_cost * (1 + reseller_mk_pct / 100.0) + platform_fee, 2)
+    res_freight_pct = reseller_mk_pair.get("freight_pct", 0.0)
+    res_surch_pct = reseller_mk_pair.get("surcharge_pct", 0.0)
+    client_freight = reseller_base_freight * (1 + res_freight_pct / 100.0)
+    client_surcharges = reseller_surcharges_total * (1 + res_surch_pct / 100.0)
+    client_price = round(client_freight + client_surcharges + platform_fee, 2)
 
     return {
         "option_key": f"{cid}:{service_type}",
@@ -874,14 +897,16 @@ def _build_quote_option(
         "service_type": service_type,
         "is_live": is_live,
         "carrier_cost": carrier_cost,
-        "admin_markup_percent": admin_mk_pct,
+        "admin_markup_percent": admin_freight_pct,
+        "admin_surcharge_markup_percent": admin_surch_pct,
         "reseller_base_freight": reseller_base_freight,
         "reseller_surcharges_total": reseller_surcharges_total,
         "reseller_surcharge_items": reseller_surcharge_items,
         "reseller_transport_cost": reseller_transport_cost,
         "platform_fee": platform_fee,
         "reseller_cost": reseller_cost,
-        "reseller_markup_percent": reseller_mk_pct,
+        "reseller_markup_percent": res_freight_pct,
+        "reseller_surcharge_markup_percent": res_surch_pct,
         "cost": reseller_cost,
         "price": client_price,
         "transit_days": transit,
@@ -911,7 +936,7 @@ async def _compute_quotes_internal(q: QuoteRequest, user: dict) -> dict:
         if not opt:
             continue
 
-        reseller_mk_pct = await _reseller_markup_for_carrier(user, cid, zone_info["macro"])
+        reseller_mk_pair = await _reseller_markup_for_carrier(user, cid, zone_info["macro"])
 
         if cid == "tnt":
             if not is_fedex_configured() or not opt["code"]:
@@ -965,7 +990,7 @@ async def _compute_quotes_internal(q: QuoteRequest, user: dict) -> dict:
                         billed_weight=billed_weight,
                         zone_macro=zone_info["macro"],
                         opt=opt,
-                        reseller_mk_pct=reseller_mk_pct,
+                        reseller_mk_pair=reseller_mk_pair,
                     )
                 )
         else:
@@ -987,7 +1012,7 @@ async def _compute_quotes_internal(q: QuoteRequest, user: dict) -> dict:
                     billed_weight=billed_weight,
                     zone_macro=zone_info["macro"],
                     opt=opt,
-                    reseller_mk_pct=reseller_mk_pct,
+                    reseller_mk_pair=reseller_mk_pair,
                 )
             )
 
@@ -1053,7 +1078,6 @@ def _tracking_number(carrier_id: str) -> str:
 
 
 async def _issue_single_shipment_invoice(shipment: dict) -> dict:
-    """Emette in automatico una ricevuta/fattura per una spedizione pagata istantaneamente."""
     existing = await db.invoices.find_one({"shipment_ids": shipment["id"]}, {"_id": 0})
     if existing:
         return existing
@@ -1081,7 +1105,6 @@ async def _issue_single_shipment_invoice(shipment: dict) -> dict:
 
 
 async def _dispatch_shipment_to_carrier_and_bill(shipment: dict, user_doc: dict) -> dict:
-    """Esegue la chiamata al corriere, genera etichetta e registra addebiti su wallet/ledger."""
     if shipment.get("status") != "awaiting_payment" and shipment.get("tracking_number"):
         return shipment
 
@@ -1172,7 +1195,6 @@ async def _dispatch_shipment_to_carrier_and_bill(shipment: dict, user_doc: dict)
             "shipment_id": shipment["id"], "created_at": now_iso(),
         })
 
-    # Addebito Wallet Reseller (trasporto + Commissione Piattaforma se codici Admin; solo Commissione Piattaforma se codici propri)
     reseller_doc = await db.resellers.find_one({"id": rid}) if rid else None
     admin_charge_to_reseller = round(reseller_transport + applied_fee, 2) if source == "admin" else applied_fee
     if reseller_doc and reseller_doc.get("billing_type") == "prepaid" and admin_charge_to_reseller > 0:
@@ -1294,6 +1316,7 @@ async def create_shipment(inp: CreateShipmentInput, user=Depends(require_approve
         "zone": chosen["zone"],
         "carrier_cost": carrier_cost,
         "admin_markup_percent": chosen["admin_markup_percent"],
+        "admin_surcharge_markup_percent": chosen.get("admin_surcharge_markup_percent", 0.0),
         "reseller_base_freight": chosen["reseller_base_freight"],
         "reseller_surcharges_total": chosen["reseller_surcharges_total"],
         "reseller_surcharge_items": chosen["reseller_surcharge_items"],
@@ -1301,6 +1324,7 @@ async def create_shipment(inp: CreateShipmentInput, user=Depends(require_approve
         "platform_fee": applied_fee,
         "reseller_cost": reseller_cost,
         "reseller_markup_percent": chosen["reseller_markup_percent"],
+        "reseller_surcharge_markup_percent": chosen.get("reseller_surcharge_markup_percent", 0.0),
         "cost": reseller_cost,
         "price": price,
         "payment_mode": billing_mode,
@@ -1377,7 +1401,8 @@ def _sanitize_shipment_for_role(s: dict, role: str) -> dict:
             "cost", "carrier_cost", "reseller_cost", "reseller_transport_cost",
             "platform_fee", "applied_fee",
             "reseller_base_freight", "reseller_surcharges_total", "reseller_surcharge_items",
-            "admin_markup_percent", "reseller_markup_percent",
+            "admin_markup_percent", "admin_surcharge_markup_percent",
+            "reseller_markup_percent", "reseller_surcharge_markup_percent",
         ):
             s.pop(secret_k, None)
     return s
@@ -1420,7 +1445,8 @@ async def list_shipments(user=Depends(require_approved)):
             "cost": 0, "carrier_cost": 0, "reseller_cost": 0, "reseller_transport_cost": 0,
             "platform_fee": 0, "applied_fee": 0,
             "reseller_base_freight": 0, "reseller_surcharges_total": 0, "reseller_surcharge_items": 0,
-            "admin_markup_percent": 0, "reseller_markup_percent": 0,
+            "admin_markup_percent": 0, "admin_surcharge_markup_percent": 0,
+            "reseller_markup_percent": 0, "reseller_surcharge_markup_percent": 0,
         })
     ships = await db.shipments.find(q, proj).sort("created_at", -1).to_list(1000)
 
