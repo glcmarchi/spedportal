@@ -1,5 +1,5 @@
 import React, { useEffect, useState } from "react";
-import { useNavigate } from "react-router-dom";
+import { useLocation, useNavigate } from "react-router-dom";
 import { api } from "@/lib/api";
 import { useAuth } from "@/lib/auth";
 import { Button } from "@/components/ui/button";
@@ -7,7 +7,7 @@ import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import { Checkbox } from "@/components/ui/checkbox";
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
-import { COUNTRIES, PROVINCE_COUNTRIES } from "@/pages/NewShipment";
+import { COUNTRIES, PROVINCE_COUNTRIES, CountryFlag } from "@/pages/NewShipment";
 import { toast } from "sonner";
 import {
   Lightning, Plus, X, ArrowRight, FileText, Cube, Package,
@@ -22,6 +22,9 @@ const QUICK_PRESETS = [
 
 export default function QuickQuote() {
   const nav = useNavigate();
+  const location = useLocation();
+  const dashPreset = location.state || null;
+
   const { user } = useAuth();
   const isResellerOrAdmin = ["reseller_admin", "super_admin", "admin"].includes(user?.role);
   const enabledSurcharges = user?.enabled_surcharges || {
@@ -33,15 +36,17 @@ export default function QuickQuote() {
   const [fromCity, setFromCity] = useState("");
   const [fromProv, setFromProv] = useState("");
 
-  const [toCountry, setToCountry] = useState("IT");
-  const [toCap, setToCap] = useState("");
+  const [toCountry, setToCountry] = useState(dashPreset?.presetDestCountry || "IT");
+  const [toCap, setToCap] = useState(dashPreset?.presetDestCap || "");
   const [toCity, setToCity] = useState("");
   const [toProv, setToProv] = useState("");
   const [toCityOptions, setToCityOptions] = useState([]);
 
   const [category, setCategory] = useState("goods");
   const [parcelType, setParcelType] = useState("pacco");
-  const [parcels, setParcels] = useState([{ length: 30, width: 20, height: 15, weight: 1 }]);
+  const [parcels, setParcels] = useState([
+    { length: 30, width: 20, height: 15, weight: dashPreset?.presetWeight || 1 },
+  ]);
   const [savedParcels, setSavedParcels] = useState([]);
 
   const [residential, setResidential] = useState(false);
@@ -65,27 +70,39 @@ export default function QuickQuote() {
     api.get("/parcels").then((r) => {
       const list = r.data || [];
       setSavedParcels(list);
-      const def = list.find((p) => p.is_default);
-      if (def) {
-        setParcelType("pacco");
-        setParcels([{ length: def.length, width: def.width, height: def.height, weight: def.weight }]);
+      if (!dashPreset?.presetWeight) {
+        const def = list.find((p) => p.is_default);
+        if (def) {
+          setParcelType("pacco");
+          setParcels([{ length: def.length, width: def.width, height: def.height, weight: def.weight }]);
+        }
       }
     }).catch(() => {});
-  }, []);
+  }, [dashPreset]);
+
+  useEffect(() => {
+    if (dashPreset?.presetDestCap) {
+      lookupCap("to", dashPreset.presetDestCap, dashPreset.presetDestCountry || "IT");
+    }
+  }, [dashPreset]);
 
   const lookupCap = async (side, capVal, countryCode) => {
-    if (!capVal) return;
+    const cleanCap = (capVal || "").trim();
+    if (!cleanCap) return;
     try {
       const cc = (countryCode || "IT").toUpperCase();
-      const r = await api.get(`/geo/lookup?country=${cc}&cap=${encodeURIComponent(capVal)}`);
+      const r = await api.get(`/geo/lookup?country=${cc}&cap=${encodeURIComponent(cleanCap)}`);
+      if (r.data?.valid === false) {
+        toast.warning(`Il CAP "${cleanCap}" non risulta valido per ${cc}`);
+      }
       if (side === "from") {
-        if (r.data?.city) setFromCity(r.data.city);
-        if (r.data?.province) setFromProv(r.data.province);
+        setFromCity(r.data?.city || "");
+        setFromProv(PROVINCE_COUNTRIES.has(cc) ? (r.data?.province || "") : "");
       } else {
         const list = r.data?.cities || (r.data?.city ? [r.data.city] : []);
         setToCityOptions(list);
-        if (r.data?.city) setToCity(r.data.city);
-        if (r.data?.province) setToProv(r.data.province);
+        setToCity(r.data?.city || "");
+        setToProv(PROVINCE_COUNTRIES.has(cc) ? (r.data?.province || "") : "");
       }
     } catch {}
   };
@@ -215,12 +232,30 @@ export default function QuickQuote() {
             <div className="grid grid-cols-12 gap-2">
               <div className="col-span-5">
                 <Label className="label-caps text-[10px]">Nazione</Label>
-                <Select value={fromCountry} onValueChange={(v) => setFromCountry(v)}>
-                  <SelectTrigger className="mt-1 h-10 rounded-sm bg-white text-xs"><SelectValue /></SelectTrigger>
-                  <SelectContent className="max-h-72">
-                    {COUNTRIES.map((c) => <SelectItem key={c.code} value={c.code}>{c.name} ({c.code})</SelectItem>)}
-                  </SelectContent>
-                </Select>
+                <div className="flex items-center gap-1.5 mt-1">
+                  <CountryFlag code={fromCountry} />
+                  <Select
+                    value={fromCountry}
+                    onValueChange={(v) => {
+                      setFromCountry(v);
+                      setFromCap("");
+                      setFromCity("");
+                      setFromProv("");
+                    }}
+                  >
+                    <SelectTrigger className="h-10 rounded-sm bg-white text-xs flex-1"><SelectValue /></SelectTrigger>
+                    <SelectContent className="max-h-72">
+                      {COUNTRIES.map((c) => (
+                        <SelectItem key={c.code} value={c.code}>
+                          <span className="inline-flex items-center gap-2">
+                            <CountryFlag code={c.code} />
+                            <span>{c.name} ({c.code})</span>
+                          </span>
+                        </SelectItem>
+                      ))}
+                    </SelectContent>
+                  </Select>
+                </div>
               </div>
               <div className="col-span-3">
                 <Label className="label-caps text-[10px]">CAP*</Label>
@@ -250,12 +285,31 @@ export default function QuickQuote() {
             <div className="grid grid-cols-12 gap-2">
               <div className={PROVINCE_COUNTRIES.has(toCountry) ? "col-span-4" : "col-span-5"}>
                 <Label className="label-caps text-[10px]">Nazione</Label>
-                <Select value={toCountry} onValueChange={(v) => { setToCountry(v); setToCityOptions([]); }}>
-                  <SelectTrigger className="mt-1 h-10 rounded-sm bg-white text-xs"><SelectValue /></SelectTrigger>
-                  <SelectContent className="max-h-72">
-                    {COUNTRIES.map((c) => <SelectItem key={c.code} value={c.code}>{c.name} ({c.code})</SelectItem>)}
-                  </SelectContent>
-                </Select>
+                <div className="flex items-center gap-1.5 mt-1">
+                  <CountryFlag code={toCountry} />
+                  <Select
+                    value={toCountry}
+                    onValueChange={(v) => {
+                      setToCountry(v);
+                      setToCap("");
+                      setToCity("");
+                      setToProv("");
+                      setToCityOptions([]);
+                    }}
+                  >
+                    <SelectTrigger className="h-10 rounded-sm bg-white text-xs flex-1"><SelectValue /></SelectTrigger>
+                    <SelectContent className="max-h-72">
+                      {COUNTRIES.map((c) => (
+                        <SelectItem key={c.code} value={c.code}>
+                          <span className="inline-flex items-center gap-2">
+                            <CountryFlag code={c.code} />
+                            <span>{c.name} ({c.code})</span>
+                          </span>
+                        </SelectItem>
+                      ))}
+                    </SelectContent>
+                  </Select>
+                </div>
               </div>
               <div className="col-span-3">
                 <Label className="label-caps text-[10px]">CAP*</Label>
@@ -460,7 +514,7 @@ export default function QuickQuote() {
 
           {result.warnings?.length > 0 && (
             <div className="bg-amber-50 border border-amber-300 text-amber-900 rounded-sm p-3 text-xs space-y-1">
-              {result.warnings.map((w, i) => <div key={i}>• {w}</div>)}
+              {result.warnings.map((w, idx) => <div key={idx}>• {w}</div>)}
             </div>
           )}
 
