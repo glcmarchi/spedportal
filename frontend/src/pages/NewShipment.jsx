@@ -19,44 +19,154 @@ import {
 
 export const COUNTRIES = [
   { code: "IT", name: "Italia" },
-  { code: "FR", name: "Francia" },
-  { code: "DE", name: "Germania" },
-  { code: "ES", name: "Spagna" },
-  { code: "IE", name: "Irlanda" },
-  { code: "GB", name: "Regno Unito (UK)" },
-  { code: "CH", name: "Svizzera" },
-  { code: "AT", name: "Austria" },
-  { code: "BE", name: "Belgio" },
-  { code: "NL", name: "Paesi Bassi (Olanda)" },
-  { code: "PT", name: "Portogallo" },
-  { code: "PL", name: "Polonia" },
-  { code: "SE", name: "Svezia" },
-  { code: "DK", name: "Danimarca" },
-  { code: "FI", name: "Finlandia" },
-  { code: "GR", name: "Grecia" },
-  { code: "RO", name: "Romania" },
-  { code: "CZ", name: "Repubblica Ceca" },
-  { code: "HU", name: "Ungheria" },
-  { code: "HR", name: "Croazia" },
-  { code: "SI", name: "Slovenia" },
-  { code: "SK", name: "Slovacchia" },
-  { code: "BG", name: "Bulgaria" },
-  { code: "LU", name: "Lussemburgo" },
-  { code: "MT", name: "Malta" },
-  { code: "CY", name: "Cipro" },
-  { code: "EE", name: "Estonia" },
-  { code: "LV", name: "Lettonia" },
-  { code: "LT", name: "Lituania" },
-  { code: "NO", name: "Norvegia" },
-  { code: "US", name: "Stati Uniti (USA)" },
-  { code: "CA", name: "Canada" },
-  { code: "MX", name: "Messico" },
+  { code: "AF", name: "Afghanistan" },
+  { code: "AL", name: "Albania" },
+  { code: "DZ", name: "Algeria" },
+  { code: "AD", name: "Andorra" },
+  { code: "AO", name: "Angola" },
+  { code: "SA", name: "Arabia Saudita" },
+  { code: "AR", name: "Argentina" },
+  { code: "AM", name: "Armenia" },
   { code: "AU", name: "Australia" },
-  { code: "JP", name: "Giappone" },
-  { code: "CN", name: "Cina" },
-  { code: "AE", name: "Emirati Arabi Uniti" },
+  { code: "AT", name: "Austria" },
+  { code: "AZ", name: "Azerbaigian" },
+  { code: "BS", name: "Bahamas" },
+  { code: "BH", name: "Bahrein" },
+  { code: "BD", name: "Bangladesh" },
+  { code: "BB", name: "Barbados" },
+  { code: "BE", name: "Belgio" },
+  { code: "BZ", name: "Belize" },
+  { code: "BJ", name: "Benin" },
+  { code: "BM", name: "Bermuda" },
+  { code: "BT", name: "Bhutan" },
+  { code: "BY", name: "Bielorussia" },
+  { code: "BO", name: "Bolivia" },
+  { code: "BA", name: "Bosnia ed Erzegovina" },
+  { code: "BW", name: "Botswana" },
   { code: "BR", name: "Brasile" },
+  { code: "BN", name: "Brunei" },
+  { code: "BG", name: "Bulgaria" },
+  { code: "BF", name: "Burkina Faso" },
+  { code: "BI", name: "Burundi" },
+  { code: "KH", name: "Cambogia" },
+  { code: "CM", name: "Camerun" },
+  { code: "CA", name: "Canada" },
+  { code: "CV", name: "Capo Verde" },
+  { code: "CL", name: "Cile" },
+  { code: "CN", name: "Cina" },
+  { code: "CY", name: "Cipro" },
+  { code: "VA", name: "Città del Vaticano" },
+  { code: "CO", name: "Colombia" },
+  { code: "KR", name: "Corea del Sud" },
+  { code: "CI", name: "Costa d'Avorio" },
+  { code: "CR", name: "Costa Rica" },
+  { code: "HR", name: "Croazia" },
+  { code: "DK", name: "Danimarca" },
+  { code: "EC", name: "Ecuador" },
+  { code: "EG", name: "Egitto" },
+  { code: "SV", name: "El Salvador" },
+  { code: "AE", name: "Emirati Arabi Uniti" },
+  { code: "EE", name: "Estonia" },
+  { code: "ET", name: "Etiopia" },
+  { code: "PH", name: "Filippine" },
+  { code: "FI", name: "Finlandia" },
+  { code: "FR", name: "Francia" },
+  { code: "GA", name: "Gabon" },
+  { code: "GE", name: "Georgia" },
+  { code: "DE", name: "Germania" },
+  { code: "GH", name: "Ghana" },
+  { code: "JM", name: "Giamaica" },
+  { code: "JP", name: "Giappone" },
+  { code: "GI", name: "Gibilterra" },
+  { code: "JO", name: "Giordania" },
+  { code: "GR", name: "Grecia" },
+  { code: "GT", name: "Guatemala" },
+  { code: "HN", name: "Honduras" },
+  { code: "HK", name: "Hong Kong" },
+  { code: "IN", name: "India" },
+  { code: "ID", name: "Indonesia" },
+  { code: "IE", name: "Irlanda" },
+  { code: "IS", name: "Islanda" },
+  { code: "IL", name: "Israele" },
+  { code: "KZ", name: "Kazakistan" },
+  { code: "KE", name: "Kenya" },
+  { code: "KW", name: "Kuwait" },
+  { code: "LV", name: "Lettonia" },
+  { code: "LB", name: "Libano" },
+  { code: "LI", name: "Liechtenstein" },
+  { code: "LT", name: "Lituania" },
+  { code: "LU", name: "Lussemburgo" },
+  { code: "MK", name: "Macedonia del Nord" },
+  { code: "MG", name: "Madagascar" },
+  { code: "MY", name: "Malesia" },
+  { code: "MT", name: "Malta" },
+  { code: "MA", name: "Marocco" },
+  { code: "MU", name: "Mauritius" },
+  { code: "MX", name: "Messico" },
+  { code: "MD", name: "Moldavia" },
+  { code: "MC", name: "Monaco (Principato)" },
+  { code: "ME", name: "Montenegro" },
+  { code: "MZ", name: "Mozambico" },
+  { code: "NA", name: "Namibia" },
+  { code: "NP", name: "Nepal" },
+  { code: "NI", name: "Nicaragua" },
+  { code: "NG", name: "Nigeria" },
+  { code: "NO", name: "Norvegia" },
+  { code: "NZ", name: "Nuova Zelanda" },
+  { code: "OM", name: "Oman" },
+  { code: "NL", name: "Paesi Bassi (Olanda)" },
+  { code: "PK", name: "Pakistan" },
+  { code: "PA", name: "Panama" },
+  { code: "PY", name: "Paraguay" },
+  { code: "PE", name: "Perù" },
+  { code: "PL", name: "Polonia" },
+  { code: "PT", name: "Portogallo" },
+  { code: "PR", name: "Porto Rico" },
+  { code: "QA", name: "Qatar" },
+  { code: "GB", name: "Regno Unito (UK)" },
+  { code: "CZ", name: "Repubblica Ceca" },
+  { code: "DO", name: "Repubblica Dominicana" },
+  { code: "RO", name: "Romania" },
+  { code: "SM", name: "San Marino" },
+  { code: "SN", name: "Senegal" },
+  { code: "RS", name: "Serbia" },
+  { code: "SG", name: "Singapore" },
+  { code: "SK", name: "Slovacchia" },
+  { code: "SI", name: "Slovenia" },
+  { code: "ES", name: "Spagna" },
+  { code: "US", name: "Stati Uniti (USA)" },
+  { code: "ZA", name: "Sudafrica" },
+  { code: "SE", name: "Svezia" },
+  { code: "CH", name: "Svizzera" },
+  { code: "TW", name: "Taiwan" },
+  { code: "TZ", name: "Tanzania" },
+  { code: "TH", name: "Thailandia" },
+  { code: "TN", name: "Tunisia" },
+  { code: "TR", name: "Turchia" },
+  { code: "UA", name: "Ucraina" },
+  { code: "UG", name: "Uganda" },
+  { code: "HU", name: "Ungheria" },
+  { code: "UY", name: "Uruguay" },
+  { code: "UZ", name: "Uzbekistan" },
+  { code: "VE", name: "Venezuela" },
+  { code: "VN", name: "Vietnam" },
+  { code: "ZM", name: "Zambia" },
+  { code: "ZW", name: "Zimbabwe" },
 ];
+
+export function CountryFlag({ code }) {
+  const iso = ((code || "IT").toLowerCase() === "uk" ? "gb" : (code || "IT").toLowerCase()).slice(0, 2);
+  return (
+    <img
+      src={`https://flagcdn.com/w20/${iso}.png`}
+      alt={code}
+      width={20}
+      height={15}
+      className="inline-block rounded-[2px] border border-slate-200 shrink-0 object-cover"
+      onError={(e) => { e.currentTarget.style.display = "none"; }}
+    />
+  );
+}
 
 const EU_COUNTRIES = new Set([
   "AT", "BE", "BG", "HR", "CY", "CZ", "DK", "EE", "FI", "FR", "DE", "GR",
@@ -210,6 +320,8 @@ export default function NewShipment() {
   const [chosen, setChosen] = useState(quickState?.preselectedQuote || null);
   const [addrCheck, setAddrCheck] = useState(null);
   const [checkingAddr, setCheckingAddr] = useState(false);
+  const [streetWarning, setStreetWarning] = useState(null);
+  const [validatingStep, setValidatingStep] = useState(false);
   const [loading, setLoading] = useState(false);
   const [created, setCreated] = useState(null);
   const [addressbook, setAddressbook] = useState([]);
@@ -223,7 +335,6 @@ export default function NewShipment() {
     setCustoms(c => ({ ...c, required: isExtraEu, incoterms: allowDdp ? c.incoterms : "DAP" }));
   }, [isExtraEu, allowDdp]);
 
-  // Precompilazione automatica Mittente predefinito con l'indirizzo sede dell'utente
   useEffect(() => {
     if (senderAutoLoaded) return;
     const ra = user?.reseller_address;
@@ -469,6 +580,55 @@ export default function NewShipment() {
     return true;
   };
 
+  const handleNextStep = async () => {
+    const targetAddr = step === 0 ? sender : (step === 1 ? recipient : null);
+    if (!targetAddr) {
+      setStep(step + 1);
+      return;
+    }
+    setValidatingStep(true);
+    setStreetWarning(null);
+    try {
+      const cc = (targetAddr.country || "IT").toUpperCase();
+      const geoRes = await api.get(`/geo/lookup?country=${cc}&cap=${encodeURIComponent(targetAddr.postal_code)}`);
+      if (geoRes.data?.valid === false) {
+        toast.error(`Il CAP "${targetAddr.postal_code}" non appartiene a ${cc}. Verifica Nazione e CAP.`);
+        return;
+      }
+      const allowedCities = geoRes.data?.cities || [];
+      if (allowedCities.length > 0) {
+        const typedCity = (targetAddr.city || "").trim().toLowerCase();
+        const match = allowedCities.some(
+          c => c.toLowerCase() === typedCity || typedCity.includes(c.toLowerCase()) || c.toLowerCase().includes(typedCity)
+        );
+        if (!match) {
+          toast.error(`La città "${targetAddr.city}" non corrisponde al CAP ${targetAddr.postal_code} (${allowedCities.join(", ")}).`);
+          return;
+        }
+      }
+
+      if (step === 1) {
+        const valRes = await api.post("/geo/validate-address", {
+          address: targetAddr.address,
+          postal_code: targetAddr.postal_code,
+          city: targetAddr.city,
+          province: targetAddr.province || "",
+          country: cc,
+        });
+        if (valRes.data?.supported && (!valRes.data?.found || !valRes.data?.exact)) {
+          setStreetWarning(valRes.data);
+          return;
+        }
+      }
+
+      setStep(step + 1);
+    } catch {
+      setStep(step + 1);
+    } finally {
+      setValidatingStep(false);
+    }
+  };
+
   const prohibitedList = [
     ...PROHIBITED_COMMON,
     ...(PROHIBITED_EXTRA_BY_COUNTRY[destCountry] || []),
@@ -502,14 +662,58 @@ export default function NewShipment() {
           />
         )}
         {step === 1 && (
-          <AddressForm
-            title="Dati Destinatario"
-            data={recipient}
-            setData={setRecipient}
-            addressbook={addressbook}
-            onSavedToBook={reloadBook}
-            canSaveToBook={features.address_book !== false}
-          />
+          <div className="space-y-4">
+            <AddressForm
+              title="Dati Destinatario"
+              data={recipient}
+              setData={(d) => { setStreetWarning(null); setRecipient(d); }}
+              addressbook={addressbook}
+              onSavedToBook={reloadBook}
+              canSaveToBook={features.address_book !== false}
+            />
+            {streetWarning && (
+              <div className="bg-amber-50 border-2 border-amber-300 rounded-sm p-4 text-xs text-amber-950 space-y-2.5">
+                <div className="font-bold flex items-center gap-1.5 text-sm text-amber-900">
+                  <Warning size={18} weight="fill" className="text-amber-600" />
+                  Verifica Indirizzo Destinatario
+                </div>
+                <p>{streetWarning.warning || "L'indirizzo inserito presenta una lieve difformità rispetto allo stradario ufficiale."}</p>
+                {streetWarning.suggested_address && (
+                  <div className="bg-white border border-amber-200 rounded-sm p-2.5 flex flex-wrap items-center justify-between gap-2">
+                    <div>
+                      Indirizzo suggerito: <b>{streetWarning.suggested_address}</b> · {streetWarning.suggested_postal_code} {streetWarning.suggested_city}
+                    </div>
+                    <Button
+                      type="button"
+                      size="sm"
+                      onClick={() => {
+                        setRecipient(r => ({
+                          ...r,
+                          address: streetWarning.suggested_address || r.address,
+                          city: streetWarning.suggested_city || r.city,
+                          postal_code: streetWarning.suggested_postal_code || r.postal_code,
+                        }));
+                        setStreetWarning(null);
+                        setStep(2);
+                      }}
+                      className="bg-orange-600 hover:bg-orange-700 h-8 rounded-sm text-xs"
+                    >
+                      Usa indirizzo suggerito e prosegui
+                    </Button>
+                  </div>
+                )}
+                <div className="flex justify-end">
+                  <button
+                    type="button"
+                    onClick={() => { setStreetWarning(null); setStep(2); }}
+                    className="underline font-semibold text-amber-800 hover:text-amber-950"
+                  >
+                    Mantieni comunque l'indirizzo inserito e prosegui →
+                  </button>
+                </div>
+              </div>
+            )}
+          </div>
         )}
         {step === 2 && (
           <div className="space-y-6">
@@ -1076,7 +1280,11 @@ export default function NewShipment() {
       {step < 5 && (
         <div className="flex justify-between">
           <Button variant="outline" onClick={() => setStep(Math.max(0, step - 1))} disabled={step === 0} className="rounded-sm"><ArrowLeft size={16} className="mr-2" /> Indietro</Button>
-          {step < 3 && <Button disabled={!canNext()} onClick={() => setStep(step + 1)} className="bg-orange-600 hover:bg-orange-700 rounded-sm">Avanti <ArrowRight size={16} className="ml-2" /></Button>}
+          {step < 3 && (
+            <Button disabled={!canNext() || validatingStep} onClick={handleNextStep} className="bg-orange-600 hover:bg-orange-700 rounded-sm">
+              {validatingStep ? "Verifica indirizzo…" : <>Avanti <ArrowRight size={16} className="ml-2" /></>}
+            </Button>
+          )}
           {step === 3 && <Button disabled={loading} onClick={fetchQuotes} className="bg-orange-600 hover:bg-orange-700 rounded-sm">{loading ? "Calcolo…" : "Calcola tariffe"} <ArrowRight size={16} className="ml-2" /></Button>}
           {step === 4 && (
             <Button disabled={!chosen || loading} onClick={confirm} className="bg-orange-600 hover:bg-orange-700 rounded-sm">
@@ -1279,27 +1487,31 @@ function AddressForm({ title, data, setData, addressbook = [], onClient, onSaved
     setData(d => ({
       ...d,
       country: up,
-      province: PROVINCE_COUNTRIES.has(up) ? d.province : "",
+      postal_code: "",
+      city: "",
+      province: "",
     }));
   };
 
   const lookupCap = async (cap) => {
-    if (!cap) return;
+    const cleanCap = (cap || "").trim();
+    if (!cleanCap) return;
     try {
-      const r = await api.get(`/geo/lookup?country=${cc}&cap=${encodeURIComponent(cap)}`);
+      const r = await api.get(`/geo/lookup?country=${cc}&cap=${encodeURIComponent(cleanCap)}`);
       if (r.data.valid === false) {
-        toast.warning(`Il CAP "${cap}" non risulta valido per ${cc}`);
+        toast.error(`Il CAP "${cleanCap}" non è valido per ${cc}. Correggilo prima di proseguire.`);
+        setCityOptions([]);
+        setData(d => ({ ...d, city: "", province: "" }));
+        return;
       }
       const list = r.data.cities || (r.data.city ? [r.data.city] : []);
       setCityOptions(list);
-      if (r.data.city || r.data.province) {
-        setData(d => ({
-          ...d,
-          postal_code: r.data.cap || d.postal_code,
-          city: r.data.city || d.city,
-          province: PROVINCE_COUNTRIES.has(cc) ? (r.data.province || d.province) : "",
-        }));
-      }
+      setData(d => ({
+        ...d,
+        postal_code: r.data.cap || cleanCap,
+        city: r.data.city || "",
+        province: PROVINCE_COUNTRIES.has(cc) ? (r.data.province || "") : "",
+      }));
     } catch {}
   };
 
@@ -1368,14 +1580,24 @@ function AddressForm({ title, data, setData, addressbook = [], onClient, onSaved
         <Field label="Riferimento (opzionale)"><Input value={data.reference} onChange={set("reference")} className="rounded-sm h-11" /></Field>
         <Field label="Indirizzo" required className="sm:col-span-2"><Input value={data.address} onChange={set("address")} className="rounded-sm h-11" /></Field>
         <Field label="Nazione" required>
-          <Select value={cc} onValueChange={handleCountryChange}>
-            <SelectTrigger className="rounded-sm h-11 bg-white"><SelectValue placeholder="Seleziona nazione" /></SelectTrigger>
-            <SelectContent className="max-h-72">
-              {COUNTRIES.map(c => (
-                <SelectItem key={c.code} value={c.code}>{c.name} ({c.code})</SelectItem>
-              ))}
-            </SelectContent>
-          </Select>
+          <div className="flex items-center gap-2">
+            <CountryFlag code={cc} />
+            <Select value={cc} onValueChange={handleCountryChange}>
+              <SelectTrigger className="rounded-sm h-11 bg-white flex-1">
+                <SelectValue placeholder="Seleziona nazione" />
+              </SelectTrigger>
+              <SelectContent className="max-h-72">
+                {COUNTRIES.map(c => (
+                  <SelectItem key={c.code} value={c.code}>
+                    <span className="inline-flex items-center gap-2">
+                      <CountryFlag code={c.code} />
+                      <span>{c.name} ({c.code})</span>
+                    </span>
+                  </SelectItem>
+                ))}
+              </SelectContent>
+            </Select>
+          </div>
         </Field>
         <Field
           label="CAP / ZIP Code"
