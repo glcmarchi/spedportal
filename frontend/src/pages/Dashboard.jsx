@@ -2,7 +2,8 @@ import React, { useEffect, useMemo, useState } from "react";
 import { Link, useNavigate } from "react-router-dom";
 import { api } from "@/lib/api";
 import { useAuth } from "@/lib/auth";
-import { Package, Truck, CheckCircle, Wallet, ArrowRight, Warning, Archive } from "@phosphor-icons/react";
+import { COUNTRIES, CountryFlag } from "@/pages/NewShipment";
+import { Package, Truck, CheckCircle, Wallet, ArrowRight, Warning, Archive, Lightning } from "@phosphor-icons/react";
 
 const StatCard = ({ icon: Icon, label, value, sub, accent, testid, onClick }) => (
   <button data-testid={testid} onClick={onClick}
@@ -22,6 +23,11 @@ export default function Dashboard() {
   const [ships, setShips] = useState([]);
   const [balance, setBalance] = useState(null);
 
+  // Mini-barra Preventivo Rapido
+  const [quickCountry, setQuickCountry] = useState("IT");
+  const [quickCap, setQuickCap] = useState("");
+  const [quickWeight, setQuickWeight] = useState("1");
+
   useEffect(() => {
     api.get("/shipments").then(r => setShips(r.data)).catch(() => {});
     if (user?.billing_type === "prepaid") {
@@ -39,8 +45,19 @@ export default function Dashboard() {
 
   const go = (f) => () => nav(`/shipments?filter=${f}`);
 
+  const handleQuickQuoteSubmit = (e) => {
+    e.preventDefault();
+    nav("/quote", {
+      state: {
+        presetDestCountry: quickCountry,
+        presetDestCap: quickCap.trim(),
+        presetWeight: parseFloat(quickWeight) || 1,
+      },
+    });
+  };
+
   return (
-    <div className="space-y-8">
+    <div className="space-y-6">
       <div className="flex flex-col sm:flex-row sm:items-end sm:justify-between gap-3">
         <div>
           <div className="label-caps text-orange-600 mb-1">Dashboard</div>
@@ -53,6 +70,54 @@ export default function Dashboard() {
           <Package size={18} weight="fill" /> Nuova Spedizione
         </Link>
       </div>
+
+      {/* Mini-Barra Preventivo Rapido */}
+      <form onSubmit={handleQuickQuoteSubmit} className="bg-white border-2 border-orange-200 rounded-sm p-4 shadow-sm flex flex-col lg:flex-row lg:items-center gap-3">
+        <div className="flex items-center gap-2 text-orange-700 font-black text-xs uppercase tracking-wider shrink-0">
+          <Lightning size={18} weight="fill" className="text-orange-600" />
+          Preventivo al Volo
+        </div>
+        <div className="grid grid-cols-1 sm:grid-cols-12 gap-2 flex-1">
+          <div className="sm:col-span-5 flex items-center gap-2 border border-slate-200 rounded-sm px-2.5 h-10 bg-slate-50">
+            <CountryFlag code={quickCountry} />
+            <select
+              value={quickCountry}
+              onChange={(e) => setQuickCountry(e.target.value)}
+              className="w-full bg-transparent text-xs font-semibold text-slate-800 outline-none"
+            >
+              {COUNTRIES.map((c) => (
+                <option key={c.code} value={c.code}>{c.name} ({c.code})</option>
+              ))}
+            </select>
+          </div>
+          <div className="sm:col-span-4">
+            <input
+              type="text"
+              value={quickCap}
+              onChange={(e) => setQuickCap(e.target.value)}
+              placeholder="CAP destinazione (es. 00100)"
+              className="w-full h-10 px-3 border border-slate-200 rounded-sm text-xs bg-white outline-none focus:border-orange-500"
+            />
+          </div>
+          <div className="sm:col-span-3 flex items-center border border-slate-200 rounded-sm px-3 h-10 bg-white">
+            <input
+              type="number"
+              min="0.1"
+              step="0.1"
+              value={quickWeight}
+              onChange={(e) => setQuickWeight(e.target.value)}
+              className="w-full text-xs font-bold text-slate-900 outline-none"
+            />
+            <span className="text-[11px] font-bold text-slate-400 ml-1">kg</span>
+          </div>
+        </div>
+        <button
+          type="submit"
+          className="inline-flex items-center justify-center gap-1.5 bg-slate-900 hover:bg-orange-600 text-white px-5 h-10 rounded-sm text-xs font-bold shrink-0 transition-colors"
+        >
+          Calcola Subito <ArrowRight size={14} />
+        </button>
+      </form>
 
       {user?.billing_type === "prepaid" && (
         <div className="bg-gradient-to-r from-slate-900 to-slate-800 text-white rounded-sm p-6 flex flex-col sm:flex-row items-start sm:items-center justify-between gap-4">
