@@ -111,25 +111,41 @@ CARRIER_SCHEMAS = {
 DEFAULT_POLICIES = {c: "admin_only" for c in DEFAULT_CARRIERS}
 
 
-def normalize_markup_rule(raw: Any, fallback_flat: float = 0.0) -> Dict[str, Any]:
+def normalize_markup_rule(raw: Any, fallback_flat: float = 0.0, fallback_surcharge: float = 0.0) -> Dict[str, Any]:
     if isinstance(raw, (int, float)):
         val = round(float(raw), 2)
-        return {"mode": "flat", "flat": val, "domestic": val, "europe": val, "world": val}
+        return {
+            "mode": "flat",
+            "flat": val,
+            "domestic": val,
+            "europe": val,
+            "world": val,
+            "surcharge_percent": round(float(fallback_surcharge), 2),
+        }
     if isinstance(raw, dict):
         mode = raw.get("mode", "flat")
         flat = round(float(raw.get("flat", fallback_flat) or 0.0), 2)
         dom = round(float(raw.get("domestic", flat) or 0.0), 2)
         eur = round(float(raw.get("europe", flat) or 0.0), 2)
         wld = round(float(raw.get("world", flat) or 0.0), 2)
+        surch = round(float(raw.get("surcharge_percent", fallback_surcharge) or 0.0), 2)
         return {
             "mode": "area" if mode == "area" else "flat",
             "flat": flat,
             "domestic": dom,
             "europe": eur,
             "world": wld,
+            "surcharge_percent": surch,
         }
     val = round(float(fallback_flat), 2)
-    return {"mode": "flat", "flat": val, "domestic": val, "europe": val, "world": val}
+    return {
+        "mode": "flat",
+        "flat": val,
+        "domestic": val,
+        "europe": val,
+        "world": val,
+        "surcharge_percent": round(float(fallback_surcharge), 2),
+    }
 
 
 async def require_super_admin(user=Depends(get_current_user)):
@@ -283,6 +299,7 @@ async def list_master_carriers(_=Depends(require_super_admin)):
         cdata["default_markup_rule"] = normalize_markup_rule(
             cdata.get("default_markup_rule"),
             cdata.get("default_markup_percent", 5.0),
+            0.0,
         )
     return {"schemas": CARRIER_SCHEMAS, "carriers": carriers}
 
@@ -298,11 +315,11 @@ async def save_master_carrier(carrier_id: str, inp: CarrierCredsSave, _=Depends(
         "verified" if schema["auth_type"] == "credentials" else "pending_auth"
     )
     if inp.default_markup_rule is not None:
-        rule = normalize_markup_rule(inp.default_markup_rule, 5.0)
+        rule = normalize_markup_rule(inp.default_markup_rule, 5.0, 0.0)
     elif inp.default_markup_percent is not None:
-        rule = normalize_markup_rule(inp.default_markup_percent, 5.0)
+        rule = normalize_markup_rule(inp.default_markup_percent, 5.0, 0.0)
     else:
-        rule = normalize_markup_rule(existing_entry.get("default_markup_rule"), existing_entry.get("default_markup_percent", 5.0))
+        rule = normalize_markup_rule(existing_entry.get("default_markup_rule"), existing_entry.get("default_markup_percent", 5.0), 0.0)
 
     entry = {
         "values": inp.values,
@@ -344,7 +361,7 @@ def _clean_admin_markups(raw_map: Optional[Dict[str, Any]]) -> Dict[str, Any]:
         if v is None or v == "":
             out[k] = None
         else:
-            out[k] = normalize_markup_rule(v, 0.0)
+            out[k] = normalize_markup_rule(v, 0.0, 0.0)
     return out
 
 
@@ -522,7 +539,6 @@ async def _compute_reseller_accounting_data(rid: str, date_from: Optional[str] =
          "contract_owner": 1, "carrier_code_used": 1, "applied_fee": 1}
     ).sort("created_at", -1).to_list(10000)
 
-    # Risoluzione dinamica utenti
     u_ids = list({s.get("user_id") for s in ships if s.get("user_id")})
     u_docs = await db.users.find({"id": {"$in": u_ids}}, {"_id": 0, "id": 1, "role": 1, "company_name": 1, "billing_type": 1}).to_list(1000) if u_ids else []
     u_map = {u["id"]: u for u in u_docs}
@@ -549,7 +565,6 @@ async def _compute_reseller_accounting_data(rid: str, date_from: Optional[str] =
             if "reseller_transport_cost" in s and s["reseller_transport_cost"] is not None:
                 trans_val = float(s["reseller_transport_cost"])
             else:
-                # Retrocompatibilità record precedenti
                 rc = float(s.get("reseller_cost", s.get("cost", 0)) or 0.0)
                 trans_val = rc
             admin_due_ship = round(trans_val + fee_val, 2)
@@ -596,7 +611,6 @@ async def _compute_reseller_accounting_data(rid: str, date_from: Optional[str] =
     amount_due_total = round(transport_due_master + fees_due_master + fees_due_own, 2)
 
     ledger = await db.reseller_ledger.find({"reseller_id": rid}, {"_id": 0}).sort("created_at", -1).limit(30).to_list(30)
-
     breakdown = sorted(by_origin.values(), key=lambda x: (0 if x["is_reseller_direct"] else 1, -x["total_due"]))
 
     return {
@@ -677,7 +691,6 @@ async def reseller_subclients_accounting(
     client_id: Optional[str] = None,
     user=Depends(require_reseller_admin),
 ):
-    """Contabilità e monitoraggio economico del Reseller verso i propri Sub-Clienti."""
     rid = user["reseller_id"]
     q: Dict[str, Any] = {
         "reseller_id": rid,
@@ -886,12 +899,12 @@ async def bootstrap_multitenant():
         await db.system_settings.insert_one({
             "id": "master_carriers",
             "carriers": {
-                "brt": {"values": {"user_id": "MASTER_BRT", "password": "***", "customer_code": "1029384", "depot_code": "102"}, "primary_code": "1029384", "auth_type": "credentials", "status": "verified", "default_markup_percent": 6.0, "default_markup_rule": normalize_markup_rule(6.0), "updated_at": now_iso()},
-                "gls": {"values": {"sede": "MI", "customer_code": "998877", "password": "***", "contract_code": "GLS-MST01"}, "primary_code": "998877", "auth_type": "credentials", "status": "verified", "default_markup_percent": 6.0, "default_markup_rule": normalize_markup_rule(6.0), "updated_at": now_iso()},
-                "dhl": {"values": {"api_key": "DHL_KEY_MST", "api_secret": "***", "account_number": "123456789"}, "primary_code": "123456789", "auth_type": "credentials", "status": "verified", "default_markup_percent": 5.0, "default_markup_rule": normalize_markup_rule(5.0), "updated_at": now_iso()},
-                "ups": {"values": {"account_number": "A1B2C3", "postal_code": "20100"}, "primary_code": "A1B2C3", "auth_type": "account_link", "status": "verified", "default_markup_percent": 5.0, "default_markup_rule": normalize_markup_rule(5.0), "updated_at": now_iso()},
-                "tnt": {"values": {"account_number": "987654321", "country_code": "IT"}, "primary_code": "987654321", "auth_type": "account_link", "status": "verified", "default_markup_percent": 5.0, "default_markup_rule": normalize_markup_rule(5.0), "updated_at": now_iso()},
-                "poste": {"values": {"client_id": "PI_MST_ID", "client_secret": "***", "cdc_code": "CDC001"}, "primary_code": "CDC001", "auth_type": "credentials", "status": "verified", "default_markup_percent": 8.0, "default_markup_rule": normalize_markup_rule(8.0), "updated_at": now_iso()},
+                "brt": {"values": {"user_id": "MASTER_BRT", "password": "***", "customer_code": "1029384", "depot_code": "102"}, "primary_code": "1029384", "auth_type": "credentials", "status": "verified", "default_markup_percent": 6.0, "default_markup_rule": normalize_markup_rule(6.0, 6.0, 0.0), "updated_at": now_iso()},
+                "gls": {"values": {"sede": "MI", "customer_code": "998877", "password": "***", "contract_code": "GLS-MST01"}, "primary_code": "998877", "auth_type": "credentials", "status": "verified", "default_markup_percent": 6.0, "default_markup_rule": normalize_markup_rule(6.0, 6.0, 0.0), "updated_at": now_iso()},
+                "dhl": {"values": {"api_key": "DHL_KEY_MST", "api_secret": "***", "account_number": "123456789"}, "primary_code": "123456789", "auth_type": "credentials", "status": "verified", "default_markup_percent": 5.0, "default_markup_rule": normalize_markup_rule(5.0, 5.0, 0.0), "updated_at": now_iso()},
+                "ups": {"values": {"account_number": "A1B2C3", "postal_code": "20100"}, "primary_code": "A1B2C3", "auth_type": "account_link", "status": "verified", "default_markup_percent": 5.0, "default_markup_rule": normalize_markup_rule(5.0, 5.0, 0.0), "updated_at": now_iso()},
+                "tnt": {"values": {"account_number": "987654321", "country_code": "IT"}, "primary_code": "987654321", "auth_type": "account_link", "status": "verified", "default_markup_percent": 5.0, "default_markup_rule": normalize_markup_rule(5.0, 5.0, 0.0), "updated_at": now_iso()},
+                "poste": {"values": {"client_id": "PI_MST_ID", "client_secret": "***", "cdc_code": "CDC001"}, "primary_code": "CDC001", "auth_type": "credentials", "status": "verified", "default_markup_percent": 8.0, "default_markup_rule": normalize_markup_rule(8.0, 8.0, 0.0), "updated_at": now_iso()},
             }
         })
 
