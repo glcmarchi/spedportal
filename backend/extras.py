@@ -3,7 +3,7 @@ from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
 from typing import List, Optional
 from datetime import datetime, timezone
-import io, csv, base64, os
+import io, csv, base64, os, re
 import httpx
 import stripe
 from reportlab.lib.pagesizes import A4
@@ -253,17 +253,14 @@ def _it_province_from_cap(cap: str) -> str:
     if p3 == "090": return "SU"
     return IT_PROV_PREFIX.get(cap[:2], "")
 
-@extra_router.get("/geo/lookup")
-async def geo_lookup(country: str = "IT", cap: str = ""):
+async def _lookup_postal_cities(country: str, cap: str) -> dict:
     country = (country or "IT").upper().strip()
     cap = (cap or "").strip().upper()
-    if not cap:
-        return {"country": country, "cap": cap, "city": None, "cities": [], "province": None, "valid": True}
-
     it_prov = _it_province_from_cap(cap) if country == "IT" else ""
     cities_set = []
     ext_prov = ""
     valid = True
+    zippo_found = False
 
     fx_postal = await validate_fedex_postal(country, cap, it_prov)
     if fx_postal is not None:
@@ -284,6 +281,7 @@ async def geo_lookup(country: str = "IT", cap: str = ""):
         async with httpx.AsyncClient(timeout=4.0) as client:
             r = await client.get(f"https://api.zippopotam.us/{zippo_cc}/{query_cap}")
             if r.status_code == 200:
+                zippo_found = True
                 places = r.json().get("places") or []
                 for p in places:
                     pname = (p.get("place name") or "").strip()
@@ -291,10 +289,11 @@ async def geo_lookup(country: str = "IT", cap: str = ""):
                         cities_set.append(pname)
                     if not ext_prov and country in ("US", "CA", "AU"):
                         ext_prov = (p.get("state abbreviation") or "")[:2].upper()
+            elif r.status_code == 404 and country in ("IT", "FR", "DE", "ES", "CH", "AT", "BE", "NL", "PL", "PT", "US", "GB"):
+                valid = False
     except Exception:
         pass
 
-    # Ordina alfabeticamente le località trovate per quel CAP
     cities_sorted = sorted(cities_set, key=lambda x: x.lower())
     primary_city = cities_sorted[0] if cities_sorted else None
     final_prov = (it_prov or ext_prov) if country in ("IT", "US", "CA", "AU") else ""
@@ -306,7 +305,112 @@ async def geo_lookup(country: str = "IT", cap: str = ""):
         "cities": cities_sorted,
         "province": final_prov or None,
         "valid": valid,
+        "zippo_found": zippo_found,
     }
+
+@extra_router.get("/geo/lookup")
+async def geo_lookup(country: str = "IT", cap: str = ""):
+    if not (cap or "").strip():
+        return {"country": country.upper(), "cap": "", "city": None, "cities": [], "province": None, "valid": True}
+    res = await _lookup_postal_cities(country, cap)
+    res.pop("zippo_found", None)
+    return res
+
+class GeoValidateAddressInput(BaseModel):
+    country: str = "IT"
+    postal_code: str = ""
+    city: str = ""
+    province: Optional[str] = ""
+    address: str = ""
+
+@extra_router.post("/geo/validate-address")
+async def geo_validate_address(inp: GeoValidateAddressInput, _=Depends(require_approved)):
+    cc = (inp.country or "IT").upper().strip()
+    cap = (inp.postal_code or "").strip().upper()
+    city = (inp.city or "").strip()
+    street = (inp.address or "").strip()
+
+    postal_info = await _lookup_postal_cities(cc, cap)
+    if not postal_info["valid"]:
+        return {
+            "ok": False,
+            "severity": "error",
+            "message": f"Il CAP '{cap}' non risulta valido per la nazione {cc}.",
+            "suggested_cities": postal_info["cities"],
+        }
+
+    if postal_info["cities"] and city:
+        norm_city = city.lower()
+        matches = any(
+            norm_city == c.lower() or norm_city in c.lower() or c.lower() in norm_city
+            for c in postal_info["cities"]
+        )
+        if not matches:
+            return {
+                "ok": False,
+                "severity": "error",
+                "message": f"La città '{city}' non corrisponde al CAP {cap} ({cc}). Località previste: {', '.join(postal_info['cities'][:5])}.",
+                "suggested_cities": postal_info["cities"],
+            }
+
+    street_clean = re.sub(r"\d+", "", street).strip(" ,.-").lower()
+    street_suggestion = None
+    street_found = True
+
+    if len(street_clean) >= 4:
+        try:
+            async with httpx.AsyncClient(timeout=4.5) as client:
+                r = await client.get(
+                    "https://nominatim.openstreetmap.org/search",
+                    params={
+                        "street": street,
+                        "postalcode": cap,
+                        "city": city,
+                        "countrycodes": cc.lower(),
+                        "format": "json",
+                        "addressdetails": 1,
+                        "limit": 3,
+                    },
+                    headers={"User-Agent": "SpedPortal-AddressCheck/1.0"},
+                )
+                hits = r.json() if r.status_code == 200 else []
+                if not hits:
+                    # Seconda ricerca ampia su CAP + Città per proporre la via corretta
+                    r2 = await client.get(
+                        "https://nominatim.openstreetmap.org/search",
+                        params={
+                            "q": f"{street_clean}, {cap} {city}",
+                            "countrycodes": cc.lower(),
+                            "format": "json",
+                            "addressdetails": 1,
+                            "limit": 3,
+                        },
+                        headers={"User-Agent": "SpedPortal-AddressCheck/1.0"},
+                    )
+                    hits2 = r2.json() if r2.status_code == 200 else []
+                    if hits2:
+                        addr_obj = hits2[0].get("address") or {}
+                        road = addr_obj.get("road") or addr_obj.get("pedestrian") or ""
+                        nums = re.findall(r"\d+[a-zA-Z]?", street)
+                        if road:
+                            street_suggestion = f"{road}, {nums[0]}" if nums else road
+                    street_found = False
+        except Exception:
+            street_found = True
+
+    if not street_found:
+        msg = f"L'indirizzo '{street}' non è stato trovato con certezza a {cap} {city}."
+        if street_suggestion and street_suggestion.lower() != street.lower():
+            msg += f" Intendevi '{street_suggestion}'?"
+        return {
+            "ok": False,
+            "severity": "warning",
+            "message": msg,
+            "suggested_street": street_suggestion,
+            "suggested_cities": postal_info["cities"],
+        }
+
+    return {"ok": True, "severity": "ok", "message": "Indirizzo verificato"}
 
 class CustomTopUpInput(BaseModel):
     amount: float = Field(gt=0, le=100000); method: str; origin_url: str
