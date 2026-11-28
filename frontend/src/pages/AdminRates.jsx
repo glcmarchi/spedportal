@@ -19,18 +19,19 @@ const CARRIER_LABELS = {
   poste: "Poste Italiane / SDA",
 };
 
-const emptyRule = (val = 20) => ({
+const emptyRule = (val = 20, surch = 0) => ({
   mode: "flat",
   flat: val,
   domestic: val,
   europe: val,
   world: val,
+  surcharge_percent: surch,
 });
 
-function buildDefaultMarkups(val = 20) {
+function buildDefaultMarkups(val = 20, surch = 0) {
   const out = {};
   ALL_CARRIER_IDS.forEach((cid) => {
-    out[cid] = emptyRule(val);
+    out[cid] = emptyRule(val, surch);
   });
   return out;
 }
@@ -42,8 +43,9 @@ export default function AdminRates() {
   const [open, setOpen] = useState(false);
   const [editing, setEditing] = useState(null);
   const [name, setName] = useState("");
-  const [markups, setMarkups] = useState(buildDefaultMarkups(20));
+  const [markups, setMarkups] = useState(buildDefaultMarkups(20, 0));
   const [bulkPct, setBulkPct] = useState("20");
+  const [bulkSurchPct, setBulkSurchPct] = useState("0");
 
   const load = async () => {
     try {
@@ -73,19 +75,20 @@ export default function AdminRates() {
   const startNew = () => {
     setEditing(null);
     setName("");
-    setMarkups(buildDefaultMarkups(20));
+    setMarkups(buildDefaultMarkups(20, 0));
     setBulkPct("20");
+    setBulkSurchPct("0");
     setOpen(true);
   };
 
   const startEdit = (t) => {
     setEditing(t);
     setName(t.name || "");
-    const base = buildDefaultMarkups(20);
+    const base = buildDefaultMarkups(20, 0);
     const existing = t.carrier_markups || {};
     ALL_CARRIER_IDS.forEach((cid) => {
       if (existing[cid]) {
-        base[cid] = { ...emptyRule(20), ...existing[cid] };
+        base[cid] = { ...emptyRule(20, 0), ...existing[cid] };
       }
     });
     setMarkups(base);
@@ -101,8 +104,9 @@ export default function AdminRates() {
 
   const applyAllFlat = () => {
     const val = Math.max(0, parseFloat(bulkPct) || 0);
-    setMarkups(buildDefaultMarkups(val));
-    toast.success(`Applicato +${val}% a tutti i corrieri`);
+    const surch = Math.max(0, parseFloat(bulkSurchPct) || 0);
+    setMarkups(buildDefaultMarkups(val, surch));
+    toast.success(`Applicato Nolo +${val}% e Supplementi +${surch}% a tutti i corrieri`);
   };
 
   const save = async () => {
@@ -133,11 +137,12 @@ export default function AdminRates() {
   };
 
   const formatRuleBadge = (r) => {
-    if (!r) return "+20%";
-    if (r.mode === "area") {
-      return `IT +${r.domestic}% · UE +${r.europe}% · Mondo +${r.world}%`;
-    }
-    return `+${r.flat}% (Tutte le aree)`;
+    if (!r) return "Nolo +20% · Suppl +0%";
+    const surch = Number(r.surcharge_percent || 0);
+    const freightStr = r.mode === "area"
+      ? `Nolo IT +${r.domestic}% · UE +${r.europe}% · Mondo +${r.world}%`
+      : `Nolo +${r.flat}%`;
+    return `${freightStr} · Suppl +${surch}%`;
   };
 
   return (
@@ -151,7 +156,7 @@ export default function AdminRates() {
             Profili Margini Corrieri
           </h1>
           <p className="text-sm text-slate-600 mt-1">
-            Crea i tuoi profili di ricarico (es. <i>Tutto +20%</i> oppure differenziati per Italia, Europa e Mondo) da abbinare ai sub-clienti.
+            Configura separatamente il margine sul <b>Nolo Base</b> (unico o per macro-area) e il margine unico sui <b>Supplementi</b> per ogni corriere.
           </p>
         </div>
         <Button onClick={startNew} className="bg-orange-600 hover:bg-orange-700 rounded-sm h-11">
@@ -179,9 +184,9 @@ export default function AdminRates() {
 
             <div className="border-t border-slate-100 pt-3 space-y-2 text-xs">
               {visibleCarrierIds.map((cid) => (
-                <div key={cid} className="flex items-center justify-between py-1 border-b border-slate-50 last:border-0">
+                <div key={cid} className="flex items-center justify-between py-1 border-b border-slate-50 last:border-0 gap-2">
                   <span className="font-semibold text-slate-800">{CARRIER_LABELS[cid] || cid.toUpperCase()}</span>
-                  <span className="font-mono font-bold text-orange-700 bg-orange-50 px-2 py-0.5 rounded-sm">
+                  <span className="font-mono font-bold text-orange-700 bg-orange-50 px-2 py-0.5 rounded-sm text-right">
                     {formatRuleBadge(t.carrier_markups?.[cid])}
                   </span>
                 </div>
@@ -206,27 +211,38 @@ export default function AdminRates() {
 
           <div className="space-y-4 text-sm">
             <div>
-              <Label className="label-caps">Nome Profilo (es. Tutto +20%, Listino Standard)*</Label>
+              <Label className="label-caps">Nome Profilo (es. Listino Standard, Cliente Top)*</Label>
               <Input
                 value={name}
                 onChange={(e) => setName(e.target.value)}
-                placeholder="es. Tutto +20%"
+                placeholder="es. Listino Standard"
                 className="mt-1 rounded-sm h-10"
               />
             </div>
 
             <div className="bg-slate-50 border border-slate-200 rounded-sm p-3 flex flex-wrap items-center justify-between gap-2">
               <div className="text-xs text-slate-700">
-                <b>Impostazione rapida:</b> applica la stessa percentuale unica a tutti i corrieri
+                <b>Impostazione rapida globale:</b>
               </div>
-              <div className="flex items-center gap-2">
+              <div className="flex flex-wrap items-center gap-2">
+                <span className="text-xs text-slate-600">Nolo:</span>
                 <Input
                   type="number"
                   min="0"
                   step="0.5"
                   value={bulkPct}
                   onChange={(e) => setBulkPct(e.target.value)}
-                  className="w-24 h-9 rounded-sm bg-white text-right font-mono"
+                  className="w-20 h-9 rounded-sm bg-white text-right font-mono"
+                />
+                <span className="text-xs font-bold">%</span>
+                <span className="text-xs text-slate-600 ml-1">Supplementi:</span>
+                <Input
+                  type="number"
+                  min="0"
+                  step="0.5"
+                  value={bulkSurchPct}
+                  onChange={(e) => setBulkSurchPct(e.target.value)}
+                  className="w-20 h-9 rounded-sm bg-white text-right font-mono"
                 />
                 <span className="text-xs font-bold">%</span>
                 <Button type="button" size="sm" variant="outline" onClick={applyAllFlat} className="h-9 rounded-sm">
@@ -237,7 +253,7 @@ export default function AdminRates() {
 
             <div className="space-y-3">
               {visibleCarrierIds.map((cid) => {
-                const rule = markups[cid] || emptyRule(20);
+                const rule = markups[cid] || emptyRule(20, 0);
                 return (
                   <div key={cid} className="border border-slate-200 rounded-sm p-3.5 bg-white space-y-3">
                     <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-2">
@@ -246,69 +262,88 @@ export default function AdminRates() {
                         value={rule.mode}
                         onValueChange={(m) => updateRule(cid, { mode: m })}
                       >
-                        <SelectTrigger className="w-56 h-8 rounded-sm text-xs">
+                        <SelectTrigger className="w-60 h-8 rounded-sm text-xs">
                           <SelectValue />
                         </SelectTrigger>
                         <SelectContent>
-                          <SelectItem value="flat">Margine unico (tutte le aree)</SelectItem>
-                          <SelectItem value="area">Differenziato per Macro-Area</SelectItem>
+                          <SelectItem value="flat">Nolo: Margine unico (tutte le aree)</SelectItem>
+                          <SelectItem value="area">Nolo: Differenziato per Macro-Area</SelectItem>
                         </SelectContent>
                       </Select>
                     </div>
 
-                    {rule.mode === "flat" ? (
-                      <div className="flex items-center gap-2 max-w-xs">
-                        <Label className="label-caps text-[11px] shrink-0">Margine %:</Label>
-                        <Input
-                          type="number"
-                          min="0"
-                          step="0.5"
-                          value={rule.flat}
-                          onChange={(e) => {
-                            const v = Math.max(0, parseFloat(e.target.value) || 0);
-                            updateRule(cid, { flat: v, domestic: v, europe: v, world: v });
-                          }}
-                          className="h-9 rounded-sm font-mono text-right"
-                        />
-                        <span className="text-xs font-bold text-slate-500">%</span>
+                    <div className="grid grid-cols-1 md:grid-cols-12 gap-3 items-end">
+                      <div className="md:col-span-8">
+                        {rule.mode === "flat" ? (
+                          <div className="flex items-center gap-2 max-w-xs">
+                            <Label className="label-caps text-[11px] shrink-0">Margine Nolo Base %:</Label>
+                            <Input
+                              type="number"
+                              min="0"
+                              step="0.5"
+                              value={rule.flat}
+                              onChange={(e) => {
+                                const v = Math.max(0, parseFloat(e.target.value) || 0);
+                                updateRule(cid, { flat: v, domestic: v, europe: v, world: v });
+                              }}
+                              className="h-9 rounded-sm font-mono text-right"
+                            />
+                            <span className="text-xs font-bold text-slate-500">%</span>
+                          </div>
+                        ) : (
+                          <div className="grid grid-cols-3 gap-2">
+                            <div>
+                              <Label className="label-caps text-[10px]">Nolo Italia %</Label>
+                              <Input
+                                type="number"
+                                min="0"
+                                step="0.5"
+                                value={rule.domestic}
+                                onChange={(e) => updateRule(cid, { domestic: Math.max(0, parseFloat(e.target.value) || 0) })}
+                                className="mt-1 h-9 rounded-sm font-mono text-right"
+                              />
+                            </div>
+                            <div>
+                              <Label className="label-caps text-[10px]">Nolo Europa %</Label>
+                              <Input
+                                type="number"
+                                min="0"
+                                step="0.5"
+                                value={rule.europe}
+                                onChange={(e) => updateRule(cid, { europe: Math.max(0, parseFloat(e.target.value) || 0) })}
+                                className="mt-1 h-9 rounded-sm font-mono text-right"
+                              />
+                            </div>
+                            <div>
+                              <Label className="label-caps text-[10px]">Nolo Mondo %</Label>
+                              <Input
+                                type="number"
+                                min="0"
+                                step="0.5"
+                                value={rule.world}
+                                onChange={(e) => updateRule(cid, { world: Math.max(0, parseFloat(e.target.value) || 0) })}
+                                className="mt-1 h-9 rounded-sm font-mono text-right"
+                              />
+                            </div>
+                          </div>
+                        )}
                       </div>
-                    ) : (
-                      <div className="grid grid-cols-3 gap-3">
-                        <div>
-                          <Label className="label-caps text-[11px]">Italia (Domestico) %</Label>
+
+                      <div className="md:col-span-4 bg-slate-50 border border-slate-200 rounded-sm p-2">
+                        <Label className="label-caps text-[10px] text-orange-700">Margine Supplementi % (Unico)</Label>
+                        <div className="flex items-center gap-1 mt-1">
                           <Input
                             type="number"
                             min="0"
                             step="0.5"
-                            value={rule.domestic}
-                            onChange={(e) => updateRule(cid, { domestic: Math.max(0, parseFloat(e.target.value) || 0) })}
-                            className="mt-1 h-9 rounded-sm font-mono text-right"
+                            value={rule.surcharge_percent ?? 0}
+                            onChange={(e) => updateRule(cid, { surcharge_percent: Math.max(0, parseFloat(e.target.value) || 0) })}
+                            className="h-8 rounded-sm font-mono text-right bg-white text-xs"
                           />
-                        </div>
-                        <div>
-                          <Label className="label-caps text-[11px]">Europa (UE) %</Label>
-                          <Input
-                            type="number"
-                            min="0"
-                            step="0.5"
-                            value={rule.europe}
-                            onChange={(e) => updateRule(cid, { europe: Math.max(0, parseFloat(e.target.value) || 0) })}
-                            className="mt-1 h-9 rounded-sm font-mono text-right"
-                          />
-                        </div>
-                        <div>
-                          <Label className="label-caps text-[11px]">Mondo (Extra-UE) %</Label>
-                          <Input
-                            type="number"
-                            min="0"
-                            step="0.5"
-                            value={rule.world}
-                            onChange={(e) => updateRule(cid, { world: Math.max(0, parseFloat(e.target.value) || 0) })}
-                            className="mt-1 h-9 rounded-sm font-mono text-right"
-                          />
+                          <span className="text-xs font-bold text-slate-600">%</span>
                         </div>
                       </div>
-                    )}
+                    </div>
                   </div>
                 );
               })}
